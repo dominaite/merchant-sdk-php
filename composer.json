@@ -20,5 +20,11 @@
         "psr-4": {
             "Dominaite\\Tests\\": "tests/"
         }
+    },
+    "scripts": {
+        "test": [
+            "php tests/vectors.php",
+            "php tests/webhook_vectors.php"
+        ]
     }
 }

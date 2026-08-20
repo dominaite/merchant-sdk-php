@@ -167,6 +167,74 @@ final class DominaiteClient
     }
 
     /**
+     * Verifies the signature on an incoming webhook delivery.
+     *
+     * Call this BEFORE you parse the body or trust anything in it, on the RAW request
+     * body - read it with file_get_contents('php://input') and do not re-encode it, do
+     * not use the already-decoded $_POST. A single re-serialised byte fails the check.
+     *
+     * The header looks like "t=1755700000,v1=<64 lowercase hex>". v1 is HMAC-SHA256 over
+     * "{t}.{raw body}" keyed with the endpoint's whsec_ secret. A delivery whose
+     * timestamp is more than $toleranceSeconds away from now is rejected even when the
+     * MAC is valid, so a captured delivery cannot be replayed at leisure.
+     *
+     * Returns false - never throws - for anything an attacker controls: a bad MAC, a
+     * stale timestamp, a missing or malformed header. Answer 400 and stop.
+     *
+     * @param string   $payload          Raw request body, exactly as received.
+     * @param string   $signatureHeader  The X-Webhook-Signature header value.
+     * @param string   $secret           The endpoint's signing secret (whsec_...).
+     * @param int      $toleranceSeconds Max clock difference to accept, in seconds.
+     * @param int|null $now              Unix seconds to compare against; defaults to time().
+     *
+     * @throws \InvalidArgumentException Empty secret or negative tolerance - your own bug, not the sender's.
+     */
+    public static function verifyWebhook(
+        string $payload,
+        string $signatureHeader,
+        string $secret,
+        int $toleranceSeconds = 300,
+        ?int $now = null
+    ): bool {
+        if ($secret === '') {
+            throw new \InvalidArgumentException('secret must not be empty - use the endpoint secret shown when the webhook was created');
+        }
+        if ($toleranceSeconds < 0) {
+            throw new \InvalidArgumentException('toleranceSeconds must not be negative');
+        }
+
+        $timestamp = null;
+        $received = null;
+        foreach (explode(',', $signatureHeader) as $part) {
+            $pair = explode('=', trim($part), 2);
+            if (count($pair) !== 2) {
+                continue;
+            }
+            // Unknown keys are ignored on purpose: a future v2= scheme must not break v1 readers.
+            if ($pair[0] === 't' && $timestamp === null) {
+                $timestamp = $pair[1];
+            } elseif ($pair[0] === 'v1' && $received === null) {
+                $received = $pair[1];
+            }
+        }
+
+        if ($timestamp === null || $received === null) {
+            return false;
+        }
+        if (preg_match('/^[0-9]{1,10}$/', $timestamp) !== 1 || preg_match('/^[0-9a-f]{64}$/', $received) !== 1) {
+            return false;
+        }
+
+        $expected = hash_hmac('sha256', $timestamp . '.' . $payload, $secret);
+        if (!hash_equals($expected, $received)) {
+            return false;
+        }
+
+        // Age last: a valid MAC on a stale delivery is a replay, not a rejection to log as tampering.
+        return abs(($now ?? time()) - (int) $timestamp) <= $toleranceSeconds;
+    }
+
+    /**
      * @param array<string,mixed>|null $body Null for GET: an empty body (and empty
      *                                       idempotency key) is what gets signed.
      * @return array<string,mixed>

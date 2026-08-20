@@ -7,6 +7,10 @@ your server, which keeps your PCI scope minimal (SAQ A).
 
 Works on plain PHP 7.4+ with curl. No framework required.
 
+The integration is three moving parts: create a session from your backend, render the widget,
+and receive a webhook when the payment lands. Webhooks are how you learn the outcome; polling
+is the fallback for when you have not set one up yet.
+
 ## Install
 
 ```bash
@@ -89,8 +93,106 @@ try {
         data-cashier-token="<?= htmlspecialchars($session['cashierToken']) ?>"></script>
 ```
 
-That's the whole integration: the session call above, the script tag, and your domain bound
-to your checkout by Dominaite during onboarding.
+That's the checkout half: the session call above, the script tag, and your domain bound to
+your checkout by Dominaite during onboarding. The other half is the webhook that tells you
+the payment happened.
+
+## Webhooks
+
+Register an endpoint in the dashboard (Developers, Webhooks): an HTTPS URL, the events you
+want, and you get a signing secret `whsec_...` shown exactly once. Store it like the API
+secret. Regenerating it kills the old one.
+
+### Receiving a delivery (your `webhook.php`)
+
+```php
+<?php
+require __DIR__ . '/vendor/autoload.php';
+
+use Dominaite\DominaiteClient;
+
+// The RAW body, before any parsing. Do not use $_POST and do not re-encode:
+// the signature covers these exact bytes.
+$payload = file_get_contents('php://input');
+$signature = $_SERVER['HTTP_X_WEBHOOK_SIGNATURE'] ?? '';
+
+if (!DominaiteClient::verifyWebhook($payload, $signature, getenv('DOMINAITE_WEBHOOK_SECRET'))) {
+    http_response_code(400);
+    exit;
+}
+
+$event = json_decode($payload, true);
+
+// Answer immediately, then do the work. Anything slow here eats into the delivery
+// timeout and earns you a retry you did not need.
+http_response_code(200);
+
+if (!already_handled($event['id'])) {          // dedupe on the delivery id
+    queue_fulfilment($event);                  // your own job queue
+    mark_handled($event['id']);
+}
+```
+
+`verifyWebhook($payload, $signatureHeader, $secret, $toleranceSeconds = 300, $now = null)`
+returns `true` or `false`. It returns `false` for everything the sender controls: a bad
+signature, a body that changed by one byte, a stale timestamp, a missing or garbled header.
+It throws `InvalidArgumentException` only for your own mistakes, an empty secret or a
+negative tolerance. Verify before you parse, always.
+
+The header is `X-Webhook-Signature: t=<unix seconds>,v1=<hex>`, where `v1` is HMAC-SHA256
+over `"{t}.{raw body}"` keyed with your endpoint secret. The timestamp is inside the MAC and
+checked against a 300 second window, so a captured delivery cannot be replayed later.
+
+### What arrives
+
+```json
+{
+  "id": "delivery id, your dedupe key",
+  "type": "payment.succeeded",
+  "createdAt": "2026-08-20T14:00:00Z",
+  "data": {
+    "transactionId": "...",
+    "status": "succeeded",
+    "previousStatus": "pending",
+    "kind": "sale",
+    "amount": 8440,
+    "grossAmount": 8701,
+    "surchargeAmount": 261,
+    "currency": "EUR",
+    "originalTransactionId": null,
+    "idempotencyKey": "order-123"
+  }
+}
+```
+
+Flat envelope, no `success` wrapper to branch on. Amounts are minor units: `amount` is what
+you get paid, `grossAmount` is what moved on the card, `surchargeAmount` is the difference
+when a surcharge applies.
+
+Events: `payment.succeeded`, `payment.failed`, `payment.requires_capture`,
+`payment.cancelled`, `payment.abandoned`, `payment.refunded`, `payment.disputed`.
+`payment.succeeded` is the only one that means money in hand. In-flight states (`pending`,
+`processing`) are not webhooked, so drive that part of your UX from the session status.
+
+### Delivery guarantees
+
+- At least once. The same delivery can arrive twice, so dedupe on `id` and make your
+  handler idempotent.
+- Respond 2xx fast and queue the work. Never fulfil the order inline in the request.
+- Failed attempts retry up to your configured count (3 by default, 10 max), spaced 1m, 5m,
+  30m, 2h, 12h.
+- An endpoint that fails its initial attempt and every retry in a row gets disabled
+  automatically, and re-enables itself on the next successful delivery. An endpoint you
+  disable by hand stays disabled.
+- Up to 25 active endpoints per merchant.
+
+### Reconcile anyway
+
+Webhooks complement a reconciliation sweep, they do not replace it. Keep a job that walks
+your open orders and calls `getStatus()` on anything past its expected settle time. There
+are windows where a delivery never lands: a chain parked on a disabled endpoint, or an
+outage on our side between the payment and the publish. The sweep is what closes them, and
+it is not optional if you care about your books.
 
 ## Amounts are minor units
 
@@ -108,7 +210,10 @@ timeout, retry with the same key rather than generating a new one.
 
 A session is valid for 2 hours. If the payer comes back later, create a new session.
 
-## Status polling
+## Fallback: status polling
+
+Use this when you have not registered a webhook endpoint yet, inside your reconciliation
+sweep, or any time you need the current state of one specific payment on demand.
 
 ```php
 $status = $client->getStatus($session['transactionId']);
