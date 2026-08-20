@@ -24,6 +24,26 @@ You get two values from Dominaite (shown once - store them like passwords):
 Every request is signed with the secret (HMAC-SHA256) and timestamped. Keep your server
 clock on NTP - signatures older than 5 minutes are rejected.
 
+## Ping before your first session
+
+One signed GET that creates nothing, so anything that fails here is your credentials, your
+signing or your clock - not the payment:
+
+```php
+<?php
+require __DIR__ . '/vendor/autoload.php';
+
+use Dominaite\DominaiteClient;
+
+$client = new DominaiteClient(getenv('DOMINAITE_KEY_ID'), getenv('DOMINAITE_SECRET'));
+
+print_r($client->ping());
+// ['pong' => true, 'merchantId' => '...', 'serverTime' => '...', 'clockSkewSeconds' => 0]
+```
+
+Watch `clockSkewSeconds`: the gateway rejects requests once it passes 300, so a number that
+keeps growing is your cue to fix NTP before payments start failing.
+
 ## Create a session (your `create_session.php`)
 
 ```php
@@ -97,9 +117,39 @@ $status = $client->getStatus($session['transactionId']);
 ```
 
 `status` is one of: `pending`, `processing`, `succeeded`, `failed`, `refunded`,
-`partially_refunded`, `cancelled`, `disputed`, `abandoned`. While the session is still
-payable the response also carries `expiresAt`; after that instant a `pending` session can
-only become `abandoned`. An unknown transaction id throws an `ApiException` with HTTP 404.
+`partially_refunded`, `cancelled`, `disputed`, `requires_capture`, `abandoned`. While the
+session is still payable the response also carries `expiresAt`; after that instant a `pending`
+session can only become `abandoned`. An unknown transaction id throws an `ApiException` with
+HTTP 404.
+
+`succeeded` is the only value that means the payment is complete. Keep polling on `pending`,
+`processing` and `requires_capture` - none of them is terminal.
+
+`requires_capture` is **not** "unpaid": the payer has already paid and the funds are held
+awaiting capture. Never treat it as an abandoned order.
+
+Treat any status you do not recognise as still-open as well: a value the API adds later should
+make you keep polling, never silently close an order that is still live.
 
 Poll after the payer returns to you, or on your order timeout - not in a tight loop; the
 endpoint is rate limited per key.
+
+### Recovering from a replay refusal
+
+When your idempotency key collides with an earlier attempt, the refusal names the transaction
+it collided with, so you can reconcile instead of minting a second payment:
+
+```php
+try {
+    $session = $client->createCheckoutSession($params);
+} catch (CheckoutRefusedException $refusal) {
+    if ($refusal->getTransactionId() !== null) {
+        $status = $client->getStatus($refusal->getTransactionId());
+        // Now you know what the earlier attempt actually did.
+    }
+}
+```
+
+`getTransactionId()` is `null` when the API did not name one (a concurrent-race
+`DUPLICATE_REQUEST` knows the key is taken but not yet by which row), so check it before use.
+The full refusal payload is on `getResult()`.

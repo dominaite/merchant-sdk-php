@@ -31,7 +31,8 @@ final class DominaiteClient
 {
     private const DEFAULT_BASE_URL = 'https://api.dominaite.com/payments';
     private const SESSIONS_PATH = '/merchant-api/bridgerpay/checkout/sessions';
-    private const USER_AGENT = 'dominaite-php/0.1.0 (php ' . PHP_VERSION . ')';
+    public const PING_PATH = '/merchant-api/ping';
+    private const USER_AGENT = 'dominaite-php/0.1.2 (php ' . PHP_VERSION . ')';
     private const TIMEOUT_SECONDS = 15;
 
     private string $keyId;
@@ -54,6 +55,28 @@ final class DominaiteClient
         $this->keyId = $keyId;
         $this->secret = $secret;
         $this->baseUrl = rtrim($baseUrl, '/');
+    }
+
+    /**
+     * Checks your credentials, your signing and your clock without creating anything.
+     *
+     * Make this your first live call: it tells you whether the setup is right before
+     * a real payment is on the line. A failure here is the key id, the secret, the
+     * signature, the clock or an IP allowlist, and never the payment itself.
+     *
+     * Watch clockSkewSeconds - the gateway rejects requests once it passes 300.
+     *
+     * @return array{pong:bool,merchantId:string,serverTime?:string,serverUnixTime?:int,clockSkewSeconds:int}
+     *
+     * @throws AuthenticationException Wrong/revoked credentials, bad signature, clock off, IP not allowlisted.
+     * @throws ApiException            Unexpected API response.
+     * @throws TransportException      Network-level failure.
+     */
+    public function ping(): array
+    {
+        // GET signs an EMPTY idempotency key and an EMPTY body, and sends no
+        // Idempotency-Key header - the same signed shape getStatus() uses.
+        return $this->request('GET', self::PING_PATH, null, '');
     }
 
     /**
@@ -94,9 +117,16 @@ final class DominaiteClient
         $response = $this->request('POST', self::SESSIONS_PATH, $params, $idempotencyKey);
 
         if (($response['success'] ?? false) !== true || !isset($response['checkout'])) {
+            // A replay refusal names the transaction the key collided with. Carry it
+            // (and the whole payload) so the caller can reconcile with getStatus()
+            // instead of minting a second payment for the same order.
+            $transactionId = $response['transactionId'] ?? null;
+
             throw new CheckoutRefusedException(
                 (string) ($response['errorCode'] ?? 'UNKNOWN'),
-                (string) ($response['errorMessage'] ?? 'The checkout session was refused.')
+                (string) ($response['errorMessage'] ?? 'The checkout session was refused.'),
+                is_string($transactionId) && $transactionId !== '' ? $transactionId : null,
+                $response
             );
         }
 
@@ -107,8 +137,17 @@ final class DominaiteClient
      * Reads the payment status of one of your checkout sessions.
      *
      * Status values: pending, processing, succeeded, failed, refunded, partially_refunded,
-     * cancelled, disputed, abandoned. While a session is still payable the response carries
-     * expiresAt; amounts are integers in MINOR units.
+     * cancelled, disputed, requires_capture, abandoned. While a session is still payable the
+     * response carries expiresAt; amounts are integers in MINOR units.
+     *
+     * succeeded is the only value that means the payment is complete. Keep polling on
+     * pending, processing and requires_capture - none of them is terminal.
+     *
+     * requires_capture is NOT "unpaid": the payer has already paid and the funds are held
+     * awaiting capture. Never treat it as an abandoned order.
+     *
+     * Treat any status you do not recognise as still-open too: a value the API adds later
+     * should make you keep polling, never silently close an order that is still live.
      *
      * @param string $transactionId The transactionId returned by createCheckoutSession().
      * @return array{transactionId:string,orderId:string,orderReference?:string,status:string,amount:int,currency:string,refundedAmount?:int,createdAt:string,updatedAt?:string,expiresAt?:string}
