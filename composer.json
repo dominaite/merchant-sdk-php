@@ -1,0 +1,24 @@
+{
+    "name": "dominaite/merchant-sdk",
+    "description": "Server-side PHP client for the Dominaite merchant API: create hosted checkout sessions from your own backend.",
+    "type": "library",
+    "license": "MIT",
+    "require": {
+        "php": ">=7.4",
+        "ext-curl": "*",
+        "ext-json": "*"
+    },
+    "require-dev": {
+        "phpunit/phpunit": "^9.6"
+    },
+    "autoload": {
+        "psr-4": {
+            "Dominaite\\": "src/"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "Dominaite\\Tests\\": "tests/"
+        }
+    }
+}
