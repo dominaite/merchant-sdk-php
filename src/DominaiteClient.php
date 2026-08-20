@@ -1,0 +1,232 @@
+<?php
+
+declare(strict_types=1);
+
+namespace Dominaite;
+
+use Dominaite\Exception\ApiException;
+use Dominaite\Exception\AuthenticationException;
+use Dominaite\Exception\CheckoutRefusedException;
+use Dominaite\Exception\TransportException;
+
+/**
+ * Server-side client for the Dominaite merchant API.
+ *
+ * Keep your API secret on the server. Never ship it to a browser, never commit it,
+ * never log it. Card details never touch your backend or this SDK - the payer enters
+ * them inside the hosted checkout widget.
+ *
+ * Usage:
+ *
+ *   $client = new DominaiteClient('dmk_...', 'dms_...');
+ *   $session = $client->createCheckoutSession([
+ *       'amount'         => 2500,          // minor units: 25.00 EUR
+ *       'currency'       => 'EUR',
+ *       'orderReference' => 'order-1042',  // your own order id
+ *       'customer'       => ['firstName' => 'Ana', 'lastName' => 'K', 'email' => 'ana@example.com'],
+ *   ]);
+ *   // Hand $session['cashierKey'] + $session['cashierToken'] to the embed snippet.
+ */
+final class DominaiteClient
+{
+    private const DEFAULT_BASE_URL = 'https://api.dominaite.com/payments';
+    private const SESSIONS_PATH = '/merchant-api/checkout/sessions';
+    private const USER_AGENT = 'dominaite-php/0.1.0 (php ' . PHP_VERSION . ')';
+    private const TIMEOUT_SECONDS = 15;
+
+    private string $keyId;
+    private string $secret;
+    private string $baseUrl;
+
+    /**
+     * @param string $keyId   Your API key id (dmk_...), from the Dominaite dashboard/operator.
+     * @param string $secret  Your API secret (dms_...). Server-side only.
+     * @param string $baseUrl Override for non-production environments.
+     */
+    public function __construct(string $keyId, string $secret, string $baseUrl = self::DEFAULT_BASE_URL)
+    {
+        if (strpos($keyId, 'dmk_') !== 0) {
+            throw new \InvalidArgumentException('keyId must start with dmk_');
+        }
+        if (strpos($secret, 'dms_') !== 0) {
+            throw new \InvalidArgumentException('secret must start with dms_');
+        }
+        $this->keyId = $keyId;
+        $this->secret = $secret;
+        $this->baseUrl = rtrim($baseUrl, '/');
+    }
+
+    /**
+     * Creates a hosted checkout session for one payment.
+     *
+     * Required params: amount (int, MINOR units - cents), currency (ISO 4217),
+     * orderReference (your order id, <= 100 chars).
+     * Optional: customer{firstName,lastName,email,phone}, country (ISO 3166-1 alpha-2),
+     * language (ISO 639-1), theme ('light'|'dark'|'bright'), description,
+     * idempotencyKey (auto-generated when omitted - retrying with the same key never
+     * creates a second payment).
+     *
+     * @param array<string,mixed> $params
+     * @return array{transactionId:string,orderId:string,cashierKey:string,cashierToken:string,amount:int,currency:string,expiresAt:string}
+     *
+     * @throws AuthenticationException Wrong/revoked credentials or bad signature (fix config; do not retry).
+     * @throws CheckoutRefusedException The gateway refused the session (inspect getErrorCode()).
+     * @throws ApiException            Unexpected API response.
+     * @throws TransportException      Network-level failure (safe to retry WITH the same idempotencyKey).
+     */
+    public function createCheckoutSession(array $params): array
+    {
+        foreach (['amount', 'currency', 'orderReference'] as $required) {
+            if (!isset($params[$required])) {
+                throw new \InvalidArgumentException("Missing required parameter: {$required}");
+            }
+        }
+        if (!is_int($params['amount']) || $params['amount'] <= 0) {
+            throw new \InvalidArgumentException('amount must be a positive integer in MINOR units (e.g. 2500 for 25.00 EUR)');
+        }
+
+        $idempotencyKey = $params['idempotencyKey'] ?? bin2hex(random_bytes(16));
+        unset($params['idempotencyKey']);
+        if (!is_string($idempotencyKey) || $idempotencyKey === '' || strlen($idempotencyKey) > 100) {
+            throw new \InvalidArgumentException('idempotencyKey must be a non-empty string of at most 100 characters');
+        }
+
+        $response = $this->request('POST', self::SESSIONS_PATH, $params, $idempotencyKey);
+
+        if (($response['success'] ?? false) !== true || !isset($response['checkout'])) {
+            throw new CheckoutRefusedException(
+                (string) ($response['errorCode'] ?? 'UNKNOWN'),
+                (string) ($response['errorMessage'] ?? 'The checkout session was refused.')
+            );
+        }
+
+        return $response['checkout'];
+    }
+
+    /**
+     * Reads the payment status of one of your checkout sessions.
+     *
+     * Status values: pending, processing, succeeded, failed, refunded, partially_refunded,
+     * cancelled, disputed, abandoned. While a session is still payable the response carries
+     * expiresAt; amounts are integers in MINOR units.
+     *
+     * @param string $transactionId The transactionId returned by createCheckoutSession().
+     * @return array{transactionId:string,orderId:string,orderReference?:string,status:string,amount:int,currency:string,refundedAmount?:int,createdAt:string,updatedAt?:string,expiresAt?:string}
+     *
+     * @throws AuthenticationException Wrong/revoked credentials or bad signature (fix config; do not retry).
+     * @throws ApiException            Unknown transaction id (HTTP 404) or unexpected response.
+     * @throws TransportException      Network-level failure (safe to retry).
+     */
+    public function getStatus(string $transactionId): array
+    {
+        $normalized = strtolower(trim($transactionId));
+        if (preg_match('/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/', $normalized) !== 1) {
+            throw new \InvalidArgumentException('transactionId must be the UUID returned by createCheckoutSession()');
+        }
+
+        return $this->request('GET', self::SESSIONS_PATH . '/' . $normalized, null, '');
+    }
+
+    /**
+     * @param array<string,mixed>|null $body Null for GET: an empty body (and empty
+     *                                       idempotency key) is what gets signed.
+     * @return array<string,mixed>
+     */
+    private function request(string $method, string $path, ?array $body, string $idempotencyKey): array
+    {
+        if ($body === null) {
+            $json = '';
+        } else {
+            $json = json_encode($body, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+            if ($json === false) {
+                throw new \InvalidArgumentException('Request parameters are not JSON-encodable');
+            }
+        }
+
+        $timestamp = (string) time();
+        $signature = $this->sign($timestamp, $method, $path, $idempotencyKey, $json);
+
+        $headers = [
+            'Content-Type: application/json',
+            'X-Api-Key-Id: ' . $this->keyId,
+            'X-Timestamp: ' . $timestamp,
+            'X-Signature: ' . $signature,
+        ];
+        if ($idempotencyKey !== '') {
+            $headers[] = 'Idempotency-Key: ' . $idempotencyKey;
+        }
+
+        $ch = curl_init($this->baseUrl . $path);
+        $options = [
+            CURLOPT_CUSTOMREQUEST => $method,
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_TIMEOUT => self::TIMEOUT_SECONDS,
+            // Some edges block requests without a real User-Agent - always send one.
+            CURLOPT_USERAGENT => self::USER_AGENT,
+            CURLOPT_HTTPHEADER => $headers,
+        ];
+        if ($body !== null) {
+            $options[CURLOPT_POSTFIELDS] = $json;
+        }
+        curl_setopt_array($ch, $options);
+
+        $raw = curl_exec($ch);
+        if ($raw === false) {
+            $error = curl_error($ch);
+            curl_close($ch);
+            throw new TransportException("Could not reach the Dominaite API: {$error}");
+        }
+        $status = (int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
+        curl_close($ch);
+
+        $decoded = json_decode((string) $raw, true);
+        if (!is_array($decoded)) {
+            throw new ApiException($status, 'The API returned a non-JSON response');
+        }
+
+        // The gateway wraps responses as { success, data, ... }; unwrap when present.
+        // Error responses carry the machine-readable code at error.code.
+        $payload = isset($decoded['data']) && is_array($decoded['data']) ? $decoded['data'] : $decoded;
+        $envelopeError = isset($decoded['error']) && is_array($decoded['error']) ? $decoded['error'] : [];
+
+        if ($status === 401 || $status === 403) {
+            throw new AuthenticationException(
+                (string) ($payload['errorCode'] ?? $envelopeError['code'] ?? 'UNAUTHORIZED'),
+                'Authentication failed - check your key id, secret, and server clock.'
+            );
+        }
+        if ($status >= 500) {
+            throw new TransportException("The Dominaite API is unavailable (HTTP {$status}); retry with the same idempotency key.");
+        }
+        if ($status >= 400) {
+            throw new ApiException($status, (string) ($payload['errorMessage'] ?? $envelopeError['message'] ?? 'Request rejected'));
+        }
+
+        return $payload;
+    }
+
+    /**
+     * Request signature: hex HMAC-SHA256 over
+     * "{timestamp}\n{METHOD}\n{path}\n{idempotencyKey}\n{sha256hex(body)}".
+     * The idempotency key is INSIDE the signature, so a captured request cannot be replayed
+     * with a different key to mint extra sessions. The server rejects timestamps more than
+     * 5 minutes off - keep your server clock on NTP.
+     */
+    private function sign(string $timestamp, string $method, string $path, string $idempotencyKey, string $body): string
+    {
+        return self::signRequest($this->secret, $timestamp, $method, $path, $idempotencyKey, $body);
+    }
+
+    /**
+     * Builds the X-Signature value for one request: lowercase hex HMAC-SHA256 over
+     * "{timestamp}\n{METHOD}\n{path}\n{idempotencyKey}\n{sha256hex(body)}".
+     *
+     * Public so you can pin the published known-answer vectors in your own tests
+     * before ever calling the live API.
+     */
+    public static function signRequest(string $secret, string $timestamp, string $method, string $path, string $idempotencyKey, string $body): string
+    {
+        $payload = $timestamp . "\n" . strtoupper($method) . "\n" . $path . "\n" . $idempotencyKey . "\n" . hash('sha256', $body);
+        return hash_hmac('sha256', $payload, $secret);
+    }
+}
