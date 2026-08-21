@@ -101,6 +101,7 @@ class DominaiteClient
         if (strpos($secret, 'dms_') !== 0) {
             throw new \InvalidArgumentException('secret must start with dms_');
         }
+        self::assertHeaderSafe('keyId', $keyId);
         $this->keyId = $keyId;
         $this->secret = $secret;
         $this->baseUrl = rtrim($baseUrl, '/');
@@ -162,6 +163,7 @@ class DominaiteClient
         if (!is_string($idempotencyKey) || $idempotencyKey === '' || strlen($idempotencyKey) > 100) {
             throw new \InvalidArgumentException('idempotencyKey must be a non-empty string of at most 100 characters');
         }
+        self::assertHeaderSafe('idempotencyKey', $idempotencyKey);
 
         // Recorded BEFORE the call so a caller who catches TransportException can read the
         // key the timed-out attempt used and retry with it. A generated key that only ever
@@ -308,6 +310,25 @@ class DominaiteClient
 
         // Age last: a valid MAC on a stale delivery is a replay, not a rejection to log as tampering.
         return abs(($now ?? time()) - (int) $timestamp) <= $toleranceSeconds;
+    }
+
+    /**
+     * Values that end up in a request header must be printable ASCII.
+     *
+     * A CR or LF closes the header line, so anything after it becomes headers of the
+     * caller's own choosing - an orderReference-derived key like "order-1\r\nX-Forwarded-For: 1.2.3.4"
+     * would rewrite what the gateway sees as the client IP. Reject the value here rather
+     * than letting curl serialise it.
+     */
+    private static function assertHeaderSafe(string $name, string $value): void
+    {
+        // \z, not $: $ also matches just before a trailing newline, which is exactly the
+        // byte being defended against.
+        if (preg_match('/^[\x20-\x7E]*\z/', $value) !== 1) {
+            throw new \InvalidArgumentException(
+                "{$name} must contain only printable ASCII characters (0x20-0x7E); it is sent as an HTTP header"
+            );
+        }
     }
 
     /**

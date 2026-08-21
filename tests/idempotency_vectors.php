@@ -1,5 +1,6 @@
 <?php
-// Dependency-free tests for the idempotency key: it stays the same across a retried call.
+// Dependency-free tests for the idempotency key: it stays the same across a retried
+// call, and it can never smuggle extra HTTP headers.
 // Run: php tests/idempotency_vectors.php - exits non-zero on any mismatch.
 //
 // Why this file exists: the key is the gateway's only duplicate-payment guard. A retry
@@ -122,5 +123,54 @@ check('a caller key is sent verbatim on every attempt',
     implode(',', $mine->keysSent), 'order-1042,order-1042');
 check('a caller key is what getLastIdempotencyKey() reports',
     (string) $mine->getLastIdempotencyKey(), 'order-1042');
+
+// 4. Nothing that would break out of the header line survives validation. The key is
+//    concatenated into an HTTP header, so a CR or LF in it injects headers of the
+//    caller's choosing - X-Forwarded-For, say, which the pre-auth rate limiter trusts.
+$injections = [
+    'CRLF' => "order-1\r\nX-Injected: yes",
+    'bare CR' => "order-1\rX-Injected: yes",
+    'bare LF' => "order-1\nX-Injected: yes",
+    'trailing LF' => "order-1\n",
+    'leading CRLF' => "\r\norder-1",
+    'NUL' => "order-1\0",
+    'tab' => "order-1\tX",
+    'non-ascii' => "order-\u{00e9}1",
+];
+foreach ($injections as $label => $bad) {
+    $client = new FlakyClient();
+    $outcome = 'accepted';
+    try {
+        $client->createCheckoutSession($params + ['idempotencyKey' => $bad]);
+    } catch (\InvalidArgumentException $e) {
+        $outcome = 'rejected locally';
+    }
+    check("idempotency key rejected before the call: $label", $outcome, 'rejected locally');
+    check("nothing was sent for the rejected key: $label", (string) count($client->keysSent), '0');
+}
+
+// Ordinary keys still pass - the check must not cost anyone a working integration.
+foreach (['order-1042', 'ORDER 1042 / attempt #2', str_repeat('k', 100), '~!@#$%^&*()_+={}[]|:;"<>,.?'] as $good) {
+    $client = new FlakyClient();
+    $outcome = 'rejected';
+    try {
+        $client->createCheckoutSession($params + ['idempotencyKey' => $good]);
+        $outcome = 'accepted';
+    } catch (\InvalidArgumentException $e) {
+        // falls through as rejected
+    }
+    check('normal idempotency key accepted: ' . substr($good, 0, 12), $outcome, 'accepted');
+}
+
+// 5. The key id lands in X-Api-Key-Id, so it gets the same treatment.
+foreach (["dmk_a\r\nX-Injected: yes", "dmk_a\n", "dmk_\u{00e9}"] as $badKeyId) {
+    $outcome = 'accepted';
+    try {
+        new DominaiteClient($badKeyId, 'dms_0123456789abcdef');
+    } catch (\InvalidArgumentException $e) {
+        $outcome = 'rejected locally';
+    }
+    check('key id with header-breaking bytes rejected', $outcome, 'rejected locally');
+}
 
 exit($failures === 0 ? 0 : 1);
