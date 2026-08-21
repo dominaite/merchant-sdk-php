@@ -326,10 +326,15 @@ class DominaiteClient
      * body - read it with file_get_contents('php://input') and do not re-encode it, do
      * not use the already-decoded $_POST. A single re-serialised byte fails the check.
      *
-     * The header looks like "t=1755700000,v1=<64 lowercase hex>". v1 is HMAC-SHA256 over
+     * The header is exactly "t=1755700000,v1=<64 lowercase hex>". v1 is HMAC-SHA256 over
      * "{t}.{raw body}" keyed with the endpoint's whsec_ secret. A delivery whose
      * timestamp is more than $toleranceSeconds away from now is rejected even when the
      * MAC is valid, so a captured delivery cannot be replayed at leisure.
+     *
+     * The grammar is strict, matching what the platform emits: comma-separated key=value
+     * elements, no whitespace anywhere, one t and one v1 (a repeat of either rejects the
+     * whole header), t is ASCII digits, v1 is lowercase hex. Unknown keys are ignored so
+     * a later v2 scheme can roll out without breaking v1 readers.
      *
      * Returns false - never throws - for anything an attacker controls: a bad MAC, a
      * stale timestamp, a missing or malformed header. Answer 400 and stop.
@@ -359,14 +364,22 @@ class DominaiteClient
         $timestamp = null;
         $received = null;
         foreach (explode(',', $signatureHeader) as $part) {
-            $pair = explode('=', trim($part), 2);
+            $pair = explode('=', $part, 2);
             if (count($pair) !== 2) {
-                continue;
+                return false;
             }
-            // Unknown keys are ignored on purpose: a future v2= scheme must not break v1 readers.
-            if ($pair[0] === 't' && $timestamp === null) {
+            // Unknown keys are ignored on purpose: a future v2= scheme must not break v1
+            // readers. t and v1 may each appear once - a repeat is a header we do not
+            // understand, so we refuse it rather than pick a candidate out of it.
+            if ($pair[0] === 't') {
+                if ($timestamp !== null) {
+                    return false;
+                }
                 $timestamp = $pair[1];
-            } elseif ($pair[0] === 'v1' && $received === null) {
+            } elseif ($pair[0] === 'v1') {
+                if ($received !== null) {
+                    return false;
+                }
                 $received = $pair[1];
             }
         }
@@ -374,7 +387,9 @@ class DominaiteClient
         if ($timestamp === null || $received === null) {
             return false;
         }
-        if (preg_match('/^[0-9]{1,10}$/', $timestamp) !== 1 || preg_match('/^[0-9a-f]{64}$/', $received) !== 1) {
+        // The raw digits go into the MAC input untouched: reformatting the number here
+        // would let "01755700000" and "1755700000" sign the same bytes.
+        if (preg_match('/^[0-9]+$/', $timestamp) !== 1 || preg_match('/^[0-9a-f]{64}$/', $received) !== 1) {
             return false;
         }
 
