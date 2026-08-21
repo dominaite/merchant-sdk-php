@@ -27,13 +27,61 @@ use Dominaite\Exception\TransportException;
  *   ]);
  *   // Hand $session['cashierKey'] + $session['cashierToken'] to the embed snippet.
  */
-final class DominaiteClient
+// Not final: the contract test substitutes the transport by overriding request().
+// Everything a merchant should call is public and documented below; the protected
+// members are an internal seam and can change without a major version.
+class DominaiteClient
 {
     private const DEFAULT_BASE_URL = 'https://api.dominaite.com/payments';
-    private const SESSIONS_PATH = '/merchant-api/bridgerpay/checkout/sessions';
+    public const SESSIONS_PATH = '/merchant-api/bridgerpay/checkout/sessions';
     public const PING_PATH = '/merchant-api/ping';
     private const USER_AGENT = 'dominaite-php/0.1.2 (php ' . PHP_VERSION . ')';
     private const TIMEOUT_SECONDS = 15;
+
+    /**
+     * Every value getStatus() can return in `status`, in the API's own order.
+     *
+     * Pinned against the canonical cross-SDK contract fixture
+     * (tests/merchant-api-contract.json) so a value cannot ship in one SDK and be
+     * mirrored wrong into the others. Do NOT extend this list to "support" a status
+     * you saw in the wild - treat unknown values as still-open (see getStatus()) and
+     * get the gateway contract changed first.
+     */
+    public const STATUS_VOCABULARY = [
+        'pending',
+        'processing',
+        'succeeded',
+        'failed',
+        'refunded',
+        'partially_refunded',
+        'cancelled',
+        'disputed',
+        'requires_capture',
+        'abandoned',
+    ];
+
+    /**
+     * Every errorCode a refused createCheckoutSession() can carry, as pinned by the
+     * canonical contract fixture. These arrive as HTTP 200 with success=false and reach
+     * the caller as a CheckoutRefusedException - branch on getErrorCode().
+     */
+    public const REFUSAL_ERROR_CODES = [
+        'PAYMENT_PROCESSING_UNAVAILABLE',
+        'DUPLICATE_REQUEST',
+        'ALREADY_PROCESSED',
+        'IDEMPOTENCY_KEY_REUSED',
+        'PRIOR_ATTEMPT_FAILED',
+    ];
+
+    /**
+     * Input-validation codes on the create endpoint. Unlike the refusals above these are
+     * HTTP 400, not the success=false shape, and surface as ApiException. This SDK
+     * generates and length-checks the idempotency key itself, so a correct integration
+     * never sees IDEMPOTENCY_KEY_REQUIRED.
+     */
+    public const VALIDATION_ERROR_CODES = [
+        'IDEMPOTENCY_KEY_REQUIRED',
+    ];
 
     private string $keyId;
     private string $secret;
@@ -66,7 +114,7 @@ final class DominaiteClient
      *
      * Watch clockSkewSeconds - the gateway rejects requests once it passes 300.
      *
-     * @return array{pong:bool,merchantId:string,serverTime?:string,serverUnixTime?:int,clockSkewSeconds:int}
+     * @return array{pong:bool,merchantId:string,serverTime:string,serverUnixTime:int,clockSkewSeconds:int}
      *
      * @throws AuthenticationException Wrong/revoked credentials, bad signature, clock off, IP not allowlisted.
      * @throws ApiException            Unexpected API response.
@@ -150,7 +198,7 @@ final class DominaiteClient
      * should make you keep polling, never silently close an order that is still live.
      *
      * @param string $transactionId The transactionId returned by createCheckoutSession().
-     * @return array{transactionId:string,orderId:string,orderReference?:string,status:string,amount:int,currency:string,refundedAmount?:int,createdAt:string,updatedAt?:string,expiresAt?:string}
+     * @return array{transactionId:string,orderId:string,orderReference:?string,status:string,amount:int,currency:string,refundedAmount:?int,createdAt:string,updatedAt:?string,expiresAt:?string}
      *
      * @throws AuthenticationException Wrong/revoked credentials or bad signature (fix config; do not retry).
      * @throws ApiException            Unknown transaction id (HTTP 404) or unexpected response.
@@ -238,8 +286,12 @@ final class DominaiteClient
      * @param array<string,mixed>|null $body Null for GET: an empty body (and empty
      *                                       idempotency key) is what gets signed.
      * @return array<string,mixed>
+     *
+     * Protected, not private, so the contract test can substitute canned gateway
+     * responses and exercise the response handling above without a network call.
+     * Not part of the public API - do not call or rely on it from integration code.
      */
-    private function request(string $method, string $path, ?array $body, string $idempotencyKey): array
+    protected function request(string $method, string $path, ?array $body, string $idempotencyKey): array
     {
         if ($body === null) {
             $json = '';
