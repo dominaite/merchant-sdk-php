@@ -28,6 +28,30 @@ You get two values from Dominaite (shown once - store them like passwords):
 Every request is signed with the secret (HMAC-SHA256) and timestamped. Keep your server
 clock on NTP - signatures older than 5 minutes are rejected.
 
+### Do not dump the client
+
+The client holds your secret in memory. Do not `var_dump()`, `print_r()`, `var_export()`,
+`(array)`-cast or `serialize()` a client as a way to inspect it, and do not let one reach a
+log line or an error tracker.
+
+`var_dump()`, `print_r()` and `serialize()` are redacted for you - the client implements
+`__debugInfo()` and `__serialize()`, which Symfony VarDumper, Ignition and Whoops honour too,
+so a client caught in an exception page does not print your secret. `json_encode()` returns
+`{}` because the properties are private.
+
+**`var_export()`, an `(array)` cast and Reflection are NOT redacted.** They honour no hook and
+print the secret in full. There is no way for the SDK to intercept them, so this one is on you.
+
+One more thing worth setting in production `php.ini`:
+
+```ini
+zend.exception_ignore_args = 1
+```
+
+Without it, a stack trace records the arguments each frame was called with, so an exception
+thrown anywhere below `new DominaiteClient(...)` carries your plaintext secret into whatever
+renders or ships that trace.
+
 ## Ping before your first session
 
 One signed GET that creates nothing, so anything that fails here is your credentials, your

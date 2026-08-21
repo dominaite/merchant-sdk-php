@@ -38,6 +38,9 @@ class DominaiteClient
     private const USER_AGENT = 'dominaite-php/0.1.2 (php ' . PHP_VERSION . ')';
     private const TIMEOUT_SECONDS = 15;
 
+    /** Stands in for the secret wherever the client is dumped or serialized. */
+    private const REDACTED = 'dms_***redacted***';
+
     /**
      * Every value getStatus() can return in `status`, in the API's own order.
      *
@@ -105,6 +108,60 @@ class DominaiteClient
         $this->keyId = $keyId;
         $this->secret = $secret;
         $this->baseUrl = rtrim($baseUrl, '/');
+    }
+
+    /**
+     * Keeps the API secret out of var_dump() and out of error-tracker output.
+     *
+     * var_dump() and print_r() honour this hook, and so do the dumpers built on them -
+     * Symfony VarDumper, Ignition, Whoops - which is the path that puts a dumped client
+     * into a bug report or an exception page. Verified on 7.4 and 8.3.
+     *
+     * NOT a general guarantee. var_export(), an (array) cast and Reflection honour no hook
+     * and still show the secret in full. Do not reach for them on a client.
+     * See "Do not dump the client" in the README.
+     *
+     * @return array<string,mixed>
+     */
+    public function __debugInfo(): array
+    {
+        return [
+            'keyId' => $this->keyId,
+            'secret' => self::REDACTED,
+            'baseUrl' => $this->baseUrl,
+            'lastIdempotencyKey' => $this->lastIdempotencyKey,
+        ];
+    }
+
+    /**
+     * Keeps the API secret out of serialize() output.
+     *
+     * A client is not session data and there is no reason to serialize one, but frameworks
+     * do snapshot their service container, and a serialized blob tends to end up in a cache
+     * or a log. Redacting rather than throwing keeps that snapshot from turning into an
+     * outage; the restored client cannot sign, which is the intended outcome.
+     *
+     * @return array<string,mixed>
+     */
+    public function __serialize(): array
+    {
+        return [
+            'keyId' => $this->keyId,
+            'secret' => self::REDACTED,
+            'baseUrl' => $this->baseUrl,
+            'lastIdempotencyKey' => $this->lastIdempotencyKey,
+        ];
+    }
+
+    /**
+     * @param array<string,mixed> $data
+     */
+    public function __unserialize(array $data): void
+    {
+        $this->keyId = (string) ($data['keyId'] ?? '');
+        $this->secret = (string) ($data['secret'] ?? self::REDACTED);
+        $this->baseUrl = (string) ($data['baseUrl'] ?? self::DEFAULT_BASE_URL);
+        $this->lastIdempotencyKey = isset($data['lastIdempotencyKey']) ? (string) $data['lastIdempotencyKey'] : null;
     }
 
     /**
