@@ -137,7 +137,12 @@ class DominaiteClient
      * Optional: customer{firstName,lastName,email,phone}, country (ISO 3166-1 alpha-2),
      * language (ISO 639-1), theme ('light'|'dark'|'bright'), description,
      * idempotencyKey (auto-generated when omitted - retrying with the same key never
-     * creates a second payment).
+     * creates a second payment; read the generated one back with getLastIdempotencyKey()).
+     *
+     * Retrying a key the gateway already saw does NOT return the original session: it
+     * answers HTTP 200 with success=false and a replay code, which arrives here as a
+     * CheckoutRefusedException. The first session's cashierKey/cashierToken are not in
+     * that response - reconcile via the refusal's transaction id and getStatus().
      *
      * @param array<string,mixed> $params
      * @return array{transactionId:string,orderId:string,cashierKey:string,cashierToken:string,amount:int,currency:string,expiresAt:string}
@@ -145,7 +150,7 @@ class DominaiteClient
      * @throws AuthenticationException Wrong/revoked credentials or bad signature (fix config; do not retry).
      * @throws CheckoutRefusedException The gateway refused the session (inspect getErrorCode()).
      * @throws ApiException            Unexpected API response.
-     * @throws TransportException      Network-level failure (safe to retry WITH the same idempotencyKey).
+     * @throws TransportException      Network-level failure (retry WITH the same idempotencyKey - getLastIdempotencyKey()).
      */
     public function createCheckoutSession(array $params): array
     {

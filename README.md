@@ -80,7 +80,7 @@ try {
     http_response_code(409);
     exit('Payment unavailable: ' . $e->getErrorCode());
 } catch (TransportException $e) {
-    // Network blip - safe to retry with the same idempotencyKey.
+    // Network blip - retry with $client->getLastIdempotencyKey(), never a fresh key.
     http_response_code(503);
     exit('Payment temporarily unavailable');
 }
@@ -204,7 +204,27 @@ pass here is what gets charged; nothing in the browser can change it.
 
 Every `createCheckoutSession` call carries an idempotency key (auto-generated, or pass your
 own as `idempotencyKey`). Retrying with the same key never opens a second payment - on a
-timeout, retry with the same key rather than generating a new one.
+timeout, retry with the same key rather than generating a new one. When you let the SDK
+generate the key, read it back with `getLastIdempotencyKey()` so the retry can reuse it:
+
+```php
+try {
+    $session = $client->createCheckoutSession($params);
+} catch (TransportException $e) {
+    $params['idempotencyKey'] = $client->getLastIdempotencyKey();  // store against your order
+    // ... then retry with it:
+    $session = $client->createCheckoutSession($params);
+}
+```
+
+**A replay does not hand you the original session back.** If the first attempt did reach the
+gateway, the retry answers HTTP 200 with `success=false` and a replay code - `DUPLICATE_REQUEST`,
+`ALREADY_PROCESSED`, `PRIOR_ATTEMPT_FAILED` or `IDEMPOTENCY_KEY_REUSED` - which the SDK raises
+as a `CheckoutRefusedException`. The original session's `cashierKey` and `cashierToken` are not
+in that response, so a retry cannot be your only path to rendering the widget. What the refusal
+gives you is the transaction id to reconcile against; see "Recovering from a replay refusal"
+below. Store `transactionId` and the idempotency key when a create succeeds, and treat the
+replay refusal as "go look up what the first attempt did", not as an error to show the payer.
 
 ## Sessions expire
 
