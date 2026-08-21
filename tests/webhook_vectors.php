@@ -74,12 +74,38 @@ foreach ($malformed as $name => $bad) {
     check("malformed header rejected: $name", verdict($body, $bad, $secret, 300, $timestamp), 'false');
 }
 
-// Whitespace around the pairs themselves is a formatting difference, not tampering, and
-// unknown schemes must not shadow v1 - a v2= reader arriving later cannot break v1 senders.
-check('spaces between pairs are tolerated',
-    verdict($body, 't=1755700000, v1=' . $mac, $secret, 300, $timestamp), 'true');
-check('unknown scheme alongside v1 is ignored',
-    verdict($body, 't=1755700000,v2=deadbeef,v1=' . $mac, $secret, 300, $timestamp), 'true');
+// 6. The ten shared header-grammar vectors from WEBHOOKS-CONTRACT.md. Every Dominaite SDK
+// pins this same list; nine reject, the last one verifies. The grammar is deliberately
+// narrow - the platform only ever emits "t={digits},v1={64 lowercase hex}", so anything
+// wider is accept-set we gain nothing from and an attacker gets to aim at.
+$grammarRejects = [
+    'g1 missing v1'        => 't=1755700000',
+    'g2 missing t'         => 'v1=' . $mac,
+    'g3 uppercase hex'     => 't=1755700000,v1=' . strtoupper($mac),
+    'g4 repeated v1'       => 't=1755700000,v1=' . $mac . ',v1=' . $mac,
+    'g5 repeated t'        => 't=1755700000,t=1755700000,v1=' . $mac,
+    'g6 empty t + repeat'  => 't=,v1=garbage,v1=' . $mac,
+    'g7 space after comma' => 't=1755700000, v1=' . $mac,
+    'g8 non-digit in t'    => 't=+1755700000,v1=' . $mac,
+    'g9 element without =' => 'garbage',
+];
+foreach ($grammarRejects as $name => $bad) {
+    check("grammar vector rejected: $name", verdict($body, $bad, $secret, 300, $timestamp), 'false');
+}
+
+// g4/g5/g6 are the audit A7 shapes: a repeat must sink the header even when one of the
+// candidates carries the real MAC. The platform never rotates secrets on the wire, so a
+// second candidate is never something we are meant to fall back to.
+check('grammar vector verifies: g10 unknown key ignored',
+    verdict($body, 't=1755700000,v1=' . $mac . ',v9=deadbeef', $secret, 300, $timestamp), 'true');
+
+// The raw digit substring is what gets signed, not a number we parsed and printed back.
+// A parser that reformats "01755700000" to "1755700000" would accept the first of these.
+check('leading-zero t does not match the reformatted MAC',
+    verdict($body, 't=01755700000,v1=' . $mac, $secret, 300, $timestamp), 'false');
+check('leading-zero t matches the MAC over the raw digits',
+    verdict($body, 't=01755700000,v1=' . hash_hmac('sha256', '01755700000.' . $body, $secret), $secret, 300, $timestamp),
+    'true');
 
 // Caller-side mistakes are the caller's bug, and must be loud rather than a silent false.
 check('empty secret throws', verdict($body, $header, '', 300, $timestamp), 'threw InvalidArgumentException');
