@@ -28,6 +28,30 @@ You get two values from Dominaite (shown once - store them like passwords):
 Every request is signed with the secret (HMAC-SHA256) and timestamped. Keep your server
 clock on NTP - signatures older than 5 minutes are rejected.
 
+### Do not dump the client
+
+The client holds your secret in memory. Do not `var_dump()`, `print_r()`, `var_export()`,
+`(array)`-cast or `serialize()` a client as a way to inspect it, and do not let one reach a
+log line or an error tracker.
+
+`var_dump()`, `print_r()` and `serialize()` are redacted for you - the client implements
+`__debugInfo()` and `__serialize()`, which Symfony VarDumper, Ignition and Whoops honour too,
+so a client caught in an exception page does not print your secret. `json_encode()` returns
+`{}` because the properties are private.
+
+**`var_export()`, an `(array)` cast and Reflection are NOT redacted.** They honour no hook and
+print the secret in full. There is no way for the SDK to intercept them, so this one is on you.
+
+One more thing worth setting in production `php.ini`:
+
+```ini
+zend.exception_ignore_args = 1
+```
+
+Without it, a stack trace records the arguments each frame was called with, so an exception
+thrown anywhere below `new DominaiteClient(...)` carries your plaintext secret into whatever
+renders or ships that trace.
+
 ## Ping before your first session
 
 One signed GET that creates nothing, so anything that fails here is your credentials, your
@@ -80,7 +104,7 @@ try {
     http_response_code(409);
     exit('Payment unavailable: ' . $e->getErrorCode());
 } catch (TransportException $e) {
-    // Network blip - safe to retry with the same idempotencyKey.
+    // Network blip - retry with $client->getLastIdempotencyKey(), never a fresh key.
     http_response_code(503);
     exit('Payment temporarily unavailable');
 }
@@ -204,7 +228,39 @@ pass here is what gets charged; nothing in the browser can change it.
 
 Every `createCheckoutSession` call carries an idempotency key (auto-generated, or pass your
 own as `idempotencyKey`). Retrying with the same key never opens a second payment - on a
-timeout, retry with the same key rather than generating a new one.
+timeout, retry with the same key rather than generating a new one. When you let the SDK
+generate the key, read it back with `getLastIdempotencyKey()` so the retry can reuse it:
+
+```php
+$session = null;
+$key = null;
+
+for ($attempt = 1; $attempt <= 3 && $session === null; $attempt++) {
+    if ($key !== null) {
+        $params['idempotencyKey'] = $key;
+    }
+    try {
+        $session = $client->createCheckoutSession($params);
+    } catch (TransportException $e) {
+        // Read the key here, in the catch - store it against your order before you
+        // sleep or hand off, because the next create() call overwrites it.
+        $key = $client->getLastIdempotencyKey();
+        if ($attempt === 3) {
+            throw $e;
+        }
+        sleep($attempt);
+    }
+}
+```
+
+**A replay does not hand you the original session back.** If the first attempt did reach the
+gateway, the retry answers HTTP 200 with `success=false` and a replay code - `DUPLICATE_REQUEST`,
+`ALREADY_PROCESSED`, `PRIOR_ATTEMPT_FAILED` or `IDEMPOTENCY_KEY_REUSED` - which the SDK raises
+as a `CheckoutRefusedException`. The original session's `cashierKey` and `cashierToken` are not
+in that response, so a retry cannot be your only path to rendering the widget. What the refusal
+gives you is the transaction id to reconcile against; see "Recovering from a replay refusal"
+below. Store `transactionId` and the idempotency key when a create succeeds, and treat the
+replay refusal as "go look up what the first attempt did", not as an error to show the payer.
 
 ## Sessions expire
 
