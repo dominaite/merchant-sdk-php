@@ -33,7 +33,7 @@ use Dominaite\Exception\TransportException;
 class DominaiteClient
 {
     private const DEFAULT_BASE_URL = 'https://api.dominaite.com/payments';
-    public const SESSIONS_PATH = '/merchant-api/bridgerpay/checkout/sessions';
+    public const SESSIONS_PATH = '/merchant-api/checkout/sessions';
     public const PING_PATH = '/merchant-api/ping';
     private const USER_AGENT = 'dominaite-php/0.1.2 (php ' . PHP_VERSION . ')';
     private const TIMEOUT_SECONDS = 15;
