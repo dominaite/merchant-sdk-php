@@ -38,6 +38,9 @@ class DominaiteClient
     private const USER_AGENT = 'dominaite-php/0.1.2 (php ' . PHP_VERSION . ')';
     private const TIMEOUT_SECONDS = 15;
 
+    /** Stands in for the secret wherever the client is dumped or serialized. */
+    private const REDACTED = 'dms_***redacted***';
+
     /**
      * Every value getStatus() can return in `status`, in the API's own order.
      *
@@ -86,6 +89,7 @@ class DominaiteClient
     private string $keyId;
     private string $secret;
     private string $baseUrl;
+    private ?string $lastIdempotencyKey = null;
 
     /**
      * @param string $keyId   Your API key id (dmk_...), from the Dominaite dashboard/operator.
@@ -100,9 +104,64 @@ class DominaiteClient
         if (strpos($secret, 'dms_') !== 0) {
             throw new \InvalidArgumentException('secret must start with dms_');
         }
+        self::assertHeaderSafe('keyId', $keyId);
         $this->keyId = $keyId;
         $this->secret = $secret;
         $this->baseUrl = rtrim($baseUrl, '/');
+    }
+
+    /**
+     * Keeps the API secret out of var_dump() and out of error-tracker output.
+     *
+     * var_dump() and print_r() honour this hook, and so do the dumpers built on them -
+     * Symfony VarDumper, Ignition, Whoops - which is the path that puts a dumped client
+     * into a bug report or an exception page. Verified on 7.4 and 8.3.
+     *
+     * NOT a general guarantee. var_export(), an (array) cast and Reflection honour no hook
+     * and still show the secret in full. Do not reach for them on a client.
+     * See "Do not dump the client" in the README.
+     *
+     * @return array<string,mixed>
+     */
+    public function __debugInfo(): array
+    {
+        return [
+            'keyId' => $this->keyId,
+            'secret' => self::REDACTED,
+            'baseUrl' => $this->baseUrl,
+            'lastIdempotencyKey' => $this->lastIdempotencyKey,
+        ];
+    }
+
+    /**
+     * Keeps the API secret out of serialize() output.
+     *
+     * A client is not session data and there is no reason to serialize one, but frameworks
+     * do snapshot their service container, and a serialized blob tends to end up in a cache
+     * or a log. Redacting rather than throwing keeps that snapshot from turning into an
+     * outage; the restored client cannot sign, which is the intended outcome.
+     *
+     * @return array<string,mixed>
+     */
+    public function __serialize(): array
+    {
+        return [
+            'keyId' => $this->keyId,
+            'secret' => self::REDACTED,
+            'baseUrl' => $this->baseUrl,
+            'lastIdempotencyKey' => $this->lastIdempotencyKey,
+        ];
+    }
+
+    /**
+     * @param array<string,mixed> $data
+     */
+    public function __unserialize(array $data): void
+    {
+        $this->keyId = (string) ($data['keyId'] ?? '');
+        $this->secret = (string) ($data['secret'] ?? self::REDACTED);
+        $this->baseUrl = (string) ($data['baseUrl'] ?? self::DEFAULT_BASE_URL);
+        $this->lastIdempotencyKey = isset($data['lastIdempotencyKey']) ? (string) $data['lastIdempotencyKey'] : null;
     }
 
     /**
@@ -135,7 +194,12 @@ class DominaiteClient
      * Optional: customer{firstName,lastName,email,phone}, country (ISO 3166-1 alpha-2),
      * language (ISO 639-1), theme ('light'|'dark'|'bright'), description,
      * idempotencyKey (auto-generated when omitted - retrying with the same key never
-     * creates a second payment).
+     * creates a second payment; read the generated one back with getLastIdempotencyKey()).
+     *
+     * Retrying a key the gateway already saw does NOT return the original session: it
+     * answers HTTP 200 with success=false and a replay code, which arrives here as a
+     * CheckoutRefusedException. The first session's cashierKey/cashierToken are not in
+     * that response - reconcile via the refusal's transaction id and getStatus().
      *
      * @param array<string,mixed> $params
      * @return array{transactionId:string,orderId:string,cashierKey:string,cashierToken:string,amount:int,currency:string,expiresAt:string}
@@ -143,10 +207,16 @@ class DominaiteClient
      * @throws AuthenticationException Wrong/revoked credentials or bad signature (fix config; do not retry).
      * @throws CheckoutRefusedException The gateway refused the session (inspect getErrorCode()).
      * @throws ApiException            Unexpected API response.
-     * @throws TransportException      Network-level failure (safe to retry WITH the same idempotencyKey).
+     * @throws TransportException      Network-level failure (retry WITH the same idempotencyKey - getLastIdempotencyKey()).
      */
     public function createCheckoutSession(array $params): array
     {
+        // Cleared first, so a call that never reaches the wire cannot leave the PREVIOUS
+        // order's key readable. An error handler reading the accessor after a rejected key
+        // would otherwise file an earlier order's key against this one, and a later retry
+        // with it collides with that earlier payment instead.
+        $this->lastIdempotencyKey = null;
+
         foreach (['amount', 'currency', 'orderReference'] as $required) {
             if (!isset($params[$required])) {
                 throw new \InvalidArgumentException("Missing required parameter: {$required}");
@@ -161,6 +231,13 @@ class DominaiteClient
         if (!is_string($idempotencyKey) || $idempotencyKey === '' || strlen($idempotencyKey) > 100) {
             throw new \InvalidArgumentException('idempotencyKey must be a non-empty string of at most 100 characters');
         }
+        self::assertHeaderSafe('idempotencyKey', $idempotencyKey);
+
+        // Recorded BEFORE the call so a caller who catches TransportException can read the
+        // key the timed-out attempt used and retry with it. A generated key that only ever
+        // existed inside this method would leave a retry no choice but a fresh key, and a
+        // fresh key is a second real payment for the same order.
+        $this->lastIdempotencyKey = $idempotencyKey;
 
         $response = $this->request('POST', self::SESSIONS_PATH, $params, $idempotencyKey);
 
@@ -179,6 +256,34 @@ class DominaiteClient
         }
 
         return $response['checkout'];
+    }
+
+    /**
+     * The idempotency key the last createCheckoutSession() call sent, generated or yours.
+     *
+     * Read it in your catch block. On a timeout you cannot know whether the gateway
+     * created the session, and retrying with a NEW key charges the order twice - retry
+     * with this one, or hand it to getStatus() reconciliation later:
+     *
+     *   try {
+     *       $session = $client->createCheckoutSession($params);
+     *   } catch (TransportException $e) {
+     *       $key = $client->getLastIdempotencyKey();  // store it, then retry with it
+     *   }
+     *
+     * Null before the first createCheckoutSession() call, and null again after one that was
+     * rejected locally without reaching the API - it always means "the key of the most
+     * recent attempt that went out", never an older order's.
+     *
+     * It is a single slot on a client you can reuse, so the next createCheckoutSession()
+     * overwrites it. On a long-lived worker that means reading it in the catch block and
+     * storing it against your order, not going back for it later.
+     *
+     * ping() and getStatus() sign an empty key by design and leave this untouched.
+     */
+    public function getLastIdempotencyKey(): ?string
+    {
+        return $this->lastIdempotencyKey;
     }
 
     /**
@@ -280,6 +385,25 @@ class DominaiteClient
 
         // Age last: a valid MAC on a stale delivery is a replay, not a rejection to log as tampering.
         return abs(($now ?? time()) - (int) $timestamp) <= $toleranceSeconds;
+    }
+
+    /**
+     * Values that end up in a request header must be printable ASCII.
+     *
+     * A CR or LF closes the header line, so anything after it becomes headers of the
+     * caller's own choosing - an orderReference-derived key like "order-1\r\nX-Forwarded-For: 1.2.3.4"
+     * would rewrite what the gateway sees as the client IP. Reject the value here rather
+     * than letting curl serialise it.
+     */
+    private static function assertHeaderSafe(string $name, string $value): void
+    {
+        // \z, not $: $ also matches just before a trailing newline, which is exactly the
+        // byte being defended against.
+        if (preg_match('/^[\x20-\x7E]*\z/', $value) !== 1) {
+            throw new \InvalidArgumentException(
+                "{$name} must contain only printable ASCII characters (0x20-0x7E); it is sent as an HTTP header"
+            );
+        }
     }
 
     /**
