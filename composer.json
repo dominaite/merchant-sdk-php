@@ -25,6 +25,7 @@
         "test": [
             "php tests/vectors.php",
             "php tests/webhook_vectors.php",
+            "php tests/idempotency_vectors.php",
             "php tests/contract_vectors.php"
         ]
     }

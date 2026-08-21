@@ -86,6 +86,7 @@ class DominaiteClient
     private string $keyId;
     private string $secret;
     private string $baseUrl;
+    private ?string $lastIdempotencyKey = null;
 
     /**
      * @param string $keyId   Your API key id (dmk_...), from the Dominaite dashboard/operator.
@@ -162,6 +163,12 @@ class DominaiteClient
             throw new \InvalidArgumentException('idempotencyKey must be a non-empty string of at most 100 characters');
         }
 
+        // Recorded BEFORE the call so a caller who catches TransportException can read the
+        // key the timed-out attempt used and retry with it. A generated key that only ever
+        // existed inside this method would leave a retry no choice but a fresh key, and a
+        // fresh key is a second real payment for the same order.
+        $this->lastIdempotencyKey = $idempotencyKey;
+
         $response = $this->request('POST', self::SESSIONS_PATH, $params, $idempotencyKey);
 
         if (($response['success'] ?? false) !== true || !isset($response['checkout'])) {
@@ -179,6 +186,27 @@ class DominaiteClient
         }
 
         return $response['checkout'];
+    }
+
+    /**
+     * The idempotency key the last createCheckoutSession() call sent, generated or yours.
+     *
+     * Read it in your catch block. On a timeout you cannot know whether the gateway
+     * created the session, and retrying with a NEW key charges the order twice - retry
+     * with this one, or hand it to getStatus() reconciliation later:
+     *
+     *   try {
+     *       $session = $client->createCheckoutSession($params);
+     *   } catch (TransportException $e) {
+     *       $key = $client->getLastIdempotencyKey();  // store it, then retry with it
+     *   }
+     *
+     * Null before the first createCheckoutSession() call. ping() and getStatus() sign an
+     * empty key by design and leave this untouched.
+     */
+    public function getLastIdempotencyKey(): ?string
+    {
+        return $this->lastIdempotencyKey;
     }
 
     /**
