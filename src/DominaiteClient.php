@@ -154,6 +154,12 @@ class DominaiteClient
      */
     public function createCheckoutSession(array $params): array
     {
+        // Cleared first, so a call that never reaches the wire cannot leave the PREVIOUS
+        // order's key readable. An error handler reading the accessor after a rejected key
+        // would otherwise file an earlier order's key against this one, and a later retry
+        // with it collides with that earlier payment instead.
+        $this->lastIdempotencyKey = null;
+
         foreach (['amount', 'currency', 'orderReference'] as $required) {
             if (!isset($params[$required])) {
                 throw new \InvalidArgumentException("Missing required parameter: {$required}");
@@ -208,8 +214,15 @@ class DominaiteClient
      *       $key = $client->getLastIdempotencyKey();  // store it, then retry with it
      *   }
      *
-     * Null before the first createCheckoutSession() call. ping() and getStatus() sign an
-     * empty key by design and leave this untouched.
+     * Null before the first createCheckoutSession() call, and null again after one that was
+     * rejected locally without reaching the API - it always means "the key of the most
+     * recent attempt that went out", never an older order's.
+     *
+     * It is a single slot on a client you can reuse, so the next createCheckoutSession()
+     * overwrites it. On a long-lived worker that means reading it in the catch block and
+     * storing it against your order, not going back for it later.
+     *
+     * ping() and getStatus() sign an empty key by design and leave this untouched.
      */
     public function getLastIdempotencyKey(): ?string
     {

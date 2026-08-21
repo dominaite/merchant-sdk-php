@@ -162,15 +162,46 @@ foreach (['order-1042', 'ORDER 1042 / attempt #2', str_repeat('k', 100), '~!@#$%
     check('normal idempotency key accepted: ' . substr($good, 0, 12), $outcome, 'accepted');
 }
 
-// 5. The key id lands in X-Api-Key-Id, so it gets the same treatment.
-foreach (["dmk_a\r\nX-Injected: yes", "dmk_a\n", "dmk_\u{00e9}"] as $badKeyId) {
+// 5. A call that never reached the wire must not leave the PREVIOUS order's key readable.
+//    Otherwise an error handler files order A's key against order B, and retrying B with it
+//    collides with A and reports A's transaction as the duplicate.
+$reused = new FlakyClient();
+$reused->createCheckoutSession($params + ['idempotencyKey' => 'order-A']);
+check('the accessor holds the key after a successful call',
+    (string) $reused->getLastIdempotencyKey(), 'order-A');
+foreach (['malformed' => "order-B\r\nX: y", 'empty' => '', 'too long' => str_repeat('k', 101)] as $label => $bad) {
+    try {
+        $reused->createCheckoutSession($params + ['idempotencyKey' => $bad]);
+    } catch (\InvalidArgumentException $e) {
+        // the point is what the accessor reads afterwards
+    }
+    check("a rejected key clears the accessor rather than keeping the old one: $label",
+        $reused->getLastIdempotencyKey() === null ? 'null' : (string) $reused->getLastIdempotencyKey(), 'null');
+    $reused->createCheckoutSession($params + ['idempotencyKey' => 'order-A']);
+}
+// The same holds for a rejected amount, which is caught before the key is even read.
+try {
+    $reused->createCheckoutSession(['amount' => 0, 'currency' => 'EUR', 'orderReference' => 'order-B']);
+} catch (\InvalidArgumentException $e) {
+    // expected
+}
+check('a rejected amount clears the accessor too',
+    $reused->getLastIdempotencyKey() === null ? 'null' : 'stale', 'null');
+
+// 6. The key id lands in X-Api-Key-Id, so it gets the same treatment.
+$badKeyIds = [
+    'CRLF' => "dmk_a\r\nX-Injected: yes",
+    'trailing LF' => "dmk_a\n",
+    'non-ascii' => "dmk_\u{00e9}",
+];
+foreach ($badKeyIds as $label => $badKeyId) {
     $outcome = 'accepted';
     try {
         new DominaiteClient($badKeyId, 'dms_0123456789abcdef');
     } catch (\InvalidArgumentException $e) {
         $outcome = 'rejected locally';
     }
-    check('key id with header-breaking bytes rejected', $outcome, 'rejected locally');
+    check("key id with header-breaking bytes rejected: $label", $outcome, 'rejected locally');
 }
 
 exit($failures === 0 ? 0 : 1);

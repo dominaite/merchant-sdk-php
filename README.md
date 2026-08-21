@@ -208,12 +208,24 @@ timeout, retry with the same key rather than generating a new one. When you let 
 generate the key, read it back with `getLastIdempotencyKey()` so the retry can reuse it:
 
 ```php
-try {
-    $session = $client->createCheckoutSession($params);
-} catch (TransportException $e) {
-    $params['idempotencyKey'] = $client->getLastIdempotencyKey();  // store against your order
-    // ... then retry with it:
-    $session = $client->createCheckoutSession($params);
+$session = null;
+$key = null;
+
+for ($attempt = 1; $attempt <= 3 && $session === null; $attempt++) {
+    if ($key !== null) {
+        $params['idempotencyKey'] = $key;
+    }
+    try {
+        $session = $client->createCheckoutSession($params);
+    } catch (TransportException $e) {
+        // Read the key here, in the catch - store it against your order before you
+        // sleep or hand off, because the next create() call overwrites it.
+        $key = $client->getLastIdempotencyKey();
+        if ($attempt === 3) {
+            throw $e;
+        }
+        sleep($attempt);
+    }
 }
 ```
 
