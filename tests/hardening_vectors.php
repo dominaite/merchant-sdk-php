@@ -4,10 +4,10 @@
 //
 // Covers:
 //  - a 5xx is decided from the STATUS, before the body is parsed
-//  - the response body is read up to a cap and no further
 //  - HTTP 429 surfaces as RateLimitException with the Retry-After seconds
 //  - the base URL must be https:// unless it is loopback
 //  - length limits count characters, not bytes
+//  - the webhook signature is compared with hash_equals (asserted against the source)
 //
 // tests/transport_vectors.php covers the same rules end to end through real curl.
 
@@ -247,5 +247,55 @@ check('100-character idempotency key is accepted',
         ]);
     }),
     'no exception');
+
+// --- A8: the webhook MAC is compared in constant time -----------------------------------
+// PHP gives a test no way to observe the timing of a comparison, so this asserts against
+// the SOURCE instead. Crude, but a silent regression to == or === - which leaks the
+// signature a byte at a time to anyone who can time the endpoint - fails the suite.
+$source = file_get_contents(__DIR__ . '/../src/DominaiteClient.php');
+check('client source is readable', $source === false ? 'unreadable' : 'read', 'read');
+
+$verify = new ReflectionMethod(DominaiteClient::class, 'verifyWebhook');
+$lines = explode("\n", (string) $source);
+$verifyBody = implode("\n", array_slice(
+    $lines,
+    $verify->getStartLine() - 1,
+    $verify->getEndLine() - $verify->getStartLine() + 1
+));
+
+check('verifyWebhook compares the MAC with hash_equals',
+    preg_match('/hash_equals\(\s*\$expected\s*,\s*\$received\s*\)/', $verifyBody) === 1 ? 'hash_equals' : 'missing',
+    'hash_equals');
+
+// $expected is the computed MAC. It may be assigned and it may be handed to hash_equals;
+// any ==, ===, != or !== touching it is the regression this guards against, whether or
+// not a hash_equals call still exists somewhere else in the function.
+// ($received is deliberately not covered by this rule - it is legitimately compared to
+// null while the header is being parsed, before any MAC exists.)
+check('verifyWebhook never compares the computed MAC with == or ===',
+    preg_match('/\$expected\s*[!=]==?|[!=]==?\s*\$expected/', $verifyBody) === 1
+        ? 'raw comparison found' : 'none',
+    'none');
+check('verifyWebhook never compares the two signatures directly',
+    preg_match('/\$received\s*[!=]==?\s*\$expected/', $verifyBody) === 1 ? 'raw comparison found' : 'none',
+    'none');
+
+// in_array without strict, strcmp and strcasecmp are the other non-constant-time ways
+// this comparison has been written by mistake.
+foreach (['strcmp', 'strcasecmp', 'in_array', 'substr_compare'] as $unsafe) {
+    check("verifyWebhook does not use $unsafe",
+        strpos($verifyBody, $unsafe . '(') === false ? 'absent' : 'present', 'absent');
+}
+
+// The source assertion is only worth something if the function it guards still works.
+$payload = '{"event":"payment.succeeded"}';
+$now = 1755700000;
+$good = hash_hmac('sha256', $now . '.' . $payload, 'whsec_test');
+check('verifyWebhook still accepts a valid signature',
+    var_export(DominaiteClient::verifyWebhook($payload, "t={$now},v1={$good}", 'whsec_test', 300, $now), true),
+    'true');
+check('verifyWebhook still rejects a forged signature',
+    var_export(DominaiteClient::verifyWebhook($payload, 't=' . $now . ',v1=' . str_repeat('a', 64), 'whsec_test', 300, $now), true),
+    'false');
 
 exit($failures === 0 ? 0 : 1);
