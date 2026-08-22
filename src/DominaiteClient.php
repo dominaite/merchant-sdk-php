@@ -7,6 +7,7 @@ namespace Dominaite;
 use Dominaite\Exception\ApiException;
 use Dominaite\Exception\AuthenticationException;
 use Dominaite\Exception\CheckoutRefusedException;
+use Dominaite\Exception\RateLimitException;
 use Dominaite\Exception\TransportException;
 
 /**
@@ -37,6 +38,23 @@ class DominaiteClient
     public const PING_PATH = '/merchant-api/ping';
     private const USER_AGENT = 'dominaite-php/0.1.2 (php ' . PHP_VERSION . ')';
     private const TIMEOUT_SECONDS = 15;
+
+    /**
+     * Hard cap on how much response body we will buffer, in bytes.
+     *
+     * A real merchant-API response is a few kilobytes. Anything approaching this is a
+     * misrouted request, a captive portal, or an edge serving something that is not us,
+     * and reading it to the end would grow a PHP-FPM worker's memory without limit.
+     * The transfer is aborted and surfaces as TransportException (retryable) rather
+     * than as a parse error, because the reason is never the merchant's request body.
+     */
+    private const MAX_RESPONSE_BYTES = 10 * 1024 * 1024;
+
+    /**
+     * Hosts allowed to be reached over plain http://, for local development only.
+     * Anything else must be https:// - see the constructor.
+     */
+    private const LOOPBACK_HOSTS = ['localhost', '127.0.0.1', '::1'];
 
     /** Stands in for the secret wherever the client is dumped or serialized. */
     private const REDACTED = 'dms_***redacted***';
@@ -94,7 +112,8 @@ class DominaiteClient
     /**
      * @param string $keyId   Your API key id (dmk_...), from the Dominaite dashboard/operator.
      * @param string $secret  Your API secret (dms_...). Server-side only.
-     * @param string $baseUrl Override for non-production environments.
+     * @param string $baseUrl Override for non-production environments. Must be https://,
+     *                        except on localhost / 127.0.0.1 / ::1 for local development.
      */
     public function __construct(string $keyId, string $secret, string $baseUrl = self::DEFAULT_BASE_URL)
     {
@@ -105,9 +124,40 @@ class DominaiteClient
             throw new \InvalidArgumentException('secret must start with dms_');
         }
         self::assertHeaderSafe('keyId', $keyId);
+        self::assertTransportIsEncrypted($baseUrl);
         $this->keyId = $keyId;
         $this->secret = $secret;
         $this->baseUrl = rtrim($baseUrl, '/');
+    }
+
+    /**
+     * Refuses a base URL that would put the signed request on the wire in clear text.
+     *
+     * Every call carries X-Api-Key-Id and a signature derived from the secret. Over
+     * http:// those are readable by anything on the path, and a captured signed request
+     * can be replayed for the five minutes the gateway's clock window allows. A typo'd
+     * or copy-pasted http:// endpoint is the realistic way that happens, so it is
+     * rejected at construction rather than on the first live payment.
+     *
+     * Loopback is exempt: a local mock or a tunnel endpoint on localhost never leaves
+     * the machine, and forcing TLS there only pushes people to disable verification.
+     */
+    private static function assertTransportIsEncrypted(string $baseUrl): void
+    {
+        $scheme = strtolower((string) parse_url($baseUrl, PHP_URL_SCHEME));
+        if ($scheme === 'https') {
+            return;
+        }
+
+        // parse_url keeps the brackets on an IPv6 literal ("[::1]"); compare without them.
+        $host = strtolower(trim((string) parse_url($baseUrl, PHP_URL_HOST), '[]'));
+        if ($scheme === 'http' && in_array($host, self::LOOPBACK_HOSTS, true)) {
+            return;
+        }
+
+        throw new \InvalidArgumentException(
+            'baseUrl must use https:// (http:// is allowed only for localhost, 127.0.0.1 and ::1)'
+        );
     }
 
     /**
@@ -177,6 +227,7 @@ class DominaiteClient
      *
      * @throws AuthenticationException Wrong/revoked credentials, bad signature, clock off, IP not allowlisted.
      * @throws ApiException            Unexpected API response.
+     * @throws RateLimitException     HTTP 429 - you are over the rate limit; back off (getRetryAfterSeconds()).
      * @throws TransportException      Network-level failure.
      */
     public function ping(): array
@@ -207,6 +258,7 @@ class DominaiteClient
      * @throws AuthenticationException Wrong/revoked credentials or bad signature (fix config; do not retry).
      * @throws CheckoutRefusedException The gateway refused the session (inspect getErrorCode()).
      * @throws ApiException            Unexpected API response.
+     * @throws RateLimitException     HTTP 429 - you are over the rate limit; back off (getRetryAfterSeconds()).
      * @throws TransportException      Network-level failure (retry WITH the same idempotencyKey - getLastIdempotencyKey()).
      */
     public function createCheckoutSession(array $params): array
@@ -225,10 +277,14 @@ class DominaiteClient
         if (!is_int($params['amount']) || $params['amount'] <= 0) {
             throw new \InvalidArgumentException('amount must be a positive integer in MINOR units (e.g. 2500 for 25.00 EUR)');
         }
+        if (!is_string($params['orderReference']) || $params['orderReference'] === ''
+            || self::codePoints($params['orderReference']) > 100) {
+            throw new \InvalidArgumentException('orderReference must be a non-empty string of at most 100 characters');
+        }
 
         $idempotencyKey = $params['idempotencyKey'] ?? bin2hex(random_bytes(16));
         unset($params['idempotencyKey']);
-        if (!is_string($idempotencyKey) || $idempotencyKey === '' || strlen($idempotencyKey) > 100) {
+        if (!is_string($idempotencyKey) || $idempotencyKey === '' || self::codePoints($idempotencyKey) > 100) {
             throw new \InvalidArgumentException('idempotencyKey must be a non-empty string of at most 100 characters');
         }
         self::assertHeaderSafe('idempotencyKey', $idempotencyKey);
@@ -307,6 +363,7 @@ class DominaiteClient
      *
      * @throws AuthenticationException Wrong/revoked credentials or bad signature (fix config; do not retry).
      * @throws ApiException            Unknown transaction id (HTTP 404) or unexpected response.
+     * @throws RateLimitException     HTTP 429 - you are over the rate limit; back off (getRetryAfterSeconds()).
      * @throws TransportException      Network-level failure (safe to retry).
      */
     public function getStatus(string $transactionId): array
@@ -403,6 +460,24 @@ class DominaiteClient
     }
 
     /**
+     * Length of a value in Unicode CODE POINTS, which is what the documented limits count.
+     *
+     * strlen() counts bytes, so a 100-character Cyrillic or Greek orderReference measures
+     * 200 and gets rejected locally for a length the API would have accepted. Counting
+     * code points makes the local check agree with the documented "<= 100 characters".
+     *
+     * Caveat: the server counts UTF-16 code units, so an astral character (emoji, rarer
+     * CJK) is 1 here and 2 there. That only matters within a couple of characters of the
+     * limit, and the server stays the final arbiter - a value this check passes can still
+     * come back as a validation error. We do not model UTF-16 here to avoid a second,
+     * subtly different notion of length in the SDK.
+     */
+    private static function codePoints(string $value): int
+    {
+        return mb_strlen($value, 'UTF-8');
+    }
+
+    /**
      * Values that end up in a request header must be printable ASCII.
      *
      * A CR or LF closes the header line, so anything after it becomes headers of the
@@ -454,6 +529,10 @@ class DominaiteClient
             $headers[] = 'Idempotency-Key: ' . $idempotencyKey;
         }
 
+        $raw = '';
+        $oversized = false;
+        $responseHeaders = [];
+
         $ch = curl_init($this->baseUrl . $path);
         $options = [
             CURLOPT_CUSTOMREQUEST => $method,
@@ -462,22 +541,78 @@ class DominaiteClient
             // Some edges block requests without a real User-Agent - always send one.
             CURLOPT_USERAGENT => self::USER_AGENT,
             CURLOPT_HTTPHEADER => $headers,
+            // Buffer the body ourselves so the size cap can abort mid-transfer. Returning
+            // a short count from this callback is curl's documented way to stop a read;
+            // the transfer then fails with a write error, which $oversized tells apart
+            // from a real network failure below.
+            CURLOPT_WRITEFUNCTION => static function ($handle, string $chunk) use (&$raw, &$oversized): int {
+                if ($oversized || strlen($raw) + strlen($chunk) > self::MAX_RESPONSE_BYTES) {
+                    $oversized = true;
+                    return 0;
+                }
+                $raw .= $chunk;
+                return strlen($chunk);
+            },
+            // Retry-After (429) is the only response header the SDK reads, but capturing
+            // the set costs nothing and keeps the parsing in one place. Later duplicates
+            // win, which is what a redirect chain's final response should give us.
+            CURLOPT_HEADERFUNCTION => static function ($handle, string $header) use (&$responseHeaders): int {
+                $pair = explode(':', $header, 2);
+                if (count($pair) === 2) {
+                    $responseHeaders[strtolower(trim($pair[0]))] = trim($pair[1]);
+                }
+                return strlen($header);
+            },
         ];
         if ($body !== null) {
             $options[CURLOPT_POSTFIELDS] = $json;
         }
         curl_setopt_array($ch, $options);
 
-        $raw = curl_exec($ch);
-        if ($raw === false) {
-            $error = curl_error($ch);
-            curl_close($ch);
-            throw new TransportException("Could not reach the Dominaite API: {$error}");
-        }
+        $completed = curl_exec($ch);
+        $error = curl_error($ch);
         $status = (int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
         curl_close($ch);
 
-        $decoded = json_decode((string) $raw, true);
+        if ($oversized) {
+            throw new TransportException(
+                'The API response exceeded ' . self::MAX_RESPONSE_BYTES . ' bytes and was not read; '
+                . 'retry with the same idempotency key.'
+            );
+        }
+        if ($completed === false) {
+            throw new TransportException("Could not reach the Dominaite API: {$error}");
+        }
+
+        return $this->handleResponse($status, $raw, $responseHeaders);
+    }
+
+    /**
+     * Turns one HTTP response into a payload or the right exception.
+     *
+     * Split out of request() so the status handling can be exercised on its own, and so
+     * the ORDER below is visible: the status decides first, the body is parsed second.
+     * A 502/503/504 from a load balancer or a captive portal is HTML or empty, and
+     * parsing first would classify the infrastructure being down as "the API sent
+     * something we could not read" - an ApiException nobody retries - instead of the
+     * retryable TransportException it is. Same for a 429 served by an edge.
+     *
+     * @param array<string,string> $responseHeaders Lowercased header names to values.
+     * @return array<string,mixed>
+     */
+    protected function handleResponse(int $status, string $raw, array $responseHeaders = []): array
+    {
+        if ($status >= 500) {
+            throw new TransportException("The Dominaite API is unavailable (HTTP {$status}); retry with the same idempotency key.");
+        }
+        if ($status === 429) {
+            throw new RateLimitException(
+                'Rate limit exceeded (HTTP 429); back off and retry with the same idempotency key.',
+                self::parseRetryAfter($responseHeaders['retry-after'] ?? null)
+            );
+        }
+
+        $decoded = json_decode($raw, true);
         if (!is_array($decoded)) {
             throw new ApiException($status, 'The API returned a non-JSON response');
         }
@@ -493,14 +628,29 @@ class DominaiteClient
                 'Authentication failed - check your key id, secret, and server clock.'
             );
         }
-        if ($status >= 500) {
-            throw new TransportException("The Dominaite API is unavailable (HTTP {$status}); retry with the same idempotency key.");
-        }
         if ($status >= 400) {
             throw new ApiException($status, (string) ($payload['errorMessage'] ?? $envelopeError['message'] ?? 'Request rejected'));
         }
 
         return $payload;
+    }
+
+    /**
+     * Reads Retry-After as whole seconds.
+     *
+     * RFC 9110 allows either a delay in seconds or an HTTP-date. Only the seconds form
+     * is modelled: converting a date needs the server's clock to agree with ours, and a
+     * wrong number here is worse than no number, because a caller would sleep on it.
+     * The date form (and an absent or unparseable header) comes back as null - "the
+     * server did not tell us", which the caller answers with its own backoff.
+     */
+    private static function parseRetryAfter(?string $value): ?int
+    {
+        if ($value === null || preg_match('/^[0-9]+$/', trim($value)) !== 1) {
+            return null;
+        }
+
+        return (int) trim($value);
     }
 
     /**

@@ -1,0 +1,35 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  tests:
+    # 7.4 is the composer.json floor and 8.3 is what most integrators run. The suite has
+    # to pass on both: the SDK is dependency-free on purpose, so a version-specific break
+    # shows up in a merchant's application rather than in a build.
+    strategy:
+      fail-fast: false
+      matrix:
+        php: ['7.4', '8.3']
+
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Run inside the official image rather than installing PHP on the runner: it is the
+      # same command a developer runs locally, and it keeps the job free of setup actions
+      # for a library that has no dependencies to install.
+      - name: Run the suite on PHP ${{ matrix.php }}
+        run: |
+          docker run --rm -v "$PWD":/sdk -w /sdk php:${{ matrix.php }}-cli sh -c '
+            set -e
+            php -v
+            for suite in vectors webhook_vectors idempotency_vectors redaction_vectors \
+                         contract_vectors hardening_vectors transport_vectors; do
+              echo "--- tests/$suite.php"
+              php "tests/$suite.php"
+            done
+          '

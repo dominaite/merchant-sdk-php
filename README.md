@@ -17,6 +17,8 @@ is the fallback for when you have not set one up yet.
 composer require dominaite/dominaite-php
 ```
 
+PHP 7.4 or newer with `ext-curl`, `ext-json` and `ext-mbstring`. No other dependencies.
+
 ## Credentials
 
 You get two values from Dominaite (shown once - store them like passwords):
@@ -27,6 +29,12 @@ You get two values from Dominaite (shown once - store them like passwords):
 
 Every request is signed with the secret (HMAC-SHA256) and timestamped. Keep your server
 clock on NTP - signatures older than 5 minutes are rejected.
+
+The third constructor argument overrides the base URL for non-production environments. It
+has to be `https://`: the key id and the signature travel in headers, and a captured
+signed request stays replayable for the whole 5 minute clock window. `http://` is accepted
+only for `localhost`, `127.0.0.1` and `::1`, so a local mock still works. Anything else
+throws `InvalidArgumentException` at construction rather than on your first live payment.
 
 ### Do not dump the client
 
@@ -80,6 +88,7 @@ require __DIR__ . '/vendor/autoload.php';
 
 use Dominaite\DominaiteClient;
 use Dominaite\Exception\CheckoutRefusedException;
+use Dominaite\Exception\RateLimitException;
 use Dominaite\Exception\TransportException;
 
 $client = new DominaiteClient(getenv('DOMINAITE_KEY_ID'), getenv('DOMINAITE_SECRET'));
@@ -103,8 +112,13 @@ try {
     // Machine-readable: $e->getErrorCode() - see the exception docblock for the codes.
     http_response_code(409);
     exit('Payment unavailable: ' . $e->getErrorCode());
+} catch (RateLimitException $e) {
+    // You are over the rate limit. Nothing is retried for you - back off first.
+    http_response_code(503);
+    header('Retry-After: ' . ($e->getRetryAfterSeconds() ?? 5));
+    exit('Payment temporarily unavailable');
 } catch (TransportException $e) {
-    // Network blip - retry with $client->getLastIdempotencyKey(), never a fresh key.
+    // Network blip or a 5xx - retry with $client->getLastIdempotencyKey(), never a fresh key.
     http_response_code(503);
     exit('Payment temporarily unavailable');
 }
@@ -116,6 +130,11 @@ try {
         data-cashier-key="<?= htmlspecialchars($session['cashierKey']) ?>"
         data-cashier-token="<?= htmlspecialchars($session['cashierToken']) ?>"></script>
 ```
+
+`orderReference` is limited to 100 characters, counted as characters and not as bytes - a
+100 character Cyrillic or Greek reference is 200 bytes and is fine. Emoji and rarer CJK
+characters count double on the server, so stay a couple of characters clear of the limit if
+your references contain them; the server has the final say either way.
 
 That's the checkout half: the session call above, the script tag, and your domain bound to
 your checkout by Dominaite during onboarding. The other half is the webhook that tells you
@@ -261,6 +280,32 @@ in that response, so a retry cannot be your only path to rendering the widget. W
 gives you is the transaction id to reconcile against; see "Recovering from a replay refusal"
 below. Store `transactionId` and the idempotency key when a create succeeds, and treat the
 replay refusal as "go look up what the first attempt did", not as an error to show the payer.
+
+## Rate limits
+
+60 requests per minute per API key, 120 per minute per source IP. The per-IP bucket is the
+one that surprises people: several keys behind one egress address share it, so a key well
+under 60/min can still be limited.
+
+Over the limit the API answers HTTP 429 and the SDK raises `RateLimitException`. It is not
+retried for you - a loop against a rate limiter just spends the next window too, and on
+`createCheckoutSession()` retrying is a decision about a payment that belongs in your code.
+`getRetryAfterSeconds()` gives the server's own number of seconds to wait, or `null` when it
+did not send a usable one; treat `null` as "use your own backoff", not "retry now". When you
+do retry, reuse the idempotency key.
+
+`RateLimitException` extends `ApiException`, so code written before it existed still catches
+a 429. Catch `RateLimitException` first if you want to branch on it.
+
+The polling loop in "Fallback: status polling" is the usual way to hit this. Poll one
+transaction every few seconds, not every transaction every second.
+
+## Response size
+
+Responses are read up to 10 MB and no further. A real merchant-API response is a few
+kilobytes, so anything near that is a captive portal or an edge serving something that is
+not us, and reading it to the end would grow a worker's memory for no reason. An oversized
+response surfaces as `TransportException` - retryable, same as any other transport failure.
 
 ## Sessions expire
 

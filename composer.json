@@ -6,7 +6,8 @@
     "require": {
         "php": ">=7.4",
         "ext-curl": "*",
-        "ext-json": "*"
+        "ext-json": "*",
+        "ext-mbstring": "*"
     },
     "require-dev": {
         "phpunit/phpunit": "^9.6"
@@ -27,7 +28,9 @@
             "php tests/webhook_vectors.php",
             "php tests/idempotency_vectors.php",
             "php tests/redaction_vectors.php",
-            "php tests/contract_vectors.php"
+            "php tests/contract_vectors.php",
+            "php tests/hardening_vectors.php",
+            "php tests/transport_vectors.php"
         ]
     }
 }
