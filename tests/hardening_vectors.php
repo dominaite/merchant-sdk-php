@@ -6,6 +6,7 @@
 //  - a 5xx is decided from the STATUS, before the body is parsed
 //  - the response body is read up to a cap and no further
 //  - HTTP 429 surfaces as RateLimitException with the Retry-After seconds
+//  - the base URL must be https:// unless it is loopback
 //
 // tests/transport_vectors.php covers the same rules end to end through real curl.
 
@@ -143,5 +144,40 @@ check('RateLimitException is not a transport error',
     var_export($limit instanceof TransportException, true), 'false');
 check('RateLimitException is catchable as ApiException',
     var_export($limit instanceof ApiException, true), 'true');
+
+// --- A6: https-only base URL -----------------------------------------------------------
+// A signed request over http:// hands the key id and signature to anything on the path,
+// and the signature stays replayable for the gateway's whole clock window.
+$rejected = [
+    'plain http'          => 'http://api.dominaite.com/payments',
+    'http on a lookalike' => 'http://localhost.evil.example/payments',
+    'http with an IP'     => 'http://10.0.0.5/payments',
+    'no scheme at all'    => 'api.dominaite.com/payments',
+    'ftp'                 => 'ftp://api.dominaite.com/payments',
+    'empty'               => '',
+];
+foreach ($rejected as $label => $url) {
+    check("baseUrl rejected: $label",
+        thrownBy(static function () use ($url): void { new DominaiteClient(KEY_ID, SECRET, $url); }),
+        'InvalidArgumentException');
+}
+
+$accepted = [
+    'https'            => 'https://api.dominaite.com/payments',
+    'https uppercase'  => 'HTTPS://api.dominaite.com/payments',
+    'http localhost'   => 'http://localhost:8080',
+    'http 127.0.0.1'   => 'http://127.0.0.1:8080/payments',
+    'http ::1'         => 'http://[::1]:8080/payments',
+];
+foreach ($accepted as $label => $url) {
+    check("baseUrl accepted: $label",
+        thrownBy(static function () use ($url): void { new DominaiteClient(KEY_ID, SECRET, $url); }),
+        'no exception');
+}
+
+// The default base URL must itself survive the check - a constructor nobody can call
+// with no arguments is the loudest possible way to get this wrong.
+check('default baseUrl is accepted',
+    thrownBy(static function (): void { new DominaiteClient(KEY_ID, SECRET); }), 'no exception');
 
 exit($failures === 0 ? 0 : 1);

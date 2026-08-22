@@ -28,6 +28,12 @@ You get two values from Dominaite (shown once - store them like passwords):
 Every request is signed with the secret (HMAC-SHA256) and timestamped. Keep your server
 clock on NTP - signatures older than 5 minutes are rejected.
 
+The third constructor argument overrides the base URL for non-production environments. It
+has to be `https://`: the key id and the signature travel in headers, and a captured
+signed request stays replayable for the whole 5 minute clock window. `http://` is accepted
+only for `localhost`, `127.0.0.1` and `::1`, so a local mock still works. Anything else
+throws `InvalidArgumentException` at construction rather than on your first live payment.
+
 ### Do not dump the client
 
 The client holds your secret in memory. Do not `var_dump()`, `print_r()`, `var_export()`,

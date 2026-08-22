@@ -50,6 +50,12 @@ class DominaiteClient
      */
     private const MAX_RESPONSE_BYTES = 10 * 1024 * 1024;
 
+    /**
+     * Hosts allowed to be reached over plain http://, for local development only.
+     * Anything else must be https:// - see the constructor.
+     */
+    private const LOOPBACK_HOSTS = ['localhost', '127.0.0.1', '::1'];
+
     /** Stands in for the secret wherever the client is dumped or serialized. */
     private const REDACTED = 'dms_***redacted***';
 
@@ -106,7 +112,8 @@ class DominaiteClient
     /**
      * @param string $keyId   Your API key id (dmk_...), from the Dominaite dashboard/operator.
      * @param string $secret  Your API secret (dms_...). Server-side only.
-     * @param string $baseUrl Override for non-production environments.
+     * @param string $baseUrl Override for non-production environments. Must be https://,
+     *                        except on localhost / 127.0.0.1 / ::1 for local development.
      */
     public function __construct(string $keyId, string $secret, string $baseUrl = self::DEFAULT_BASE_URL)
     {
@@ -117,9 +124,40 @@ class DominaiteClient
             throw new \InvalidArgumentException('secret must start with dms_');
         }
         self::assertHeaderSafe('keyId', $keyId);
+        self::assertTransportIsEncrypted($baseUrl);
         $this->keyId = $keyId;
         $this->secret = $secret;
         $this->baseUrl = rtrim($baseUrl, '/');
+    }
+
+    /**
+     * Refuses a base URL that would put the signed request on the wire in clear text.
+     *
+     * Every call carries X-Api-Key-Id and a signature derived from the secret. Over
+     * http:// those are readable by anything on the path, and a captured signed request
+     * can be replayed for the five minutes the gateway's clock window allows. A typo'd
+     * or copy-pasted http:// endpoint is the realistic way that happens, so it is
+     * rejected at construction rather than on the first live payment.
+     *
+     * Loopback is exempt: a local mock or a tunnel endpoint on localhost never leaves
+     * the machine, and forcing TLS there only pushes people to disable verification.
+     */
+    private static function assertTransportIsEncrypted(string $baseUrl): void
+    {
+        $scheme = strtolower((string) parse_url($baseUrl, PHP_URL_SCHEME));
+        if ($scheme === 'https') {
+            return;
+        }
+
+        // parse_url keeps the brackets on an IPv6 literal ("[::1]"); compare without them.
+        $host = strtolower(trim((string) parse_url($baseUrl, PHP_URL_HOST), '[]'));
+        if ($scheme === 'http' && in_array($host, self::LOOPBACK_HOSTS, true)) {
+            return;
+        }
+
+        throw new \InvalidArgumentException(
+            'baseUrl must use https:// (http:// is allowed only for localhost, 127.0.0.1 and ::1)'
+        );
     }
 
     /**
