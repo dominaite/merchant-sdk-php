@@ -277,10 +277,14 @@ class DominaiteClient
         if (!is_int($params['amount']) || $params['amount'] <= 0) {
             throw new \InvalidArgumentException('amount must be a positive integer in MINOR units (e.g. 2500 for 25.00 EUR)');
         }
+        if (!is_string($params['orderReference']) || $params['orderReference'] === ''
+            || self::codePoints($params['orderReference']) > 100) {
+            throw new \InvalidArgumentException('orderReference must be a non-empty string of at most 100 characters');
+        }
 
         $idempotencyKey = $params['idempotencyKey'] ?? bin2hex(random_bytes(16));
         unset($params['idempotencyKey']);
-        if (!is_string($idempotencyKey) || $idempotencyKey === '' || strlen($idempotencyKey) > 100) {
+        if (!is_string($idempotencyKey) || $idempotencyKey === '' || self::codePoints($idempotencyKey) > 100) {
             throw new \InvalidArgumentException('idempotencyKey must be a non-empty string of at most 100 characters');
         }
         self::assertHeaderSafe('idempotencyKey', $idempotencyKey);
@@ -453,6 +457,24 @@ class DominaiteClient
 
         // Age last: a valid MAC on a stale delivery is a replay, not a rejection to log as tampering.
         return abs(($now ?? time()) - (int) $timestamp) <= $toleranceSeconds;
+    }
+
+    /**
+     * Length of a value in Unicode CODE POINTS, which is what the documented limits count.
+     *
+     * strlen() counts bytes, so a 100-character Cyrillic or Greek orderReference measures
+     * 200 and gets rejected locally for a length the API would have accepted. Counting
+     * code points makes the local check agree with the documented "<= 100 characters".
+     *
+     * Caveat: the server counts UTF-16 code units, so an astral character (emoji, rarer
+     * CJK) is 1 here and 2 there. That only matters within a couple of characters of the
+     * limit, and the server stays the final arbiter - a value this check passes can still
+     * come back as a validation error. We do not model UTF-16 here to avoid a second,
+     * subtly different notion of length in the SDK.
+     */
+    private static function codePoints(string $value): int
+    {
+        return mb_strlen($value, 'UTF-8');
     }
 
     /**

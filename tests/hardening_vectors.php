@@ -7,6 +7,7 @@
 //  - the response body is read up to a cap and no further
 //  - HTTP 429 surfaces as RateLimitException with the Retry-After seconds
 //  - the base URL must be https:// unless it is loopback
+//  - length limits count characters, not bytes
 //
 // tests/transport_vectors.php covers the same rules end to end through real curl.
 
@@ -53,6 +54,29 @@ final class ResponseClient extends DominaiteClient
     public function handle(int $status, string $raw, array $headers = []): array
     {
         return $this->handleResponse($status, $raw, $headers);
+    }
+}
+
+/** Records what reached the transport, so validation can be tested without a network. */
+final class RecordingClient extends DominaiteClient
+{
+    /** @var array<string,mixed>|null */
+    public ?array $sentBody = null;
+
+    protected function request(string $method, string $path, ?array $body, string $idempotencyKey): array
+    {
+        $this->sentBody = $body;
+
+        return [
+            'success' => true,
+            'checkout' => [
+                'transactionId' => '0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0',
+                'orderId' => 'ord_1',
+                'cashierKey' => 'ck', 'cashierToken' => 'ct',
+                'amount' => 8440, 'currency' => 'EUR',
+                'expiresAt' => '2026-01-01T00:00:00Z',
+            ],
+        ];
     }
 }
 
@@ -179,5 +203,49 @@ foreach ($accepted as $label => $url) {
 // with no arguments is the loudest possible way to get this wrong.
 check('default baseUrl is accepted',
     thrownBy(static function (): void { new DominaiteClient(KEY_ID, SECRET); }), 'no exception');
+
+// --- A12: length limits count characters, not bytes -------------------------------------
+// 100 Cyrillic characters are 200 bytes in UTF-8. A byte-counting check rejects an
+// orderReference the API accepts, and the merchant cannot tell why.
+$cyrillic = str_repeat('д', 100);
+check('the Cyrillic fixture is 100 characters', (string) mb_strlen($cyrillic, 'UTF-8'), '100');
+check('the Cyrillic fixture is 200 bytes', (string) strlen($cyrillic), '200');
+
+$unicodeClient = new RecordingClient(KEY_ID, SECRET);
+check('100-character Cyrillic orderReference is accepted',
+    thrownBy(static function () use ($unicodeClient, $cyrillic): void {
+        $unicodeClient->createCheckoutSession([
+            'amount' => 8440, 'currency' => 'EUR', 'orderReference' => $cyrillic,
+        ]);
+    }),
+    'no exception');
+check('the Cyrillic orderReference reaches the transport untouched',
+    (string) ($unicodeClient->sentBody['orderReference'] ?? ''), $cyrillic);
+
+check('101-character orderReference is rejected',
+    thrownBy(static function () use ($cyrillic): void {
+        (new RecordingClient(KEY_ID, SECRET))->createCheckoutSession([
+            'amount' => 8440, 'currency' => 'EUR', 'orderReference' => $cyrillic . 'д',
+        ]);
+    }),
+    'InvalidArgumentException');
+check('empty orderReference is rejected',
+    thrownBy(static function (): void {
+        (new RecordingClient(KEY_ID, SECRET))->createCheckoutSession([
+            'amount' => 8440, 'currency' => 'EUR', 'orderReference' => '',
+        ]);
+    }),
+    'InvalidArgumentException');
+
+// The idempotency key is ASCII-only by the header-safety rule, so this only proves the
+// same character-counting path is used for it - a 100-char key must still pass.
+check('100-character idempotency key is accepted',
+    thrownBy(static function (): void {
+        (new RecordingClient(KEY_ID, SECRET))->createCheckoutSession([
+            'amount' => 8440, 'currency' => 'EUR', 'orderReference' => 'order-1042',
+            'idempotencyKey' => str_repeat('k', 100),
+        ]);
+    }),
+    'no exception');
 
 exit($failures === 0 ? 0 : 1);

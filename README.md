@@ -17,6 +17,8 @@ is the fallback for when you have not set one up yet.
 composer require dominaite/dominaite-php
 ```
 
+PHP 7.4 or newer with `ext-curl`, `ext-json` and `ext-mbstring`. No other dependencies.
+
 ## Credentials
 
 You get two values from Dominaite (shown once - store them like passwords):
@@ -128,6 +130,11 @@ try {
         data-cashier-key="<?= htmlspecialchars($session['cashierKey']) ?>"
         data-cashier-token="<?= htmlspecialchars($session['cashierToken']) ?>"></script>
 ```
+
+`orderReference` is limited to 100 characters, counted as characters and not as bytes - a
+100 character Cyrillic or Greek reference is 200 bytes and is fine. Emoji and rarer CJK
+characters count double on the server, so stay a couple of characters clear of the limit if
+your references contain them; the server has the final say either way.
 
 That's the checkout half: the session call above, the script tag, and your domain bound to
 your checkout by Dominaite during onboarding. The other half is the webhook that tells you
