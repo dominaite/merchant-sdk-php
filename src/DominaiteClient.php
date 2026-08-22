@@ -38,6 +38,17 @@ class DominaiteClient
     private const USER_AGENT = 'dominaite-php/0.1.2 (php ' . PHP_VERSION . ')';
     private const TIMEOUT_SECONDS = 15;
 
+    /**
+     * Hard cap on how much response body we will buffer, in bytes.
+     *
+     * A real merchant-API response is a few kilobytes. Anything approaching this is a
+     * misrouted request, a captive portal, or an edge serving something that is not us,
+     * and reading it to the end would grow a PHP-FPM worker's memory without limit.
+     * The transfer is aborted and surfaces as TransportException (retryable) rather
+     * than as a parse error, because the reason is never the merchant's request body.
+     */
+    private const MAX_RESPONSE_BYTES = 10 * 1024 * 1024;
+
     /** Stands in for the secret wherever the client is dumped or serialized. */
     private const REDACTED = 'dms_***redacted***';
 
@@ -454,6 +465,9 @@ class DominaiteClient
             $headers[] = 'Idempotency-Key: ' . $idempotencyKey;
         }
 
+        $raw = '';
+        $oversized = false;
+
         $ch = curl_init($this->baseUrl . $path);
         $options = [
             CURLOPT_CUSTOMREQUEST => $method,
@@ -462,22 +476,60 @@ class DominaiteClient
             // Some edges block requests without a real User-Agent - always send one.
             CURLOPT_USERAGENT => self::USER_AGENT,
             CURLOPT_HTTPHEADER => $headers,
+            // Buffer the body ourselves so the size cap can abort mid-transfer. Returning
+            // a short count from this callback is curl's documented way to stop a read;
+            // the transfer then fails with a write error, which $oversized tells apart
+            // from a real network failure below.
+            CURLOPT_WRITEFUNCTION => static function ($handle, string $chunk) use (&$raw, &$oversized): int {
+                if ($oversized || strlen($raw) + strlen($chunk) > self::MAX_RESPONSE_BYTES) {
+                    $oversized = true;
+                    return 0;
+                }
+                $raw .= $chunk;
+                return strlen($chunk);
+            },
         ];
         if ($body !== null) {
             $options[CURLOPT_POSTFIELDS] = $json;
         }
         curl_setopt_array($ch, $options);
 
-        $raw = curl_exec($ch);
-        if ($raw === false) {
-            $error = curl_error($ch);
-            curl_close($ch);
-            throw new TransportException("Could not reach the Dominaite API: {$error}");
-        }
+        $completed = curl_exec($ch);
+        $error = curl_error($ch);
         $status = (int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
         curl_close($ch);
 
-        $decoded = json_decode((string) $raw, true);
+        if ($oversized) {
+            throw new TransportException(
+                'The API response exceeded ' . self::MAX_RESPONSE_BYTES . ' bytes and was not read; '
+                . 'retry with the same idempotency key.'
+            );
+        }
+        if ($completed === false) {
+            throw new TransportException("Could not reach the Dominaite API: {$error}");
+        }
+
+        return $this->handleResponse($status, $raw);
+    }
+
+    /**
+     * Turns one HTTP response into a payload or the right exception.
+     *
+     * Split out of request() so the status handling can be exercised on its own, and so
+     * the ORDER below is visible: the status decides first, the body is parsed second.
+     * A 502/503/504 from a load balancer or a captive portal is HTML or empty, and
+     * parsing first would classify the infrastructure being down as "the API sent
+     * something we could not read" - an ApiException nobody retries - instead of the
+     * retryable TransportException it is.
+     *
+     * @return array<string,mixed>
+     */
+    protected function handleResponse(int $status, string $raw): array
+    {
+        if ($status >= 500) {
+            throw new TransportException("The Dominaite API is unavailable (HTTP {$status}); retry with the same idempotency key.");
+        }
+        $decoded = json_decode($raw, true);
         if (!is_array($decoded)) {
             throw new ApiException($status, 'The API returned a non-JSON response');
         }
@@ -492,9 +544,6 @@ class DominaiteClient
                 (string) ($payload['errorCode'] ?? $envelopeError['code'] ?? 'UNAUTHORIZED'),
                 'Authentication failed - check your key id, secret, and server clock.'
             );
-        }
-        if ($status >= 500) {
-            throw new TransportException("The Dominaite API is unavailable (HTTP {$status}); retry with the same idempotency key.");
         }
         if ($status >= 400) {
             throw new ApiException($status, (string) ($payload['errorMessage'] ?? $envelopeError['message'] ?? 'Request rejected'));

@@ -27,7 +27,9 @@
             "php tests/webhook_vectors.php",
             "php tests/idempotency_vectors.php",
             "php tests/redaction_vectors.php",
-            "php tests/contract_vectors.php"
+            "php tests/contract_vectors.php",
+            "php tests/hardening_vectors.php",
+            "php tests/transport_vectors.php"
         ]
     }
 }

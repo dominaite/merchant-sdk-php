@@ -104,7 +104,7 @@ try {
     http_response_code(409);
     exit('Payment unavailable: ' . $e->getErrorCode());
 } catch (TransportException $e) {
-    // Network blip - retry with $client->getLastIdempotencyKey(), never a fresh key.
+    // Network blip or a 5xx - retry with $client->getLastIdempotencyKey(), never a fresh key.
     http_response_code(503);
     exit('Payment temporarily unavailable');
 }
@@ -261,6 +261,13 @@ in that response, so a retry cannot be your only path to rendering the widget. W
 gives you is the transaction id to reconcile against; see "Recovering from a replay refusal"
 below. Store `transactionId` and the idempotency key when a create succeeds, and treat the
 replay refusal as "go look up what the first attempt did", not as an error to show the payer.
+
+## Response size
+
+Responses are read up to 10 MB and no further. A real merchant-API response is a few
+kilobytes, so anything near that is a captive portal or an edge serving something that is
+not us, and reading it to the end would grow a worker's memory for no reason. An oversized
+response surfaces as `TransportException` - retryable, same as any other transport failure.
 
 ## Sessions expire
 
