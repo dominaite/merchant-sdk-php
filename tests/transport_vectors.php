@@ -3,8 +3,9 @@
 // Run: php tests/transport_vectors.php - exits non-zero on any mismatch.
 //
 // tests/hardening_vectors.php checks the same classification by calling the response
-// handler directly. This file goes through curl, so it also proves the piece that only
-// exists on the wire: that the size cap actually aborts a transfer.
+// handler directly. This file goes through curl, so it also proves the pieces that only
+// exist on the wire: that the size cap actually aborts a transfer, and that Retry-After
+// is read off a real response header rather than a hand-built array.
 //
 // The server is PHP's built-in one (tests/fixtures/hardening_server.php) bound to
 // 127.0.0.1, which is also why the loopback exemption in the https-only rule matters:
@@ -14,9 +15,11 @@ require __DIR__ . '/../src/DominaiteClient.php';
 require __DIR__ . '/../src/Exception/ApiException.php';
 require __DIR__ . '/../src/Exception/AuthenticationException.php';
 require __DIR__ . '/../src/Exception/CheckoutRefusedException.php';
+require __DIR__ . '/../src/Exception/RateLimitException.php';
 require __DIR__ . '/../src/Exception/TransportException.php';
 
 use Dominaite\DominaiteClient;
+use Dominaite\Exception\RateLimitException;
 use Dominaite\Exception\TransportException;
 
 $failures = 0;
@@ -124,6 +127,27 @@ check('an HTML 503 is a retryable transport error',
 check('an empty 502 is a retryable transport error',
     thrownBy(static function () use ($client): void { $client->get('/empty-502'); }),
     TransportException::class);
+
+// --- A11 ------------------------------------------------------------------------------
+$limited = null;
+try {
+    $client->get('/html-429');
+} catch (RateLimitException $e) {
+    $limited = $e;
+}
+check('an HTML 429 raises RateLimitException', $limited === null ? 'no exception' : get_class($limited),
+    RateLimitException::class);
+check('Retry-After is read off the real response header',
+    var_export($limited === null ? null : $limited->getRetryAfterSeconds(), true), '90');
+
+$dated = null;
+try {
+    $client->get('/json-429-dated');
+} catch (RateLimitException $e) {
+    $dated = $e;
+}
+check('a dated Retry-After leaves the caller to its own backoff',
+    var_export($dated === null ? 'no exception' : $dated->getRetryAfterSeconds(), true), 'NULL');
 
 // --- A13 ------------------------------------------------------------------------------
 // 64MB of body against a 10MB cap. The margin is what makes the memory assertion mean

@@ -5,6 +5,7 @@
 // Covers:
 //  - a 5xx is decided from the STATUS, before the body is parsed
 //  - the response body is read up to a cap and no further
+//  - HTTP 429 surfaces as RateLimitException with the Retry-After seconds
 //
 // tests/transport_vectors.php covers the same rules end to end through real curl.
 
@@ -12,10 +13,12 @@ require __DIR__ . '/../src/DominaiteClient.php';
 require __DIR__ . '/../src/Exception/ApiException.php';
 require __DIR__ . '/../src/Exception/AuthenticationException.php';
 require __DIR__ . '/../src/Exception/CheckoutRefusedException.php';
+require __DIR__ . '/../src/Exception/RateLimitException.php';
 require __DIR__ . '/../src/Exception/TransportException.php';
 
 use Dominaite\DominaiteClient;
 use Dominaite\Exception\ApiException;
+use Dominaite\Exception\RateLimitException;
 use Dominaite\Exception\TransportException;
 
 $failures = 0;
@@ -95,5 +98,50 @@ check('JSON 500 is a retryable transport error too',
 check('HTML 400 stays a non-retryable API error',
     thrownBy(static function () use ($responseClient): void { $responseClient->handle(400, '<html>nope</html>'); }),
     ApiException::class);
+
+// --- A11: rate limiting -----------------------------------------------------------------
+$limit = null;
+try {
+    $responseClient->handle(429, '{"error":{"code":"RATE_LIMITED"}}', ['retry-after' => '120']);
+} catch (RateLimitException $e) {
+    $limit = $e;
+}
+check('429 raises RateLimitException', $limit === null ? 'no exception' : get_class($limit),
+    RateLimitException::class);
+check('429 carries Retry-After seconds', var_export($limit === null ? null : $limit->getRetryAfterSeconds(), true), '120');
+check('429 keeps the HTTP status', (string) ($limit === null ? 0 : $limit->getHttpStatus()), '429');
+
+// An HTML 429 comes from an edge that never reached us; it must classify the same way.
+check('HTML 429 is still a RateLimitException',
+    thrownBy(static function () use ($responseClient, $html): void { $responseClient->handle(429, $html); }),
+    RateLimitException::class);
+
+// Retry-After in the HTTP-date form is not converted: a wrong number is worse than none,
+// because the caller would sleep on it.
+$retryAfterCases = [
+    'absent'      => [[], 'NULL'],
+    'http-date'   => [['retry-after' => 'Wed, 21 Oct 2026 07:28:00 GMT'], 'NULL'],
+    'garbage'     => [['retry-after' => 'soon'], 'NULL'],
+    'negative'    => [['retry-after' => '-5'], 'NULL'],
+    'fractional'  => [['retry-after' => '1.5'], 'NULL'],
+    'zero'        => [['retry-after' => '0'], '0'],
+    'padded'      => [['retry-after' => ' 30 '], '30'],
+];
+foreach ($retryAfterCases as $label => [$headers, $expected]) {
+    $seen = 'no exception';
+    try {
+        $responseClient->handle(429, '{}', $headers);
+    } catch (RateLimitException $e) {
+        $seen = var_export($e->getRetryAfterSeconds(), true);
+    }
+    check("Retry-After parsed: $label", $seen, $expected);
+}
+
+// It is not auto-retried, so it must not be a TransportException - those are the ones
+// callers loop on. Catching ApiException still works for code written before 429 existed.
+check('RateLimitException is not a transport error',
+    var_export($limit instanceof TransportException, true), 'false');
+check('RateLimitException is catchable as ApiException',
+    var_export($limit instanceof ApiException, true), 'true');
 
 exit($failures === 0 ? 0 : 1);

@@ -22,6 +22,20 @@ switch ($path) {
         header('Content-Type: text/html');
         return true;
 
+    case '/html-429':
+        http_response_code(429);
+        header('Content-Type: text/html');
+        header('Retry-After: 90');
+        echo "<html><body>Too Many Requests</body></html>\n";
+        return true;
+
+    case '/json-429-dated':
+        http_response_code(429);
+        header('Content-Type: application/json');
+        header('Retry-After: Wed, 21 Oct 2026 07:28:00 GMT');
+        echo json_encode(['success' => false, 'error' => ['code' => 'RATE_LIMITED']]);
+        return true;
+
     case '/oversized':
         // Far more than the SDK's 10MB cap, so a client that reads to the end is
         // unmistakably heavier than one that stops. Flushed in chunks: the client aborts

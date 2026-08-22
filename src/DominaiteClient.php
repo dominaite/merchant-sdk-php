@@ -7,6 +7,7 @@ namespace Dominaite;
 use Dominaite\Exception\ApiException;
 use Dominaite\Exception\AuthenticationException;
 use Dominaite\Exception\CheckoutRefusedException;
+use Dominaite\Exception\RateLimitException;
 use Dominaite\Exception\TransportException;
 
 /**
@@ -188,6 +189,7 @@ class DominaiteClient
      *
      * @throws AuthenticationException Wrong/revoked credentials, bad signature, clock off, IP not allowlisted.
      * @throws ApiException            Unexpected API response.
+     * @throws RateLimitException     HTTP 429 - you are over the rate limit; back off (getRetryAfterSeconds()).
      * @throws TransportException      Network-level failure.
      */
     public function ping(): array
@@ -218,6 +220,7 @@ class DominaiteClient
      * @throws AuthenticationException Wrong/revoked credentials or bad signature (fix config; do not retry).
      * @throws CheckoutRefusedException The gateway refused the session (inspect getErrorCode()).
      * @throws ApiException            Unexpected API response.
+     * @throws RateLimitException     HTTP 429 - you are over the rate limit; back off (getRetryAfterSeconds()).
      * @throws TransportException      Network-level failure (retry WITH the same idempotencyKey - getLastIdempotencyKey()).
      */
     public function createCheckoutSession(array $params): array
@@ -318,6 +321,7 @@ class DominaiteClient
      *
      * @throws AuthenticationException Wrong/revoked credentials or bad signature (fix config; do not retry).
      * @throws ApiException            Unknown transaction id (HTTP 404) or unexpected response.
+     * @throws RateLimitException     HTTP 429 - you are over the rate limit; back off (getRetryAfterSeconds()).
      * @throws TransportException      Network-level failure (safe to retry).
      */
     public function getStatus(string $transactionId): array
@@ -467,6 +471,7 @@ class DominaiteClient
 
         $raw = '';
         $oversized = false;
+        $responseHeaders = [];
 
         $ch = curl_init($this->baseUrl . $path);
         $options = [
@@ -487,6 +492,16 @@ class DominaiteClient
                 }
                 $raw .= $chunk;
                 return strlen($chunk);
+            },
+            // Retry-After (429) is the only response header the SDK reads, but capturing
+            // the set costs nothing and keeps the parsing in one place. Later duplicates
+            // win, which is what a redirect chain's final response should give us.
+            CURLOPT_HEADERFUNCTION => static function ($handle, string $header) use (&$responseHeaders): int {
+                $pair = explode(':', $header, 2);
+                if (count($pair) === 2) {
+                    $responseHeaders[strtolower(trim($pair[0]))] = trim($pair[1]);
+                }
+                return strlen($header);
             },
         ];
         if ($body !== null) {
@@ -509,7 +524,7 @@ class DominaiteClient
             throw new TransportException("Could not reach the Dominaite API: {$error}");
         }
 
-        return $this->handleResponse($status, $raw);
+        return $this->handleResponse($status, $raw, $responseHeaders);
     }
 
     /**
@@ -520,15 +535,23 @@ class DominaiteClient
      * A 502/503/504 from a load balancer or a captive portal is HTML or empty, and
      * parsing first would classify the infrastructure being down as "the API sent
      * something we could not read" - an ApiException nobody retries - instead of the
-     * retryable TransportException it is.
+     * retryable TransportException it is. Same for a 429 served by an edge.
      *
+     * @param array<string,string> $responseHeaders Lowercased header names to values.
      * @return array<string,mixed>
      */
-    protected function handleResponse(int $status, string $raw): array
+    protected function handleResponse(int $status, string $raw, array $responseHeaders = []): array
     {
         if ($status >= 500) {
             throw new TransportException("The Dominaite API is unavailable (HTTP {$status}); retry with the same idempotency key.");
         }
+        if ($status === 429) {
+            throw new RateLimitException(
+                'Rate limit exceeded (HTTP 429); back off and retry with the same idempotency key.',
+                self::parseRetryAfter($responseHeaders['retry-after'] ?? null)
+            );
+        }
+
         $decoded = json_decode($raw, true);
         if (!is_array($decoded)) {
             throw new ApiException($status, 'The API returned a non-JSON response');
@@ -550,6 +573,24 @@ class DominaiteClient
         }
 
         return $payload;
+    }
+
+    /**
+     * Reads Retry-After as whole seconds.
+     *
+     * RFC 9110 allows either a delay in seconds or an HTTP-date. Only the seconds form
+     * is modelled: converting a date needs the server's clock to agree with ours, and a
+     * wrong number here is worse than no number, because a caller would sleep on it.
+     * The date form (and an absent or unparseable header) comes back as null - "the
+     * server did not tell us", which the caller answers with its own backoff.
+     */
+    private static function parseRetryAfter(?string $value): ?int
+    {
+        if ($value === null || preg_match('/^[0-9]+$/', trim($value)) !== 1) {
+            return null;
+        }
+
+        return (int) trim($value);
     }
 
     /**

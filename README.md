@@ -80,6 +80,7 @@ require __DIR__ . '/vendor/autoload.php';
 
 use Dominaite\DominaiteClient;
 use Dominaite\Exception\CheckoutRefusedException;
+use Dominaite\Exception\RateLimitException;
 use Dominaite\Exception\TransportException;
 
 $client = new DominaiteClient(getenv('DOMINAITE_KEY_ID'), getenv('DOMINAITE_SECRET'));
@@ -103,6 +104,11 @@ try {
     // Machine-readable: $e->getErrorCode() - see the exception docblock for the codes.
     http_response_code(409);
     exit('Payment unavailable: ' . $e->getErrorCode());
+} catch (RateLimitException $e) {
+    // You are over the rate limit. Nothing is retried for you - back off first.
+    http_response_code(503);
+    header('Retry-After: ' . ($e->getRetryAfterSeconds() ?? 5));
+    exit('Payment temporarily unavailable');
 } catch (TransportException $e) {
     // Network blip or a 5xx - retry with $client->getLastIdempotencyKey(), never a fresh key.
     http_response_code(503);
@@ -261,6 +267,25 @@ in that response, so a retry cannot be your only path to rendering the widget. W
 gives you is the transaction id to reconcile against; see "Recovering from a replay refusal"
 below. Store `transactionId` and the idempotency key when a create succeeds, and treat the
 replay refusal as "go look up what the first attempt did", not as an error to show the payer.
+
+## Rate limits
+
+60 requests per minute per API key, 120 per minute per source IP. The per-IP bucket is the
+one that surprises people: several keys behind one egress address share it, so a key well
+under 60/min can still be limited.
+
+Over the limit the API answers HTTP 429 and the SDK raises `RateLimitException`. It is not
+retried for you - a loop against a rate limiter just spends the next window too, and on
+`createCheckoutSession()` retrying is a decision about a payment that belongs in your code.
+`getRetryAfterSeconds()` gives the server's own number of seconds to wait, or `null` when it
+did not send a usable one; treat `null` as "use your own backoff", not "retry now". When you
+do retry, reuse the idempotency key.
+
+`RateLimitException` extends `ApiException`, so code written before it existed still catches
+a 429. Catch `RateLimitException` first if you want to branch on it.
+
+The polling loop in "Fallback: status polling" is the usual way to hit this. Poll one
+transaction every few seconds, not every transaction every second.
 
 ## Response size
 
