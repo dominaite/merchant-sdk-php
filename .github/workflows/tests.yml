@@ -28,7 +28,7 @@ jobs:
             set -e
             php -v
             for suite in vectors webhook_vectors idempotency_vectors redaction_vectors \
-                         contract_vectors hardening_vectors transport_vectors; do
+                         contract_vectors wire_contract_vectors hardening_vectors transport_vectors; do
               echo "--- tests/$suite.php"
               php "tests/$suite.php"
             done
