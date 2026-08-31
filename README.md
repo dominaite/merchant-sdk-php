@@ -309,7 +309,10 @@ response surfaces as `TransportException` - retryable, same as any other transpo
 
 ## Sessions expire
 
-A session is valid for 2 hours. If the payer comes back later, create a new session.
+A session is valid for 2 hours. If the payer comes back later, create a new session - and
+re-POST with the same order-derived idempotency key, not a fresh one: from a few minutes
+past expiry the same key answers with a fresh session (see "Recovering from a replay
+refusal").
 
 ## Fallback: status polling
 
@@ -358,4 +361,14 @@ try {
 
 `getTransactionId()` is `null` when the API did not name one (a concurrent-race
 `DUPLICATE_REQUEST` knows the key is taken but not yet by which row), so check it before use.
-The full refusal payload is on `getResult()`.
+`DUPLICATE_REQUEST` means a session for this key is open, or expired within the last few
+minutes: re-POST the same key shortly, never a fresh one. The full refusal payload is on
+`getResult()`.
+
+One replay is not a refusal at all. A session that expired unpaid is superseded: from a few
+minutes past its expiry, re-POSTing the same key returns an ordinary success with a fresh
+session (new transaction id, same key), so a customer who comes back late just pays. Keep
+the order-derived key for the life of the order to keep that path open. The band is not
+endless - once the platform has independently closed the attempt (about an hour past
+expiry), the replay answers `PRIOR_ATTEMPT_FAILED` and the key is spent; reconcile and use
+a fresh key.
