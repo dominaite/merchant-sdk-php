@@ -36,7 +36,8 @@ class DominaiteClient
     private const DEFAULT_BASE_URL = 'https://api.dominaite.com/payments';
     public const SESSIONS_PATH = '/merchant-api/checkout/sessions';
     public const PING_PATH = '/merchant-api/ping';
-    private const USER_AGENT = 'dominaite-php/0.1.2 (php ' . PHP_VERSION . ')';
+    // Must track the release tag - bump alongside every tagged release.
+    private const USER_AGENT = 'dominaite-php/0.3.0 (php ' . PHP_VERSION . ')';
     private const TIMEOUT_SECONDS = 15;
 
     /**
@@ -79,6 +80,32 @@ class DominaiteClient
         'disputed',
         'requires_capture',
         'abandoned',
+    ];
+
+    /**
+     * Every payment method category the merchant API reports in `paymentMethod`, in the
+     * gateway's own order, pinned against the canonical cross-SDK contract fixture like
+     * STATUS_VOCABULARY above.
+     *
+     * Reporting data, not a money-flow switch: a wallet payment refunds, captures and
+     * disputes exactly like a plain card payment.
+     */
+    public const PAYMENT_METHOD_CATEGORIES = [
+        'card',
+        'wallet',
+        'bank_transfer',
+        'sepa',
+    ];
+
+    /**
+     * The wallets the gateway currently names in `walletType`, pinned against the
+     * canonical cross-SDK contract fixture. The field can carry a lower-cased identifier
+     * not in this list yet - treat unknown values as a valid wallet, not an error.
+     */
+    public const WALLET_TYPES = [
+        'apple_pay',
+        'google_pay',
+        'samsung_pay',
     ];
 
     /**
@@ -358,8 +385,17 @@ class DominaiteClient
      * Treat any status you do not recognise as still-open too: a value the API adds later
      * should make you keep polling, never silently close an order that is still live.
      *
+     * paymentMethod says how the payer paid ('card', 'wallet', 'bank_transfer' or 'sepa');
+     * it is null while the payment is still open (no method chosen yet) and on
+     * transactions older than the field. When it is 'wallet', walletType names the wallet
+     * ('apple_pay', 'google_pay', 'samsung_pay', or a lower-cased identifier the gateway
+     * learned about after this SDK released - treat an unknown value as a valid wallet,
+     * not an error); it is null for non-wallet payments. Both also appear inside data on
+     * every payment.* webhook event. Reporting data only, never a money-flow switch: a
+     * wallet payment refunds, captures and disputes exactly like a plain card payment.
+     *
      * @param string $transactionId The transactionId returned by createCheckoutSession().
-     * @return array{transactionId:string,orderId:string,orderReference:?string,status:string,amount:int,currency:string,refundedAmount:?int,createdAt:string,updatedAt:?string,expiresAt:?string}
+     * @return array{transactionId:string,orderId:string,orderReference:?string,status:string,amount:int,currency:string,refundedAmount:?int,paymentMethod:?string,walletType:?string,createdAt:string,updatedAt:?string,expiresAt:?string}
      *
      * @throws AuthenticationException Wrong/revoked credentials or bad signature (fix config; do not retry).
      * @throws ApiException            Unknown transaction id (HTTP 404) or unexpected response.
