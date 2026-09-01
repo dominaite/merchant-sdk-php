@@ -68,6 +68,25 @@ check('validation responses are HTTP 400', (string) $wire['validationHttpStatus'
 
 check('the contract still lists this SDK', in_array('php', $wire['sdks'], true) ? 'listed' : 'missing', 'listed');
 
+check(
+    'wallet types match the gateway, in order',
+    json_encode(DominaiteClient::WALLET_TYPES),
+    json_encode($wire['wallets']['walletTypes'] ?? null)
+);
+
+$reportingPaths = [];
+$allOptional = true;
+foreach ($wire['wallets']['reportingFields'] ?? [] as $field) {
+    $reportingPaths[] = $field['path'];
+    $allOptional = $allOptional && $field['required'] === false;
+}
+check(
+    'wallet reporting fields are paymentMethod and walletType',
+    json_encode($reportingPaths),
+    json_encode(['paymentMethod', 'walletType'])
+);
+check('wallet reporting fields are all optional', $allOptional ? 'all optional' : 'some required', 'all optional');
+
 if ($failures > 0) {
     echo "\n$failures wire-contract check(s) failed\n";
     exit(1);
