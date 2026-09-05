@@ -195,6 +195,9 @@ checked against a 300 second window, so a captured delivery cannot be replayed l
   "createdAt": "2026-08-20T14:00:00Z",
   "data": {
     "transactionId": "...",
+    "orderReference": "order-123",
+    "orderId": "dom_0f1e2d3c4b5a69788796a5b4c3d2e1f0",
+    "description": "Pro plan",
     "status": "succeeded",
     "previousStatus": "pending",
     "kind": "sale",
@@ -202,6 +205,10 @@ checked against a 300 second window, so a captured delivery cannot be replayed l
     "grossAmount": 8701,
     "surchargeAmount": 261,
     "currency": "EUR",
+    "paymentMethod": "card",
+    "walletType": null,
+    "paymentMethodBrand": "visa",
+    "paymentMethodLast4": "4242",
     "originalTransactionId": null,
     "idempotencyKey": "order-123"
   }
@@ -211,6 +218,13 @@ checked against a 300 second window, so a captured delivery cannot be replayed l
 Flat envelope, no `success` wrapper to branch on. Amounts are minor units: `amount` is what
 you get paid, `grossAmount` is what moved on the card, `surchargeAmount` is the difference
 when a surcharge applies.
+
+`orderReference` is your own order id from create session and the field to match deliveries on;
+it is null only for payments that did not start through the API, and `payment.refunded` carries
+the original payment's value. `orderId` is the hosted checkout id, null on refunds. `description`
+is what you sent on create session, null on refunds. `paymentMethodBrand` and `paymentMethodLast4`
+are filled once a card payment was attempted and null otherwise. Every key is always present;
+ignore keys you do not know, more may be added.
 
 Events: `payment.succeeded`, `payment.failed`, `payment.requires_capture`,
 `payment.cancelled`, `payment.abandoned`, `payment.refunded`, `payment.disputed`.
