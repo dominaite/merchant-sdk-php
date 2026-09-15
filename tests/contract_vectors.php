@@ -15,11 +15,18 @@
 require __DIR__ . '/../src/DominaiteClient.php';
 require __DIR__ . '/../src/Exception/ApiException.php';
 require __DIR__ . '/../src/Exception/AuthenticationException.php';
+require __DIR__ . '/../src/Exception/ChargeException.php';
 require __DIR__ . '/../src/Exception/CheckoutRefusedException.php';
+require __DIR__ . '/../src/Exception/RateLimitException.php';
+require __DIR__ . '/../src/Exception/RevokeException.php';
 require __DIR__ . '/../src/Exception/TransportException.php';
 
 use Dominaite\DominaiteClient;
+use Dominaite\Exception\ApiException;
+use Dominaite\Exception\ChargeException;
 use Dominaite\Exception\CheckoutRefusedException;
+use Dominaite\Exception\RevokeException;
+use Dominaite\Exception\TransportException;
 
 $failures = 0;
 
@@ -63,14 +70,48 @@ function sortedList(array $value): string
 }
 
 /**
+ * The fixture spells nullable fields out as null; the gateway omits them on the wire
+ * (System.Text.Json with WhenWritingNull). Every example is pushed through in both
+ * forms, and the SDK must read them identically.
+ *
+ * @param array<mixed> $value
+ * @return array<mixed>
+ */
+function withoutNulls(array $value): array
+{
+    $out = [];
+    foreach ($value as $key => $item) {
+        if ($item === null) {
+            continue;
+        }
+        $out[$key] = is_array($item) ? withoutNulls($item) : $item;
+    }
+    return $out;
+}
+
+/** @return string The class name of the thrown exception, or 'no exception'. */
+function thrownBy(callable $fn): string
+{
+    try {
+        $fn();
+    } catch (\Throwable $e) {
+        return get_class($e);
+    }
+
+    return 'no exception';
+}
+
+/**
  * A client whose transport is replaced by canned gateway responses, so the response
- * handling runs for real without a network call. Records the request line the SDK
- * would have signed, which pins the method and path per endpoint too.
+ * handling runs for real without a network call: the canned body goes through the
+ * real parser with the canned HTTP status. Records the request line the SDK would
+ * have signed, which pins the method and path per endpoint too.
  */
 final class CannedClient extends DominaiteClient
 {
     /** @var array<string,mixed> */
     private array $canned;
+    private int $status;
 
     /** @var list<string> */
     public array $calls = [];
@@ -79,20 +120,22 @@ final class CannedClient extends DominaiteClient
     public array $idempotencyKeys = [];
 
     /** @param array<string,mixed> $canned */
-    public function __construct(array $canned)
+    public function __construct(array $canned, int $status = 200)
     {
         parent::__construct(
             'dmk_0123456789abcdef',
             'dms_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'
         );
         $this->canned = $canned;
+        $this->status = $status;
     }
 
-    protected function request(string $method, string $path, ?array $body, string $idempotencyKey): array
+    protected function send(string $method, string $path, ?array $body, string $idempotencyKey): array
     {
         $this->calls[] = $method . ' ' . $path;
         $this->idempotencyKeys[] = $idempotencyKey;
-        return $this->canned;
+        $raw = $this->status === 204 ? '' : (string) json_encode($this->canned);
+        return $this->readResponse($this->status, $raw, []);
     }
 }
 
@@ -288,44 +331,81 @@ foreach (DominaiteClient::STATUS_VOCABULARY as $value) {
 
 // --- stored payment methods -----------------------------------------------------------
 // The vocabularies, in the fixture's order, like STATUS_VOCABULARY above.
-check('payment method status vocabulary matches the fixture',
-    listOf(DominaiteClient::PAYMENT_METHOD_STATUS_VOCABULARY), listOf($fixture['paymentMethodStatusVocabulary']));
+check('stored payment method status vocabulary matches the fixture',
+    listOf(DominaiteClient::STORED_PAYMENT_METHOD_STATUS_VOCABULARY), listOf($fixture['storedPaymentMethodStatusVocabulary']));
 check('charge status vocabulary matches the fixture',
     listOf(DominaiteClient::CHARGE_STATUS_VOCABULARY), listOf($fixture['chargeStatusVocabulary']));
 check('decline class vocabulary matches the fixture',
     listOf(DominaiteClient::DECLINE_CLASS_VOCABULARY), listOf($fixture['declineClassVocabulary']));
+check('charge error codes match the fixture',
+    listOf(DominaiteClient::CHARGE_ERROR_CODES), listOf($fixture['chargeErrorCodes']));
+check('revoke error codes match the fixture',
+    listOf(DominaiteClient::REVOKE_ERROR_CODES), listOf($fixture['revokeErrorCodes']));
+check('CHARGE_DECLINED is a result, never a charge error code',
+    in_array('CHARGE_DECLINED', DominaiteClient::CHARGE_ERROR_CODES, true) ? 'listed' : 'not listed', 'not listed');
 
-// getStatus() with a saved card: the payment method comes through with exactly the
-// fixture's fields, and the plain example keeps paymentMethod PRESENT and null.
-check('getStatus keeps paymentMethod present when null',
-    array_key_exists('paymentMethod', $result) ? 'present' : 'absent', 'present');
-check('getStatus paymentMethod is null in the fixture example', var_export($result['paymentMethod'], true), 'NULL');
+// getStatus() without a saved card: the fixture spells storedPaymentMethod out as null,
+// the wire omits it. Both read as "no card on file"; the SDK adds no key of its own.
+check('getStatus keeps storedPaymentMethod present when the gateway sent null',
+    array_key_exists('storedPaymentMethod', $result) ? 'present' : 'absent', 'present');
+check('getStatus storedPaymentMethod is null in the fixture example', var_export($result['storedPaymentMethod'], true), 'NULL');
+$wire = (new CannedClient(withoutNulls($status['example'])))->getStatus($status['example']['transactionId']);
+check('getStatus adds no storedPaymentMethod key when the gateway omitted it',
+    array_key_exists('storedPaymentMethod', $wire) ? 'present' : 'absent', 'absent');
+check('an omitted storedPaymentMethod reads as null with ??', var_export($wire['storedPaymentMethod'] ?? null, true), 'NULL');
 
+// With a saved card: the card comes through with exactly the fixture's fields.
 $savedClient = new CannedClient($status['savedCardExample']);
 $saved = $savedClient->getStatus($status['savedCardExample']['transactionId']);
 check('getStatus accepts the fixture saved-card example', keysOf($saved), sortedList($status['fields']));
 check('saved-card example field set matches the fixture', keysOf($status['savedCardExample']), sortedList($status['fields']));
-check('paymentMethod field set matches the fixture',
-    keysOf($saved['paymentMethod']), sortedList($status['paymentMethodFields']));
-check('paymentMethod status is in the vocabulary',
-    in_array($saved['paymentMethod']['status'], DominaiteClient::PAYMENT_METHOD_STATUS_VOCABULARY, true) ? 'in vocabulary' : $saved['paymentMethod']['status'],
+check('storedPaymentMethod field set matches the fixture',
+    keysOf($saved['storedPaymentMethod']), sortedList($status['storedPaymentMethodFields']));
+check('storedPaymentMethod status is in the vocabulary',
+    in_array($saved['storedPaymentMethod']['status'], DominaiteClient::STORED_PAYMENT_METHOD_STATUS_VOCABULARY, true) ? 'in vocabulary' : $saved['storedPaymentMethod']['status'],
     'in vocabulary');
-check('paymentMethod expiry stays an int', var_export($saved['paymentMethod']['expiryYear'], true), '2029');
-$paymentMethodId = (string) $saved['paymentMethod']['id'];
+check('storedPaymentMethod id is pm_ plus 32 hex characters',
+    preg_match('/^pm_[0-9a-f]{32}$/', (string) $saved['storedPaymentMethod']['id']) === 1 ? 'well-formed' : (string) $saved['storedPaymentMethod']['id'], 'well-formed');
+check('storedPaymentMethod expiry stays an int', var_export($saved['storedPaymentMethod']['expiryYear'], true), '2029');
+$paymentMethodId = (string) $saved['storedPaymentMethod']['id'];
+
+// The card's own nullable fields: absent on the wire when the provider did not report
+// them, present and null once read.
+$bare = $status['savedCardExample'];
+foreach (['brand', 'last4', 'expiryMonth', 'expiryYear'] as $field) {
+    $bare['storedPaymentMethod'][$field] = null;
+}
+$bareRead = (new CannedClient(withoutNulls($bare)))->getStatus($bare['transactionId']);
+check('a card without brand, last4 and expiry on the wire still has every field',
+    keysOf($bareRead['storedPaymentMethod']), sortedList($status['storedPaymentMethodFields']));
+foreach (['brand', 'last4', 'expiryMonth', 'expiryYear'] as $field) {
+    check("unreported card $field reads as null", var_export($bareRead['storedPaymentMethod'][$field], true), 'NULL');
+}
+check('the bare card keeps its id', (string) $bareRead['storedPaymentMethod']['id'], $paymentMethodId);
+
+// Every stored payment method status deserializes the same way.
+foreach (DominaiteClient::STORED_PAYMENT_METHOD_STATUS_VOCABULARY as $value) {
+    $example = $status['savedCardExample'];
+    $example['storedPaymentMethod']['status'] = $value;
+    $read = (new CannedClient($example))->getStatus($example['transactionId']);
+    check("getStatus accepts storedPaymentMethod status: $value", (string) $read['storedPaymentMethod']['status'], $value);
+}
 
 // The getStatus() docblock is where an integrator reads about the saved card too.
-check('getStatus() documents paymentMethod', strpos($getStatusDoc, 'paymentMethod') !== false ? 'documented' : 'missing', 'documented');
+check('getStatus() documents storedPaymentMethod', strpos($getStatusDoc, 'storedPaymentMethod') !== false ? 'documented' : 'missing', 'documented');
 
 // --- chargePaymentMethod --------------------------------------------------------------
 $charge = $endpoints['chargePaymentMethod'];
 check('charge path matches the fixture',
     DominaiteClient::PAYMENT_METHODS_PATH . '/{paymentMethodId}/charges', (string) $charge['path']);
-check('charge is a POST that answers 201', $charge['method'] . ' ' . $charge['httpStatus'], 'POST 201');
+check('charge is a POST that answers 201 and declines with 402',
+    $charge['method'] . ' ' . $charge['httpStatus'] . ' ' . $charge['declinedHttpStatus'], 'POST 201 402');
 $chargeParams = ['amount' => 8440, 'currency' => 'EUR', 'orderReference' => 'order-1042'];
 
-$chargeClient = new CannedClient($charge['successExample']);
+// 201: the envelope is unwrapped and the charge is exactly the fixture's fields.
+$chargeClient = new CannedClient($charge['successExample'], 201);
 $chargeResult = $chargeClient->chargePaymentMethod($paymentMethodId, $chargeParams);
-check('chargePaymentMethod accepts the fixture success example', keysOf($chargeResult), keysOf($charge['successExample']));
+check('chargePaymentMethod accepts the fixture success example', keysOf($chargeResult), keysOf($charge['successExample']['data']));
 check('charge field set matches the fixture', keysOf($chargeResult), sortedList($charge['fields']));
 check('chargePaymentMethod is a POST on the fixture path', listOf($chargeClient->calls),
     'POST ' . str_replace('{paymentMethodId}', $paymentMethodId, (string) $charge['path']));
@@ -334,52 +414,120 @@ check('chargePaymentMethod generates an idempotency key when the caller omits on
 check('charge reads a vocabulary status',
     in_array($chargeResult['status'], DominaiteClient::CHARGE_STATUS_VOCABULARY, true) ? 'in vocabulary' : $chargeResult['status'],
     'in vocabulary');
+check('chargeId is ch_ plus 32 hex characters',
+    preg_match('/^ch_[0-9a-f]{32}$/', (string) $chargeResult['chargeId']) === 1 ? 'well-formed' : (string) $chargeResult['chargeId'], 'well-formed');
 foreach (['declineClass', 'declineCode'] as $nullable) {
     check("succeeded charge keeps $nullable present when null",
         array_key_exists($nullable, $chargeResult) ? 'present' : 'absent', 'present');
     check("succeeded charge $nullable is null in the fixture example", var_export($chargeResult[$nullable], true), 'NULL');
 }
 
-// A decline is a 201 result with a class, not an exception.
-$declinedClient = new CannedClient($charge['declinedExample']);
+// The wire form of a 201 has no declineClass or declineCode at all; the result still does.
+$wireCharge = (new CannedClient(withoutNulls($charge['successExample']), 201))->chargePaymentMethod($paymentMethodId, $chargeParams);
+check('a 201 without declineClass on the wire still has every field', keysOf($wireCharge), sortedList($charge['fields']));
+check('a 201 without declineClass on the wire reads it as null', var_export($wireCharge['declineClass'], true), 'NULL');
+check('a 201 without declineCode on the wire reads it as null', var_export($wireCharge['declineCode'], true), 'NULL');
+
+// A durable replay answers 200 with the same body; still a charge.
+$replay = (new CannedClient($charge['successExample'], 200))->chargePaymentMethod($paymentMethodId, $chargeParams);
+check('a 200 replay is returned as the charge', (string) $replay['chargeId'], (string) $charge['successExample']['data']['chargeId']);
+
+// 402: a decline is a result with a class, not an exception, even though the envelope
+// says success=false and carries CHARGE_DECLINED.
+check('declined example field set matches the fixture', keysOf($charge['declinedExample']['data']), sortedList($charge['fields']));
+check('the declined example carries CHARGE_DECLINED', (string) $charge['declinedExample']['error']['code'], 'CHARGE_DECLINED');
+$declinedClient = new CannedClient($charge['declinedExample'], 402);
 $declined = $declinedClient->chargePaymentMethod($paymentMethodId, $chargeParams);
-check('declined example field set matches the fixture', keysOf($charge['declinedExample']), sortedList($charge['fields']));
-check('a declined charge is returned, not thrown', (string) $declined['status'], 'failed');
+check('a 402 decline is returned, not thrown', (string) $declined['status'], 'failed');
+check('declined charge field set matches the fixture', keysOf($declined), sortedList($charge['fields']));
 check('declined charge carries a vocabulary declineClass',
     in_array($declined['declineClass'], DominaiteClient::DECLINE_CLASS_VOCABULARY, true) ? 'in vocabulary' : (string) $declined['declineClass'],
     'in vocabulary');
 check('declined charge carries the raw declineCode', (string) $declined['declineCode'], '51');
+check('declined charge names its transaction', (string) $declined['transactionId'], (string) $charge['declinedExample']['data']['transactionId']);
 
 // Every charge status and every decline class deserializes the same way.
 foreach (DominaiteClient::CHARGE_STATUS_VOCABULARY as $value) {
     $example = $charge['successExample'];
-    $example['status'] = $value;
-    $read = (new CannedClient($example))->chargePaymentMethod($paymentMethodId, $chargeParams);
+    $example['data']['status'] = $value;
+    $read = (new CannedClient($example, 201))->chargePaymentMethod($paymentMethodId, $chargeParams);
     check("chargePaymentMethod accepts status: $value", (string) $read['status'], $value);
 }
 foreach (DominaiteClient::DECLINE_CLASS_VOCABULARY as $value) {
     $example = $charge['declinedExample'];
-    $example['declineClass'] = $value;
-    $read = (new CannedClient($example))->chargePaymentMethod($paymentMethodId, $chargeParams);
+    $example['data']['declineClass'] = $value;
+    $read = (new CannedClient($example, 402))->chargePaymentMethod($paymentMethodId, $chargeParams);
     check("chargePaymentMethod accepts declineClass: $value", (string) $read['declineClass'], $value);
 }
 
-// A refusal reuses the create endpoint's success=false shape and must raise.
-foreach (DominaiteClient::REFUSAL_ERROR_CODES as $code) {
-    $client = new CannedClient([
-        'success' => false,
-        'transactionId' => '1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d',
-        'errorCode' => $code,
-        'errorMessage' => 'Refused.',
-    ]);
-    try {
-        $client->chargePaymentMethod($paymentMethodId, $chargeParams);
-        check("charge refusal surfaces errorCode: $code", 'returned normally', $code);
-    } catch (CheckoutRefusedException $refusal) {
-        check("charge refusal surfaces errorCode: $code", $refusal->getErrorCode(), $code);
-        check("charge refusal names the transaction: $code", (string) $refusal->getTransactionId(), '1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d');
+// 409, 422, 502, 503: every error example is a ChargeException keeping the status, the
+// code, the message and whatever charge row the gateway attached - in both wire forms.
+$seenCodes = [];
+foreach ($charge['errorExamples'] as $index => $example) {
+    $label = $example['httpStatus'] . ' ' . $example['code'] . (isset($example['body']['data']) ? ' with data' : ' without data');
+    $seenCodes[] = $example['code'];
+    check("charge error example $label names a known code",
+        in_array($example['code'], DominaiteClient::CHARGE_ERROR_CODES, true) ? 'known' : 'unknown', 'known');
+    check("charge error example $label carries its code at error.code", (string) $example['body']['error']['code'], (string) $example['code']);
+    check("charge error example $label carries its status at error.statusCode", (string) $example['body']['error']['statusCode'], (string) $example['httpStatus']);
+
+    foreach (['as spelled' => $example['body'], 'on the wire' => withoutNulls($example['body'])] as $form => $body) {
+        $thrown = null;
+        try {
+            (new CannedClient($body, (int) $example['httpStatus']))->chargePaymentMethod($paymentMethodId, $chargeParams);
+        } catch (ChargeException $e) {
+            $thrown = $e;
+        }
+        check("charge $label $form throws ChargeException", $thrown === null ? 'no exception' : get_class($thrown), ChargeException::class);
+        if ($thrown === null) {
+            continue;
+        }
+        check("charge $label $form keeps the HTTP status", (string) $thrown->getHttpStatus(), (string) $example['httpStatus']);
+        check("charge $label $form keeps error.code", $thrown->getErrorCode(), (string) $example['code']);
+        check("charge $label $form keeps error.message", $thrown->getMessage(), (string) $example['body']['error']['message']);
+        check("charge $label $form keeps the whole envelope", keysOf($thrown->getResult()), keysOf($body));
+        if (isset($example['body']['data'])) {
+            $attached = $thrown->getCharge();
+            check("charge $label $form attaches the charge row", $attached === null ? 'null' : keysOf($attached), sortedList($charge['fields']));
+            check("charge $label $form attaches the charge id", (string) ($attached['chargeId'] ?? ''), (string) $example['body']['data']['chargeId']);
+            check("charge $label $form names the transaction to poll", (string) $thrown->getTransactionId(), (string) $example['body']['data']['transactionId']);
+            check("charge $label $form reads declineClass as null",
+                is_array($attached) && array_key_exists('declineClass', $attached) ? var_export($attached['declineClass'], true) : 'missing', 'NULL');
+        } else {
+            check("charge $label $form attaches no charge row", $thrown->getCharge() === null ? 'null' : 'attached', 'null');
+            check("charge $label $form has no transaction to poll", $thrown->getTransactionId() === null ? 'null' : 'set', 'null');
+        }
     }
 }
+check('the fixture exercises every charge error code',
+    sortedList(array_values(array_unique($seenCodes))), sortedList(DominaiteClient::CHARGE_ERROR_CODES));
+check('CHARGE_OUTCOME_UNKNOWN is the example that carries a transaction to poll',
+    (string) $charge['errorExamples'][0]['code'] . ' ' . (isset($charge['errorExamples'][0]['body']['data']['transactionId']) ? 'with transactionId' : 'without'),
+    'CHARGE_OUTCOME_UNKNOWN with transactionId');
+
+// 404: an id that is not yours stays the generic ApiException, code and all.
+$notFound = $charge['notFoundExample'];
+$missing = null;
+try {
+    (new CannedClient($notFound['body'], (int) $notFound['httpStatus']))->chargePaymentMethod($paymentMethodId, $chargeParams);
+} catch (ApiException $e) {
+    $missing = $e;
+}
+check('a charge on an id that is not yours is an ApiException', $missing === null ? 'no exception' : get_class($missing), ApiException::class);
+check('the charge 404 keeps its status', (string) ($missing === null ? 0 : $missing->getHttpStatus()), (string) $notFound['httpStatus']);
+check('the charge 404 keeps its code', (string) ($missing === null ? '' : $missing->getErrorCode()), (string) $notFound['code']);
+check('the charge 404 keeps its message', $missing === null ? '' : $missing->getMessage(), (string) $notFound['body']['error']['message']);
+
+// A 5xx without the gateway's envelope is the platform being down, not a charge error.
+check('a codeless 502 on a charge is a retryable transport error',
+    thrownBy(static function () use ($paymentMethodId, $chargeParams): void {
+        (new CannedClient(['success' => false], 502))->chargePaymentMethod($paymentMethodId, $chargeParams);
+    }), TransportException::class);
+// A 2xx without a charge body is not a charge, whatever success says.
+check('a 201 without a charge body is an ApiException',
+    thrownBy(static function () use ($paymentMethodId, $chargeParams): void {
+        (new CannedClient(['success' => true], 201))->chargePaymentMethod($paymentMethodId, $chargeParams);
+    }), ApiException::class);
 
 // --- revokePaymentMethod --------------------------------------------------------------
 $revoke = $endpoints['revokePaymentMethod'];
@@ -388,10 +536,51 @@ check('revoke path matches the fixture',
 check('revoke is a DELETE that answers 204 with no fields',
     $revoke['method'] . ' ' . $revoke['httpStatus'] . ' ' . count($revoke['fields']), 'DELETE 204 0');
 
-$revokeClient = new CannedClient([]);
+$revokeClient = new CannedClient([], 204);
 $revokeClient->revokePaymentMethod($paymentMethodId);
 check('revokePaymentMethod is a DELETE on the fixture path', listOf($revokeClient->calls),
     'DELETE ' . str_replace('{paymentMethodId}', $paymentMethodId, (string) $revoke['path']));
 check('DELETE signs an empty idempotency key', listOf($revokeClient->idempotencyKeys), '');
+
+// 502 and 503: a RevokeException keeping the status, the code and the message.
+$seenCodes = [];
+foreach ($revoke['errorExamples'] as $example) {
+    $label = $example['httpStatus'] . ' ' . $example['code'];
+    $seenCodes[] = $example['code'];
+    check("revoke error example $label names a known code",
+        in_array($example['code'], DominaiteClient::REVOKE_ERROR_CODES, true) ? 'known' : 'unknown', 'known');
+    $thrown = null;
+    try {
+        (new CannedClient($example['body'], (int) $example['httpStatus']))->revokePaymentMethod($paymentMethodId);
+    } catch (RevokeException $e) {
+        $thrown = $e;
+    }
+    check("revoke $label throws RevokeException", $thrown === null ? 'no exception' : get_class($thrown), RevokeException::class);
+    if ($thrown === null) {
+        continue;
+    }
+    check("revoke $label keeps the HTTP status", (string) $thrown->getHttpStatus(), (string) $example['httpStatus']);
+    check("revoke $label keeps error.code", $thrown->getErrorCode(), (string) $example['code']);
+    check("revoke $label keeps error.message", $thrown->getMessage(), (string) $example['body']['error']['message']);
+    check("revoke $label keeps the whole envelope", keysOf($thrown->getResult()), keysOf($example['body']));
+}
+check('the fixture exercises every revoke error code',
+    sortedList(array_values(array_unique($seenCodes))), sortedList(DominaiteClient::REVOKE_ERROR_CODES));
+
+// 404: the gateway's validation shape, still the generic ApiException.
+$notFound = $revoke['notFoundExample'];
+$missing = null;
+try {
+    (new CannedClient($notFound['body'], (int) $notFound['httpStatus']))->revokePaymentMethod($paymentMethodId);
+} catch (ApiException $e) {
+    $missing = $e;
+}
+check('a revoke on an id that is not yours is an ApiException', $missing === null ? 'no exception' : get_class($missing), ApiException::class);
+check('the revoke 404 keeps its status', (string) ($missing === null ? 0 : $missing->getHttpStatus()), (string) $notFound['httpStatus']);
+check('the revoke 404 keeps its code', (string) ($missing === null ? '' : $missing->getErrorCode()), (string) $notFound['code']);
+check('a codeless 503 on a revoke is a retryable transport error',
+    thrownBy(static function () use ($paymentMethodId): void {
+        (new CannedClient(['success' => false], 503))->revokePaymentMethod($paymentMethodId);
+    }), TransportException::class);
 
 exit($failures === 0 ? 0 : 1);

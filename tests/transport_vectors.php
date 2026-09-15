@@ -192,7 +192,9 @@ $charge = $client->chargePaymentMethod(PAYMENT_METHOD_ID, [
     'amount' => 2500, 'currency' => 'EUR', 'orderReference' => 'order-1043',
     'idempotencyKey' => '00000000-0000-4000-8000-000000000003',
 ]);
-check('a live charge answers with the 201 body', (string) ($charge['chargeId'] ?? ''), 'chg_live');
+check('a live charge answers with the unwrapped 201 body', (string) ($charge['chargeId'] ?? ''), 'ch_1a2b3c4d5e6f4a7b8c9d0e1f2a3b4c5d');
+check('a live charge reads the omitted declineClass as null, present',
+    array_key_exists('declineClass', $charge) ? var_export($charge['declineClass'], true) : 'absent', 'NULL');
 $seen = lastRequest($recordFile);
 check('the charge went out as POST on the canonical path', $seen['method'] . ' ' . $seen['path'],
     'POST /merchant-api/payment-methods/' . PAYMENT_METHOD_ID . '/charges');

@@ -33,14 +33,17 @@ if (strpos($path, '/merchant-api/payment-methods/') === 0) {
     // Only the vector's id exists; any other id is the 404 at the bottom, like the API.
     $known = '/merchant-api/payment-methods/pm_0123456789abcdef0123456789abcdef';
     if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST' && $path === $known . '/charges') {
+        // The gateway's envelope as it goes over the wire: null fields omitted.
         http_response_code(201);
         header('Content-Type: application/json');
         echo json_encode([
-            'chargeId' => 'chg_live',
-            'status' => 'succeeded',
-            'declineClass' => null,
-            'declineCode' => null,
-            'transactionId' => '1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d',
+            'success' => true,
+            'data' => [
+                'chargeId' => 'ch_1a2b3c4d5e6f4a7b8c9d0e1f2a3b4c5d',
+                'status' => 'succeeded',
+                'transactionId' => '1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d',
+            ],
+            'metadata' => ['requestId' => 'live', 'timestamp' => '2026-09-15T18:02:11Z', 'apiVersion' => '1.0', 'processingTimeMs' => 1],
         ]);
         return true;
     }

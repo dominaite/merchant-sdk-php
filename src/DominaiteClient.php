@@ -6,8 +6,10 @@ namespace Dominaite;
 
 use Dominaite\Exception\ApiException;
 use Dominaite\Exception\AuthenticationException;
+use Dominaite\Exception\ChargeException;
 use Dominaite\Exception\CheckoutRefusedException;
 use Dominaite\Exception\RateLimitException;
+use Dominaite\Exception\RevokeException;
 use Dominaite\Exception\TransportException;
 
 /**
@@ -123,20 +125,24 @@ class DominaiteClient
      * behind, expired means the card's expiry date has passed. Treat an unknown value
      * as not chargeable.
      */
-    public const PAYMENT_METHOD_STATUS_VOCABULARY = [
+    public const STORED_PAYMENT_METHOD_STATUS_VOCABULARY = [
         'active',
         'revoked',
         'expired',
     ];
 
     /**
-     * Every value chargePaymentMethod() can return in `status`. pending is not
-     * terminal: poll getStatus() with the charge's transactionId.
+     * Every value chargePaymentMethod() can return in `status`, in the API's own order.
+     * succeeded: the money moved. failed: it did not, and on a 402 declineClass says
+     * why. pending is not terminal: poll getStatus() with the charge's transactionId.
+     * cancelled: an authorization voided before capture, no money moved. Treat an
+     * unknown value as still open.
      */
     public const CHARGE_STATUS_VOCABULARY = [
         'succeeded',
         'failed',
         'pending',
+        'cancelled',
     ];
 
     /**
@@ -152,6 +158,41 @@ class DominaiteClient
         'soft_sca_required',
         'soft_other',
     ];
+
+    /**
+     * Every errorCode chargePaymentMethod() raises as a ChargeException, in the API's
+     * own order: 409 (PAYMENT_METHOD_NOT_ACTIVE, DUPLICATE_REQUEST), 422
+     * (IDEMPOTENCY_KEY_REUSED), 502 (CHARGE_OUTCOME_UNKNOWN, CHARGE_FAILED) and 503
+     * (PAYMENT_METHOD_CHARGES_DISABLED, PAYMENT_PROCESSING_UNAVAILABLE). CHARGE_DECLINED
+     * (402) is deliberately not one of them: a decline is a charge with status failed.
+     */
+    public const CHARGE_ERROR_CODES = [
+        'PAYMENT_METHOD_NOT_ACTIVE',
+        'DUPLICATE_REQUEST',
+        'IDEMPOTENCY_KEY_REUSED',
+        'CHARGE_OUTCOME_UNKNOWN',
+        'CHARGE_FAILED',
+        'PAYMENT_METHOD_CHARGES_DISABLED',
+        'PAYMENT_PROCESSING_UNAVAILABLE',
+    ];
+
+    /**
+     * Every errorCode revokePaymentMethod() raises as a RevokeException, in the API's
+     * own order: 502 UPSTREAM_CONTRACT_ERROR (not retryable) and 503
+     * MERCHANT_API_UNAVAILABLE (retry later). Nothing changed under either.
+     */
+    public const REVOKE_ERROR_CODES = [
+        'UPSTREAM_CONTRACT_ERROR',
+        'MERCHANT_API_UNAVAILABLE',
+    ];
+
+    /**
+     * The statuses that keep their generic exception on every route: validation (400),
+     * authentication (401, 403), an id that is not yours (404) and rate limiting (429).
+     * Any other failure that carries an error code on a payment-method route is that
+     * route's typed exception; without a code a 5xx stays the retryable transport error.
+     */
+    private const GENERIC_FAILURE_STATUSES = [400, 401, 403, 404, 429];
 
     private string $keyId;
     private string $secret;
@@ -293,9 +334,9 @@ class DominaiteClient
      * orderReference (your order id, <= 100 chars).
      * Optional: customer{firstName,lastName,email,phone}, country (ISO 3166-1 alpha-2),
      * language (ISO 639-1), theme ('light'|'dark'|'bright'), description,
-     * saveCard (bool - keep the card on file once this payment succeeds, so you can
+     * saveCard (bool - keep the card on file once this payment is approved, so you can
      * charge it again with chargePaymentMethod(); the stored method shows up as
-     * paymentMethod on getStatus(), and the card details never reach you),
+     * storedPaymentMethod on getStatus(), and the card details never reach you),
      * idempotencyKey (auto-generated when omitted - retrying with the same key never
      * creates a second payment; read the generated one back with getLastIdempotencyKey()).
      *
@@ -400,14 +441,19 @@ class DominaiteClient
      * Treat any status you do not recognise as still-open too: a value the API adds later
      * should make you keep polling, never silently close an order that is still live.
      *
-     * paymentMethod is the card kept on file for this payment: present once a session
-     * created with saveCard has succeeded, null otherwise. It carries {id, brand, last4,
-     * expiryMonth, expiryYear, status} and never the card number or the provider token.
-     * Store paymentMethod['id'] against your customer - it is what chargePaymentMethod()
-     * and revokePaymentMethod() take.
+     * storedPaymentMethod is the card kept on file by a session created with saveCard:
+     * {id, brand, last4, expiryMonth, expiryYear, status}, present once the payment is
+     * approved (and it stays after a revoke, with status 'revoked'); absent or null until
+     * then, for sessions without saveCard, and for declined or abandoned ones. brand,
+     * last4 and the expiry are null when the provider did not report them. It never
+     * carries the card number or the provider token. Store storedPaymentMethod['id']
+     * against your customer - it is what chargePaymentMethod() and
+     * revokePaymentMethod() take. It is not the paymentMethod field, which is the
+     * gateway's string category of how the payer paid ('card', 'wallet', ...) and
+     * passes through untouched.
      *
      * @param string $transactionId The transactionId returned by createCheckoutSession().
-     * @return array{transactionId:string,orderId:string,orderReference:?string,status:string,amount:int,currency:string,refundedAmount:?int,createdAt:string,updatedAt:?string,expiresAt:?string,paymentMethod:?array{id:string,brand:string,last4:string,expiryMonth:int,expiryYear:int,status:string}}
+     * @return array{transactionId:string,orderId:string,orderReference:?string,status:string,amount:int,currency:string,refundedAmount:?int,createdAt:string,updatedAt:?string,expiresAt:?string,storedPaymentMethod?:?array{id:string,brand:?string,last4:?string,expiryMonth:?int,expiryYear:?int,status:string}}
      *
      * @throws AuthenticationException Wrong/revoked credentials or bad signature (fix config; do not retry).
      * @throws ApiException            Unknown transaction id (HTTP 404) or unexpected response.
@@ -421,35 +467,52 @@ class DominaiteClient
             throw new \InvalidArgumentException('transactionId must be the UUID returned by createCheckoutSession()');
         }
 
-        return $this->request('GET', self::SESSIONS_PATH . '/' . $normalized, null, '');
+        $status = $this->request('GET', self::SESSIONS_PATH . '/' . $normalized, null, '');
+
+        // Passed through as sent, except the card on file: the gateway omits its null
+        // fields on the wire, and the caller gets one shape for it, not two. When the
+        // gateway sent no storedPaymentMethod at all there is no key here either.
+        if (is_array($status['storedPaymentMethod'] ?? null)) {
+            $status['storedPaymentMethod'] = self::storedPaymentMethod($status['storedPaymentMethod']);
+        }
+
+        return $status;
     }
 
     /**
      * Charges a card kept on file, off-session: no widget, no payer present.
      *
-     * $paymentMethodId is paymentMethod['id'] from getStatus() of a session you created
-     * with saveCard. The charge is signed like a session and carries an Idempotency-Key
-     * (auto-generated unless you pass one; read it back with getLastIdempotencyKey()),
-     * so retrying after a timeout WITH THE SAME KEY never charges the card twice.
+     * $paymentMethodId is storedPaymentMethod['id'] from getStatus() of a session you
+     * created with saveCard. The charge is signed like a session and carries an
+     * Idempotency-Key (auto-generated unless you pass one; read it back with
+     * getLastIdempotencyKey()), so retrying after a timeout WITH THE SAME KEY never
+     * charges the card twice: the gateway replays its first answer, HTTP status included.
      *
      * Required params: amount (int, MINOR units), currency (ISO 4217), orderReference
      * (<= 100 chars). Optional: description, idempotencyKey.
      *
-     * A decline is not an exception: the returned charge has status 'failed' plus a
-     * declineClass telling you whether to give up on the card (hard), wait (soft_funds,
-     * soft_other) or bring the customer back for a hosted session (soft_sca_required).
-     * 'pending' is not terminal - poll getStatus() with the charge's transactionId.
-     * declineClass and declineCode are null unless status is failed.
+     * The HTTP status is the contract on this route. 201 (200 on a replay) returns the
+     * charge, status 'succeeded', 'pending' or 'cancelled'. 402 returns the charge too:
+     * a decline is not an exception, the charge has status 'failed' plus a declineClass
+     * telling you whether to give up on the card (hard), wait (soft_funds, soft_other)
+     * or bring the customer back for a hosted session (soft_sca_required). 'pending' is
+     * not terminal - poll getStatus() with the charge's transactionId. declineClass and
+     * declineCode are null unless the charge was declined; the gateway omits them on
+     * the wire and the SDK reads absent as null.
      *
      * @param array<string,mixed> $params
      * @return array{chargeId:string,status:string,declineClass:?string,declineCode:?string,transactionId:string}
      *
+     * @throws ChargeException         409, 422, 502 or 503 with a code (CHARGE_ERROR_CODES): branch on
+     *                                 getErrorCode(). CHARGE_OUTCOME_UNKNOWN carries the charge row
+     *                                 (getCharge(), getTransactionId()): poll getStatus() with it, never
+     *                                 retry under a new key.
      * @throws AuthenticationException Wrong/revoked credentials or bad signature (fix config; do not retry).
-     * @throws CheckoutRefusedException The gateway refused to attempt the charge at all: replayed key,
-     *                                  payments off, method not chargeable (inspect getErrorCode()).
-     * @throws ApiException            An id that is not yours (HTTP 404) or unexpected response.
+     * @throws ApiException            An id that is not yours (HTTP 404, getErrorCode() PAYMENT_METHOD_NOT_FOUND),
+     *                                 validation (HTTP 400) or an unexpected response.
      * @throws RateLimitException     HTTP 429 - back off (getRetryAfterSeconds()), retry with the same key.
-     * @throws TransportException      Network-level failure (retry WITH the same idempotencyKey - getLastIdempotencyKey()).
+     * @throws TransportException      Network-level failure or a 5xx without a code (retry WITH the same
+     *                                 idempotencyKey - getLastIdempotencyKey()).
      */
     public function chargePaymentMethod(string $paymentMethodId, array $params): array
     {
@@ -475,32 +538,49 @@ class DominaiteClient
 
         $this->lastIdempotencyKey = $idempotencyKey;
 
-        $response = $this->request('POST', self::PAYMENT_METHODS_PATH . '/' . $id . '/charges', $body, $idempotencyKey);
+        $reply = $this->send('POST', self::PAYMENT_METHODS_PATH . '/' . $id . '/charges', $body, $idempotencyKey);
 
-        if (($response['success'] ?? null) === false || !is_string($response['chargeId'] ?? null)) {
-            $transactionId = $response['transactionId'] ?? null;
+        $data = $reply['envelope']['data'] ?? null;
+        $charge = is_array($data) && is_string($data['chargeId'] ?? null) ? self::charge($data) : null;
+        $errorCode = $reply['error']['code'] ?? null;
+        $errorCode = is_string($errorCode) && $errorCode !== '' ? $errorCode : null;
 
-            throw new CheckoutRefusedException(
-                (string) ($response['errorCode'] ?? 'UNKNOWN'),
-                (string) ($response['errorMessage'] ?? 'The charge was refused.'),
-                is_string($transactionId) && $transactionId !== '' ? $transactionId : null,
-                $response
-            );
+        // 201 (200 on a durable replay): the charge was placed, whatever its status. 402:
+        // the provider declined; the envelope says success=false but the charge is right
+        // there, status failed with its decline class, so it is a result, not an exception.
+        if ($charge !== null && (($reply['envelope']['success'] ?? null) === true || $reply['status'] === 402)) {
+            return $charge;
         }
 
-        return $response;
+        if ($errorCode !== null && $reply['status'] >= 400 && !in_array($reply['status'], self::GENERIC_FAILURE_STATUSES, true)) {
+            throw new ChargeException(
+                $reply['status'],
+                $errorCode,
+                (string) ($reply['error']['message'] ?? 'The charge was refused.'),
+                $charge,
+                $reply['envelope']
+            );
+        }
+        if ($reply['status'] >= 400) {
+            throw self::rejection($reply);
+        }
+        throw new ApiException($reply['status'], 'The API answered the charge without a charge body', 'UNEXPECTED_RESPONSE');
     }
 
     /**
-     * Revokes a card kept on file. The token is dropped at the payment provider and the
-     * method's status becomes 'revoked'; a later chargePaymentMethod() on it is refused.
-     * Returns nothing on success (HTTP 204). Not a payment operation: no idempotency key
-     * is signed.
+     * Revokes a card kept on file. The saved credential is deleted at the payment
+     * provider and the method's status becomes 'revoked'; a later chargePaymentMethod()
+     * on it is refused with PAYMENT_METHOD_NOT_ACTIVE. Returns nothing on success
+     * (HTTP 204), and again for an already revoked method, so retrying a timed-out
+     * revoke is safe. Not a payment operation: no idempotency key is signed.
      *
+     * @throws RevokeException         The gateway refused and nothing changed: MERCHANT_API_UNAVAILABLE
+     *                                 (503, retry later) or UPSTREAM_CONTRACT_ERROR (502, the provider
+     *                                 refused for good - contact support with the id).
      * @throws AuthenticationException Wrong/revoked credentials or bad signature (fix config; do not retry).
      * @throws ApiException            An id that is not yours (HTTP 404) or unexpected response.
      * @throws RateLimitException     HTTP 429 - back off (getRetryAfterSeconds()).
-     * @throws TransportException      Network-level failure (safe to retry).
+     * @throws TransportException      Network-level failure or a 5xx without a code (safe to retry).
      */
     public function revokePaymentMethod(string $paymentMethodId): void
     {
@@ -508,7 +588,21 @@ class DominaiteClient
 
         // DELETE signs an EMPTY idempotency key and an EMPTY body, like GET, and sends
         // no Idempotency-Key header.
-        $this->request('DELETE', self::PAYMENT_METHODS_PATH . '/' . $id, null, '');
+        $reply = $this->send('DELETE', self::PAYMENT_METHODS_PATH . '/' . $id, null, '');
+        if ($reply['status'] < 400) {
+            return;
+        }
+
+        $errorCode = $reply['error']['code'] ?? null;
+        if (is_string($errorCode) && $errorCode !== '' && !in_array($reply['status'], self::GENERIC_FAILURE_STATUSES, true)) {
+            throw new RevokeException(
+                $reply['status'],
+                $errorCode,
+                (string) ($reply['error']['message'] ?? 'The revoke was refused.'),
+                $reply['envelope']
+            );
+        }
+        throw self::rejection($reply);
     }
 
     /**
@@ -555,7 +649,7 @@ class DominaiteClient
     {
         $normalized = trim($paymentMethodId);
         if (preg_match(self::PAYMENT_METHOD_ID_PATTERN, $normalized) !== 1) {
-            throw new \InvalidArgumentException('paymentMethodId must be the paymentMethod id from getStatus()');
+            throw new \InvalidArgumentException('paymentMethodId must be the storedPaymentMethod id from getStatus()');
         }
 
         return $normalized;
@@ -682,15 +776,33 @@ class DominaiteClient
     }
 
     /**
+     * Sends and applies the generic failure rules: 5xx is transport, 4xx is ApiException.
+     *
      * @param array<string,mixed>|null $body Null for GET and DELETE: an empty body (and
      *                                       empty idempotency key) is what gets signed.
-     * @return array<string,mixed>
+     * @return array<string,mixed> The unwrapped payload.
      *
-     * Protected, not private, so the contract test can substitute canned gateway
-     * responses and exercise the response handling above without a network call.
-     * Not part of the public API - do not call or rely on it from integration code.
+     * Protected, not private, so a test can substitute canned gateway responses and
+     * exercise the routes above without a network call. Not part of the public API -
+     * do not call or rely on it from integration code.
      */
     protected function request(string $method, string $path, ?array $body, string $idempotencyKey): array
+    {
+        return self::settle($this->send($method, $path, $body, $idempotencyKey));
+    }
+
+    /**
+     * Signs, sends and parses one request. Transport failures, non-JSON bodies, 401/403
+     * and 429 are thrown here; every other status comes back as a reply for the route
+     * to read, because the payment-method routes answer 402, 409, 422, 502 and 503
+     * with a body that the caller needs.
+     *
+     * @param array<string,mixed>|null $body Null for GET and DELETE.
+     * @return array{status:int,envelope:array<string,mixed>,payload:array<string,mixed>,error:array<string,mixed>}
+     *
+     * Protected for the same reason as request(); not part of the public API.
+     */
+    protected function send(string $method, string $path, ?array $body, string $idempotencyKey): array
     {
         if ($body === null) {
             $json = '';
@@ -769,27 +881,38 @@ class DominaiteClient
             throw new TransportException("Could not reach the Dominaite API: {$error}");
         }
 
-        return $this->handleResponse($status, $raw, $responseHeaders);
+        return $this->readResponse($status, $raw, $responseHeaders);
     }
 
     /**
-     * Turns one HTTP response into a payload or the right exception.
-     *
-     * Split out of request() so the status handling can be exercised on its own, and so
-     * the ORDER below is visible: the status decides first, the body is parsed second.
-     * A 502/503/504 from a load balancer or a captive portal is HTML or empty, and
-     * parsing first would classify the infrastructure being down as "the API sent
-     * something we could not read" - an ApiException nobody retries - instead of the
-     * retryable TransportException it is. Same for a 429 served by an edge.
+     * Turns one HTTP response into a payload or the right exception: readResponse()
+     * followed by the generic failure rules, which is what every route except the
+     * payment-method ones needs.
      *
      * @param array<string,string> $responseHeaders Lowercased header names to values.
      * @return array<string,mixed>
      */
     protected function handleResponse(int $status, string $raw, array $responseHeaders = []): array
     {
-        if ($status >= 500) {
-            throw new TransportException("The Dominaite API is unavailable (HTTP {$status}); retry with the same idempotency key.");
-        }
+        return self::settle($this->readResponse($status, $raw, $responseHeaders));
+    }
+
+    /**
+     * Turns one HTTP response into a reply for the route to read, or the exception no
+     * route could read past.
+     *
+     * The ORDER below is deliberate. A 429 is classified on its status alone, because an
+     * edge serves it as HTML. A 502/503/504 from a load balancer or a captive portal is
+     * HTML or empty too, and it must stay the retryable TransportException it is, not
+     * become "the API sent something we could not read" - an ApiException nobody
+     * retries; only a 5xx that parses as the gateway's envelope comes back as a reply,
+     * because the charge and revoke routes read its error code.
+     *
+     * @param array<string,string> $responseHeaders Lowercased header names to values.
+     * @return array{status:int,envelope:array<string,mixed>,payload:array<string,mixed>,error:array<string,mixed>}
+     */
+    protected function readResponse(int $status, string $raw, array $responseHeaders = []): array
+    {
         if ($status === 429) {
             throw new RateLimitException(
                 'Rate limit exceeded (HTTP 429); back off and retry with the same idempotency key.',
@@ -799,11 +922,14 @@ class DominaiteClient
 
         // 204 carries nothing to parse; the status is the whole answer.
         if ($status === 204) {
-            return [];
+            return ['status' => 204, 'envelope' => [], 'payload' => [], 'error' => []];
         }
 
         $decoded = json_decode($raw, true);
         if (!is_array($decoded)) {
+            if ($status >= 500) {
+                throw self::unavailable($status);
+            }
             throw new ApiException($status, 'The API returned a non-JSON response');
         }
 
@@ -818,11 +944,89 @@ class DominaiteClient
                 'Authentication failed - check your key id, secret, and server clock.'
             );
         }
-        if ($status >= 400) {
-            throw new ApiException($status, (string) ($payload['errorMessage'] ?? $envelopeError['message'] ?? 'Request rejected'));
+
+        return ['status' => $status, 'envelope' => $decoded, 'payload' => $payload, 'error' => $envelopeError];
+    }
+
+    /**
+     * The generic reading of a reply: the payload on success, the generic exception on
+     * any failure.
+     *
+     * @param array{status:int,envelope:array<string,mixed>,payload:array<string,mixed>,error:array<string,mixed>} $reply
+     * @return array<string,mixed>
+     */
+    private static function settle(array $reply): array
+    {
+        if ($reply['status'] >= 400) {
+            throw self::rejection($reply);
         }
 
-        return $payload;
+        return $reply['payload'];
+    }
+
+    /**
+     * The generic reading of a failed reply: 5xx is the API being unavailable, 4xx a
+     * rejection. The machine-readable code rides along when the API sent one: a
+     * validation rejection like IDEMPOTENCY_KEY_REQUIRED is only actionable if the
+     * caller can branch on it.
+     *
+     * @param array{status:int,envelope:array<string,mixed>,payload:array<string,mixed>,error:array<string,mixed>} $reply
+     */
+    private static function rejection(array $reply): \RuntimeException
+    {
+        if ($reply['status'] >= 500) {
+            return self::unavailable($reply['status']);
+        }
+        $errorCode = $reply['payload']['errorCode'] ?? $reply['error']['code'] ?? null;
+
+        return new ApiException(
+            $reply['status'],
+            (string) ($reply['payload']['errorMessage'] ?? $reply['error']['message'] ?? 'Request rejected'),
+            is_string($errorCode) && $errorCode !== '' ? $errorCode : null
+        );
+    }
+
+    private static function unavailable(int $status): TransportException
+    {
+        return new TransportException("The Dominaite API is unavailable (HTTP {$status}); retry with the same idempotency key.");
+    }
+
+    /**
+     * The charge body as one shape: the gateway omits declineClass and declineCode when
+     * they are null (every 201, and a 502 CHARGE_FAILED row), so absent reads as null.
+     * Anything else the gateway sends is carried through.
+     *
+     * @param array<string,mixed> $data
+     * @return array<string,mixed>
+     */
+    private static function charge(array $data): array
+    {
+        $data['chargeId'] = (string) $data['chargeId'];
+        $data['status'] = (string) ($data['status'] ?? '');
+        $data['declineClass'] = is_string($data['declineClass'] ?? null) ? $data['declineClass'] : null;
+        $data['declineCode'] = is_string($data['declineCode'] ?? null) ? $data['declineCode'] : null;
+        $data['transactionId'] = (string) ($data['transactionId'] ?? '');
+
+        return $data;
+    }
+
+    /**
+     * Same rule for the card on file: brand, last4 and the expiry are absent when the
+     * provider did not report them.
+     *
+     * @param array<string,mixed> $data
+     * @return array<string,mixed>
+     */
+    private static function storedPaymentMethod(array $data): array
+    {
+        $data['id'] = (string) ($data['id'] ?? '');
+        $data['brand'] = is_string($data['brand'] ?? null) ? $data['brand'] : null;
+        $data['last4'] = is_string($data['last4'] ?? null) ? $data['last4'] : null;
+        $data['expiryMonth'] = is_int($data['expiryMonth'] ?? null) ? $data['expiryMonth'] : null;
+        $data['expiryYear'] = is_int($data['expiryYear'] ?? null) ? $data['expiryYear'] : null;
+        $data['status'] = (string) ($data['status'] ?? '');
+
+        return $data;
     }
 
     /**
