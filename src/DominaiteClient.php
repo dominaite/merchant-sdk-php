@@ -35,8 +35,13 @@ class DominaiteClient
 {
     private const DEFAULT_BASE_URL = 'https://api.dominaite.com/payments';
     public const SESSIONS_PATH = '/merchant-api/checkout/sessions';
+    /**
+     * Canonical path of stored payment methods. POST {id}/charges charges one, DELETE
+     * {id} revokes it - both signed on this path with the id verbatim.
+     */
+    public const PAYMENT_METHODS_PATH = '/merchant-api/payment-methods';
     public const PING_PATH = '/merchant-api/ping';
-    private const USER_AGENT = 'dominaite-php/0.1.2 (php ' . PHP_VERSION . ')';
+    private const USER_AGENT = 'dominaite-php/0.3.0 (php ' . PHP_VERSION . ')';
     private const TIMEOUT_SECONDS = 15;
 
     /**
@@ -58,6 +63,14 @@ class DominaiteClient
 
     /** Stands in for the secret wherever the client is dumped or serialized. */
     private const REDACTED = 'dms_***redacted***';
+
+    /**
+     * A payment method id is opaque (pm_...), so this only pins what keeps it a single
+     * path segment: no slash, no query, no whitespace, nothing that needs
+     * percent-encoding. The id goes into the signed canonical path verbatim, so anything
+     * else would sign one path and request another.
+     */
+    private const PAYMENT_METHOD_ID_PATTERN = '/^[A-Za-z0-9_-]{1,100}$/';
 
     /**
      * Every value getStatus() can return in `status`, in the API's own order.
@@ -102,6 +115,42 @@ class DominaiteClient
      */
     public const VALIDATION_ERROR_CODES = [
         'IDEMPOTENCY_KEY_REQUIRED',
+    ];
+
+    /**
+     * Every value a stored payment method's `status` can carry, in the API's own order.
+     * Only active methods can be charged; revoked is what revokePaymentMethod() leaves
+     * behind, expired means the card's expiry date has passed. Treat an unknown value
+     * as not chargeable.
+     */
+    public const PAYMENT_METHOD_STATUS_VOCABULARY = [
+        'active',
+        'revoked',
+        'expired',
+    ];
+
+    /**
+     * Every value chargePaymentMethod() can return in `status`. pending is not
+     * terminal: poll getStatus() with the charge's transactionId.
+     */
+    public const CHARGE_STATUS_VOCABULARY = [
+        'succeeded',
+        'failed',
+        'pending',
+    ];
+
+    /**
+     * Why a charge failed, coarse enough to act on without reading the issuer's code:
+     * hard = do not retry this card; soft_funds = insufficient funds, retry later;
+     * soft_sca_required = the issuer wants the customer present, send them through a
+     * hosted session with saveCard; soft_other = transient, one retry later is
+     * reasonable.
+     */
+    public const DECLINE_CLASS_VOCABULARY = [
+        'hard',
+        'soft_funds',
+        'soft_sca_required',
+        'soft_other',
     ];
 
     private string $keyId;
@@ -244,6 +293,9 @@ class DominaiteClient
      * orderReference (your order id, <= 100 chars).
      * Optional: customer{firstName,lastName,email,phone}, country (ISO 3166-1 alpha-2),
      * language (ISO 639-1), theme ('light'|'dark'|'bright'), description,
+     * saveCard (bool - keep the card on file once this payment succeeds, so you can
+     * charge it again with chargePaymentMethod(); the stored method shows up as
+     * paymentMethod on getStatus(), and the card details never reach you),
      * idempotencyKey (auto-generated when omitted - retrying with the same key never
      * creates a second payment; read the generated one back with getLastIdempotencyKey()).
      *
@@ -269,25 +321,13 @@ class DominaiteClient
         // with it collides with that earlier payment instead.
         $this->lastIdempotencyKey = null;
 
-        foreach (['amount', 'currency', 'orderReference'] as $required) {
-            if (!isset($params[$required])) {
-                throw new \InvalidArgumentException("Missing required parameter: {$required}");
-            }
-        }
-        if (!is_int($params['amount']) || $params['amount'] <= 0) {
-            throw new \InvalidArgumentException('amount must be a positive integer in MINOR units (e.g. 2500 for 25.00 EUR)');
-        }
-        if (!is_string($params['orderReference']) || $params['orderReference'] === ''
-            || self::codePoints($params['orderReference']) > 100) {
-            throw new \InvalidArgumentException('orderReference must be a non-empty string of at most 100 characters');
+        self::validateMoneyParams($params);
+        if (array_key_exists('saveCard', $params) && !is_bool($params['saveCard'])) {
+            throw new \InvalidArgumentException('saveCard must be a bool');
         }
 
-        $idempotencyKey = $params['idempotencyKey'] ?? bin2hex(random_bytes(16));
+        $idempotencyKey = self::normalizeIdempotencyKey($params['idempotencyKey'] ?? null);
         unset($params['idempotencyKey']);
-        if (!is_string($idempotencyKey) || $idempotencyKey === '' || self::codePoints($idempotencyKey) > 100) {
-            throw new \InvalidArgumentException('idempotencyKey must be a non-empty string of at most 100 characters');
-        }
-        self::assertHeaderSafe('idempotencyKey', $idempotencyKey);
 
         // Recorded BEFORE the call so a caller who catches TransportException can read the
         // key the timed-out attempt used and retry with it. A generated key that only ever
@@ -315,7 +355,8 @@ class DominaiteClient
     }
 
     /**
-     * The idempotency key the last createCheckoutSession() call sent, generated or yours.
+     * The idempotency key the last createCheckoutSession() or chargePaymentMethod() call
+     * sent, generated or yours.
      *
      * Read it in your catch block. On a timeout you cannot know whether the gateway
      * created the session, and retrying with a NEW key charges the order twice - retry
@@ -327,15 +368,16 @@ class DominaiteClient
      *       $key = $client->getLastIdempotencyKey();  // store it, then retry with it
      *   }
      *
-     * Null before the first createCheckoutSession() call, and null again after one that was
+     * Null before the first call that carries a key, and null again after one that was
      * rejected locally without reaching the API - it always means "the key of the most
      * recent attempt that went out", never an older order's.
      *
      * It is a single slot on a client you can reuse, so the next createCheckoutSession()
-     * overwrites it. On a long-lived worker that means reading it in the catch block and
-     * storing it against your order, not going back for it later.
+     * or chargePaymentMethod() overwrites it. On a long-lived worker that means reading it
+     * in the catch block and storing it against your order, not going back for it later.
      *
-     * ping() and getStatus() sign an empty key by design and leave this untouched.
+     * ping(), getStatus() and revokePaymentMethod() sign an empty key by design and leave
+     * this untouched.
      */
     public function getLastIdempotencyKey(): ?string
     {
@@ -358,8 +400,14 @@ class DominaiteClient
      * Treat any status you do not recognise as still-open too: a value the API adds later
      * should make you keep polling, never silently close an order that is still live.
      *
+     * paymentMethod is the card kept on file for this payment: present once a session
+     * created with saveCard has succeeded, null otherwise. It carries {id, brand, last4,
+     * expiryMonth, expiryYear, status} and never the card number or the provider token.
+     * Store paymentMethod['id'] against your customer - it is what chargePaymentMethod()
+     * and revokePaymentMethod() take.
+     *
      * @param string $transactionId The transactionId returned by createCheckoutSession().
-     * @return array{transactionId:string,orderId:string,orderReference:?string,status:string,amount:int,currency:string,refundedAmount:?int,createdAt:string,updatedAt:?string,expiresAt:?string}
+     * @return array{transactionId:string,orderId:string,orderReference:?string,status:string,amount:int,currency:string,refundedAmount:?int,createdAt:string,updatedAt:?string,expiresAt:?string,paymentMethod:?array{id:string,brand:string,last4:string,expiryMonth:int,expiryYear:int,status:string}}
      *
      * @throws AuthenticationException Wrong/revoked credentials or bad signature (fix config; do not retry).
      * @throws ApiException            Unknown transaction id (HTTP 404) or unexpected response.
@@ -374,6 +422,143 @@ class DominaiteClient
         }
 
         return $this->request('GET', self::SESSIONS_PATH . '/' . $normalized, null, '');
+    }
+
+    /**
+     * Charges a card kept on file, off-session: no widget, no payer present.
+     *
+     * $paymentMethodId is paymentMethod['id'] from getStatus() of a session you created
+     * with saveCard. The charge is signed like a session and carries an Idempotency-Key
+     * (auto-generated unless you pass one; read it back with getLastIdempotencyKey()),
+     * so retrying after a timeout WITH THE SAME KEY never charges the card twice.
+     *
+     * Required params: amount (int, MINOR units), currency (ISO 4217), orderReference
+     * (<= 100 chars). Optional: description, idempotencyKey.
+     *
+     * A decline is not an exception: the returned charge has status 'failed' plus a
+     * declineClass telling you whether to give up on the card (hard), wait (soft_funds,
+     * soft_other) or bring the customer back for a hosted session (soft_sca_required).
+     * 'pending' is not terminal - poll getStatus() with the charge's transactionId.
+     * declineClass and declineCode are null unless status is failed.
+     *
+     * @param array<string,mixed> $params
+     * @return array{chargeId:string,status:string,declineClass:?string,declineCode:?string,transactionId:string}
+     *
+     * @throws AuthenticationException Wrong/revoked credentials or bad signature (fix config; do not retry).
+     * @throws CheckoutRefusedException The gateway refused to attempt the charge at all: replayed key,
+     *                                  payments off, method not chargeable (inspect getErrorCode()).
+     * @throws ApiException            An id that is not yours (HTTP 404) or unexpected response.
+     * @throws RateLimitException     HTTP 429 - back off (getRetryAfterSeconds()), retry with the same key.
+     * @throws TransportException      Network-level failure (retry WITH the same idempotencyKey - getLastIdempotencyKey()).
+     */
+    public function chargePaymentMethod(string $paymentMethodId, array $params): array
+    {
+        $this->lastIdempotencyKey = null;
+
+        $id = self::normalizePaymentMethodId($paymentMethodId);
+        self::validateMoneyParams($params);
+        if (array_key_exists('description', $params) && !is_string($params['description'])) {
+            throw new \InvalidArgumentException('description must be a string');
+        }
+        $idempotencyKey = self::normalizeIdempotencyKey($params['idempotencyKey'] ?? null);
+
+        // Built field by field, not passed through: the body is what gets signed, and the
+        // contract for this route is exactly these fields in this order.
+        $body = [
+            'amount' => $params['amount'],
+            'currency' => $params['currency'],
+            'orderReference' => $params['orderReference'],
+        ];
+        if (array_key_exists('description', $params)) {
+            $body['description'] = $params['description'];
+        }
+
+        $this->lastIdempotencyKey = $idempotencyKey;
+
+        $response = $this->request('POST', self::PAYMENT_METHODS_PATH . '/' . $id . '/charges', $body, $idempotencyKey);
+
+        if (($response['success'] ?? null) === false || !is_string($response['chargeId'] ?? null)) {
+            $transactionId = $response['transactionId'] ?? null;
+
+            throw new CheckoutRefusedException(
+                (string) ($response['errorCode'] ?? 'UNKNOWN'),
+                (string) ($response['errorMessage'] ?? 'The charge was refused.'),
+                is_string($transactionId) && $transactionId !== '' ? $transactionId : null,
+                $response
+            );
+        }
+
+        return $response;
+    }
+
+    /**
+     * Revokes a card kept on file. The token is dropped at the payment provider and the
+     * method's status becomes 'revoked'; a later chargePaymentMethod() on it is refused.
+     * Returns nothing on success (HTTP 204). Not a payment operation: no idempotency key
+     * is signed.
+     *
+     * @throws AuthenticationException Wrong/revoked credentials or bad signature (fix config; do not retry).
+     * @throws ApiException            An id that is not yours (HTTP 404) or unexpected response.
+     * @throws RateLimitException     HTTP 429 - back off (getRetryAfterSeconds()).
+     * @throws TransportException      Network-level failure (safe to retry).
+     */
+    public function revokePaymentMethod(string $paymentMethodId): void
+    {
+        $id = self::normalizePaymentMethodId($paymentMethodId);
+
+        // DELETE signs an EMPTY idempotency key and an EMPTY body, like GET, and sends
+        // no Idempotency-Key header.
+        $this->request('DELETE', self::PAYMENT_METHODS_PATH . '/' . $id, null, '');
+    }
+
+    /**
+     * The checks shared by every request that moves money: amount, currency, orderReference.
+     *
+     * @param array<string,mixed> $params
+     */
+    private static function validateMoneyParams(array $params): void
+    {
+        foreach (['amount', 'currency', 'orderReference'] as $required) {
+            if (!isset($params[$required])) {
+                throw new \InvalidArgumentException("Missing required parameter: {$required}");
+            }
+        }
+        if (!is_int($params['amount']) || $params['amount'] <= 0) {
+            throw new \InvalidArgumentException('amount must be a positive integer in MINOR units (e.g. 2500 for 25.00 EUR)');
+        }
+        if (!is_string($params['orderReference']) || $params['orderReference'] === ''
+            || self::codePoints($params['orderReference']) > 100) {
+            throw new \InvalidArgumentException('orderReference must be a non-empty string of at most 100 characters');
+        }
+    }
+
+    /**
+     * Mints a key when none was given and bounds the one that was.
+     *
+     * @param mixed $idempotencyKey
+     */
+    private static function normalizeIdempotencyKey($idempotencyKey): string
+    {
+        if ($idempotencyKey === null) {
+            $idempotencyKey = bin2hex(random_bytes(16));
+        }
+        if (!is_string($idempotencyKey) || $idempotencyKey === '' || self::codePoints($idempotencyKey) > 100) {
+            throw new \InvalidArgumentException('idempotencyKey must be a non-empty string of at most 100 characters');
+        }
+        self::assertHeaderSafe('idempotencyKey', $idempotencyKey);
+
+        return $idempotencyKey;
+    }
+
+    /** Refuses anything that would not survive as one path segment of the signed canonical path. */
+    private static function normalizePaymentMethodId(string $paymentMethodId): string
+    {
+        $normalized = trim($paymentMethodId);
+        if (preg_match(self::PAYMENT_METHOD_ID_PATTERN, $normalized) !== 1) {
+            throw new \InvalidArgumentException('paymentMethodId must be the paymentMethod id from getStatus()');
+        }
+
+        return $normalized;
     }
 
     /**
@@ -497,8 +682,8 @@ class DominaiteClient
     }
 
     /**
-     * @param array<string,mixed>|null $body Null for GET: an empty body (and empty
-     *                                       idempotency key) is what gets signed.
+     * @param array<string,mixed>|null $body Null for GET and DELETE: an empty body (and
+     *                                       empty idempotency key) is what gets signed.
      * @return array<string,mixed>
      *
      * Protected, not private, so the contract test can substitute canned gateway
@@ -610,6 +795,11 @@ class DominaiteClient
                 'Rate limit exceeded (HTTP 429); back off and retry with the same idempotency key.',
                 self::parseRetryAfter($responseHeaders['retry-after'] ?? null)
             );
+        }
+
+        // 204 carries nothing to parse; the status is the whole answer.
+        if ($status === 204) {
+            return [];
         }
 
         $decoded = json_decode($raw, true);

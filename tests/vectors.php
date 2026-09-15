@@ -46,6 +46,27 @@ check('utf8 body sha256', hash('sha256', $utf8Body), 'baf00d6116d9f2eec6c3a422af
 check('utf8 signature', DominaiteClient::signRequest($secret, '1755302400', 'POST', $path, '00000000-0000-4000-8000-000000000003', $utf8Body),
     'dd809cb0b902326704a380110c29d9f789cc355864e1ed1de663157342834010');
 
+// Stored-payment-method vectors, same secret and timestamp. The charge vector is the
+// only POST besides sessions and the only one whose canonical path carries a resource
+// id; the revoke vector pins that DELETE signs an empty key and an empty body exactly
+// like GET. Shared byte-for-byte with the gateway's MerchantApiRequestAuthenticator tests.
+$paymentMethodId = 'pm_0123456789abcdef0123456789abcdef';
+$chargePath = DominaiteClient::PAYMENT_METHODS_PATH . '/' . $paymentMethodId . '/charges';
+$chargeBody = '{"amount":2500,"currency":"EUR","orderReference":"order-1043"}';
+check('payment methods path', DominaiteClient::PAYMENT_METHODS_PATH, '/merchant-api/payment-methods');
+check('charge body sha256', hash('sha256', $chargeBody), '641a0d2b08f88ebc458dca49410dede0a166359a5030bff5c977e507f13ab828');
+check('charge signature', DominaiteClient::signRequest($secret, '1755302400', 'POST', $chargePath, '00000000-0000-4000-8000-000000000003', $chargeBody),
+    '9ce9f54efa2533a46aa4493b97b56aeb657f41d6a18f1c008c7fd412029aebf9');
+
+$revokePath = DominaiteClient::PAYMENT_METHODS_PATH . '/' . $paymentMethodId;
+check('revoke body sha256 is the empty hash', hash('sha256', ''), 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855');
+check('revoke signature', DominaiteClient::signRequest($secret, '1755302400', 'DELETE', $revokePath, '', ''),
+    '9330100343c4b820504890a09829a193d5815ca39e92160fdfc13d320a802a02');
+// Same recipe as the GET vector: only the method moved, so the signature must move too.
+check('revoke signs the method, not just the path',
+    DominaiteClient::signRequest($secret, '1755302400', 'GET', $revokePath, '', '') === '9330100343c4b820504890a09829a193d5815ca39e92160fdfc13d320a802a02' ? 'same' : 'different',
+    'different');
+
 // A replay refusal must expose the transaction the key collided with, or the
 // documented recovery (read it back with getStatus) is unreachable from the catch.
 $refusal = new CheckoutRefusedException(

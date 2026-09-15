@@ -314,6 +314,63 @@ re-POST with the same order-derived idempotency key, not a fresh one: from a few
 past expiry the same key answers with a fresh session (see "Recovering from a replay
 refusal").
 
+## Stored payment methods (recurring)
+
+Pass `'saveCard' => true` when you create a session and, once that payment succeeds, the
+gateway keeps the card on file. You never see the card number or the provider token:
+`getStatus()` returns a `paymentMethod` with an opaque `id`, the `brand`, the `last4` and
+the expiry, and that `id` is what you charge and revoke with. Store it against your customer.
+
+```php
+$session = $client->createCheckoutSession([
+    'amount'         => 2500,
+    'currency'       => 'EUR',
+    'orderReference' => 'sub-8817-first',
+    'saveCard'       => true,
+]);
+// ... the payer completes the hosted checkout ...
+$status = $client->getStatus($session['transactionId']);
+if ($status['status'] === 'succeeded' && ($status['paymentMethod']['status'] ?? null) === 'active') {
+    $db->saveCard($customerId, $status['paymentMethod']['id']); // pm_...
+}
+
+// Later, off-session, no payer present:
+$charge = $client->chargePaymentMethod($paymentMethodId, [
+    'amount'         => 2500,
+    'currency'       => 'EUR',
+    'orderReference' => 'sub-8817-2026-10',
+    'description'    => 'Monthly plan, October',
+    'idempotencyKey' => 'sub-8817-2026-10', // derive it from the billing period, never random per attempt
+]);
+
+switch ($charge['status']) {
+    case 'succeeded':
+        break;
+    case 'pending':
+        // Not terminal. Poll getStatus($charge['transactionId']), or wait for the webhook.
+        break;
+    case 'failed':
+        // Not an exception: branch on the class, log the code.
+        // hard              - give up on this card, ask the customer for another one
+        // soft_funds        - insufficient funds, retry later (not in a loop)
+        // soft_sca_required - the issuer wants the customer present: send them through a
+        //                     hosted session with saveCard and charge the new method
+        // soft_other        - transient, one retry later is reasonable
+        handleDecline($charge['declineClass'], $charge['declineCode']);
+        break;
+}
+
+// When the customer removes the card:
+$client->revokePaymentMethod($paymentMethodId); // 204, returns nothing
+```
+
+A charge is signed exactly like a session and carries an `Idempotency-Key`, so a retry after
+a timeout with the **same** key never charges the card twice; `getLastIdempotencyKey()` reads
+it back the same way it does for a session. A charge the gateway refuses to attempt at all
+(replayed key, payments off, method revoked) throws `CheckoutRefusedException` with the usual
+codes; an id that is not yours is an `ApiException` with `getHttpStatus()` 404. Revoking signs
+an empty key and an empty body, like `getStatus()`.
+
 ## Fallback: status polling
 
 Use this when you have not registered a webhook endpoint yet, inside your reconciliation
