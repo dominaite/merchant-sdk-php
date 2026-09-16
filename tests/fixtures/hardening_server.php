@@ -9,6 +9,50 @@ declare(strict_types=1);
 
 $path = (string) parse_url((string) ($_SERVER['REQUEST_URI'] ?? '/'), PHP_URL_PATH);
 
+// The stored-payment-method routes record the request exactly as it arrived - method,
+// path, body bytes and the signed headers - so the transport test can recompute the
+// signature over what actually went on the wire. Written to a file because the revoke
+// answer is a 204 with no body to echo into.
+if (strpos($path, '/merchant-api/payment-methods/') === 0) {
+    $headers = [];
+    foreach ($_SERVER as $name => $value) {
+        if (strpos($name, 'HTTP_') === 0) {
+            $headers[strtolower(str_replace('_', '-', substr($name, 5)))] = $value;
+        }
+    }
+    file_put_contents(
+        sys_get_temp_dir() . '/dominaite-sdk-last-request-' . (string) ($_SERVER['SERVER_PORT'] ?? '0') . '.json',
+        json_encode([
+            'method' => $_SERVER['REQUEST_METHOD'] ?? '',
+            'path' => $path,
+            'body' => (string) file_get_contents('php://input'),
+            'headers' => $headers,
+        ])
+    );
+
+    // Only the vector's id exists; any other id is the 404 at the bottom, like the API.
+    $known = '/merchant-api/payment-methods/pm_0123456789abcdef0123456789abcdef';
+    if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST' && $path === $known . '/charges') {
+        // The gateway's envelope as it goes over the wire: null fields omitted.
+        http_response_code(201);
+        header('Content-Type: application/json');
+        echo json_encode([
+            'success' => true,
+            'data' => [
+                'chargeId' => 'ch_1a2b3c4d5e6f4a7b8c9d0e1f2a3b4c5d',
+                'status' => 'succeeded',
+                'transactionId' => '1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d',
+            ],
+            'metadata' => ['requestId' => 'live', 'timestamp' => '2026-09-15T18:02:11Z', 'apiVersion' => '1.0', 'processingTimeMs' => 1],
+        ]);
+        return true;
+    }
+    if (($_SERVER['REQUEST_METHOD'] ?? '') === 'DELETE' && $path === $known) {
+        http_response_code(204);
+        return true;
+    }
+}
+
 switch ($path) {
     case '/html-503':
         http_response_code(503);

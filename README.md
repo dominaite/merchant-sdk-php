@@ -314,6 +314,117 @@ re-POST with the same order-derived idempotency key, not a fresh one: from a few
 past expiry the same key answers with a fresh session (see "Recovering from a replay
 refusal").
 
+## Stored payment methods (recurring)
+
+Pass `'saveCard' => true` when you create a session and, once that payment is approved, the
+gateway keeps the card on file. You never see the card number or the provider token:
+`getStatus()` returns a `storedPaymentMethod` with an opaque `id` (`pm_` + 32 hex characters),
+the `brand`, the `last4` and the expiry, and that `id` is what you charge and revoke with. Store
+it against your customer. (`paymentMethod` on the same status is something else: the gateway's
+string category of how the payer paid, `card`, `wallet` and so on.)
+
+```php
+use Dominaite\Exception\ChargeException;
+use Dominaite\Exception\RevokeException;
+
+$session = $client->createCheckoutSession([
+    'amount'         => 2500,
+    'currency'       => 'EUR',
+    'orderReference' => 'sub-8817-first',
+    'saveCard'       => true,
+]);
+// ... the payer completes the hosted checkout ...
+$status = $client->getStatus($session['transactionId']);
+$stored = $status['storedPaymentMethod'] ?? null; // absent until the payment is approved
+if ($status['status'] === 'succeeded' && ($stored['status'] ?? null) === 'active') {
+    $db->saveCard($customerId, $stored['id']); // pm_...
+}
+
+// Later, off-session, no payer present:
+try {
+    $charge = $client->chargePaymentMethod($paymentMethodId, [
+        'amount'         => 2500,
+        'currency'       => 'EUR',
+        'orderReference' => 'sub-8817-2026-10',
+        'description'    => 'Monthly plan, October',
+        'idempotencyKey' => 'sub-8817-2026-10', // derive it from the billing period, never random per attempt
+    ]);
+
+    switch ($charge['status']) {
+        case 'succeeded':
+            break;
+        case 'pending':
+            // Not terminal. Poll getStatus($charge['transactionId']), or wait for the webhook.
+            break;
+        case 'failed':
+            // HTTP 402 from the gateway, but not an exception: branch on the class, log the code.
+            // hard              - give up on this card, ask the customer for another one
+            // soft_funds        - insufficient funds, retry later (not in a loop)
+            // soft_sca_required - the issuer wants the customer present: send them through a
+            //                     hosted session with saveCard and charge the new method
+            // soft_other        - transient, one retry later is reasonable
+            handleDecline($charge['declineClass'], $charge['declineCode']);
+            break;
+        case 'cancelled':
+            // An authorization voided before capture; no money moved.
+            break;
+    }
+} catch (ChargeException $e) {
+    switch ($e->getErrorCode()) {
+        case 'CHARGE_OUTCOME_UNKNOWN':
+            // 502: the provider gave no verdict, the charge MAY have happened. Never retry
+            // under a new key: poll the transaction the gateway attached instead.
+            pollUntilSettled($e->getTransactionId());
+            break;
+        case 'DUPLICATE_REQUEST':
+        case 'PAYMENT_METHOD_CHARGES_DISABLED':
+        case 'PAYMENT_PROCESSING_UNAVAILABLE':
+            // Nothing was charged; retry later with the SAME idempotency key.
+            break;
+        case 'PAYMENT_METHOD_NOT_ACTIVE':
+            // Revoked or expired: bring the customer back for a hosted session with saveCard.
+            break;
+        case 'CHARGE_FAILED':
+            // 502, nothing was charged. getCharge() is set when a row exists.
+            break;
+        case 'IDEMPOTENCY_KEY_REUSED':
+            // Same key, different body or method: a bug on your side.
+            break;
+    }
+}
+
+// When the customer removes the card:
+try {
+    $client->revokePaymentMethod($paymentMethodId); // 204, returns nothing; 204 again if already revoked
+} catch (RevokeException $e) {
+    if ($e->getErrorCode() === 'MERCHANT_API_UNAVAILABLE') {
+        // 503: nothing changed, retry later.
+    } else {
+        // 502 UPSTREAM_CONTRACT_ERROR: the provider refused for good, nothing changed. Contact support with the id.
+    }
+}
+```
+
+A charge is signed exactly like a session and carries an `Idempotency-Key`, so a retry after
+a timeout with the **same** key never charges the card twice: the gateway replays its first
+answer, HTTP status included. `getLastIdempotencyKey()` reads the key back the same way it does
+for a session. The HTTP status is the contract on this route: 201 (or 200 on a replay) returns
+the charge, 402 returns the charge too (`status` `failed` plus `declineClass`), and 409, 422,
+502 and 503 throw `ChargeException` with `getErrorCode()`, `getHttpStatus()`, the gateway's
+message and, when the gateway attached the charge row, `getCharge()` and `getTransactionId()`.
+Only authentication (401/403), an id that is not yours (404, `ApiException` with
+`getErrorCode()` `PAYMENT_METHOD_NOT_FOUND`), validation (400, `ApiException`), rate limiting
+(429) and network failures keep their generic exceptions. `declineClass` and `declineCode` are
+`null` unless the charge was declined; the gateway omits them on the wire and the SDK reads
+absent as null.
+
+Revoking signs an empty key and an empty body, like `getStatus()`. A revoke that fails with
+`RevokeException` changed nothing: `MERCHANT_API_UNAVAILABLE` (503) is retryable,
+`UPSTREAM_CONTRACT_ERROR` (502) is not. After a revoke the status read keeps the
+`storedPaymentMethod` with `status` `revoked`, and a charge against it is refused with
+`PAYMENT_METHOD_NOT_ACTIVE`. An id that is not yours is an `ApiException` with
+`getHttpStatus()` 404.
+
 ## Fallback: status polling
 
 Use this when you have not registered a webhook endpoint yet, inside your reconciliation

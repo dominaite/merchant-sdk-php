@@ -19,6 +19,7 @@ require __DIR__ . '/../src/Exception/RateLimitException.php';
 require __DIR__ . '/../src/Exception/TransportException.php';
 
 use Dominaite\DominaiteClient;
+use Dominaite\Exception\ApiException;
 use Dominaite\Exception\RateLimitException;
 use Dominaite\Exception\TransportException;
 
@@ -165,5 +166,77 @@ check('the oversized body was not read past the cap',
 // The connection is not left in a broken state: the next call still works.
 $after = $client->get('/ok');
 check('the client still works after an aborted transfer', var_export($after['pong'] ?? null, true), 'true');
+
+// --- stored payment methods on the wire ------------------------------------------------
+// The fixture server records each request; the signature is recomputed over the bytes
+// it saw. Same secret and inputs as the charge and revoke vectors in tests/vectors.php,
+// so with the vector timestamp the header would be the vector signature itself.
+const SECRET = 'dms_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef';
+const PAYMENT_METHOD_ID = 'pm_0123456789abcdef0123456789abcdef';
+$recordFile = sys_get_temp_dir() . '/dominaite-sdk-last-request-' . $port . '.json';
+
+/** @return array{method:string,path:string,body:string,headers:array<string,string>} */
+function lastRequest(string $file): array
+{
+    $raw = file_get_contents($file);
+    $decoded = is_string($raw) ? json_decode($raw, true) : null;
+    if (!is_array($decoded)) {
+        echo "FAIL the fixture server did not record the request\n";
+        exit(1);
+    }
+
+    return $decoded;
+}
+
+$charge = $client->chargePaymentMethod(PAYMENT_METHOD_ID, [
+    'amount' => 2500, 'currency' => 'EUR', 'orderReference' => 'order-1043',
+    'idempotencyKey' => '00000000-0000-4000-8000-000000000003',
+]);
+check('a live charge answers with the unwrapped 201 body', (string) ($charge['chargeId'] ?? ''), 'ch_1a2b3c4d5e6f4a7b8c9d0e1f2a3b4c5d');
+check('a live charge reads the omitted declineClass as null, present',
+    array_key_exists('declineClass', $charge) ? var_export($charge['declineClass'], true) : 'absent', 'NULL');
+$seen = lastRequest($recordFile);
+check('the charge went out as POST on the canonical path', $seen['method'] . ' ' . $seen['path'],
+    'POST /merchant-api/payment-methods/' . PAYMENT_METHOD_ID . '/charges');
+check('the charge body on the wire is the vector body', $seen['body'],
+    '{"amount":2500,"currency":"EUR","orderReference":"order-1043"}');
+check('the charge carries the Idempotency-Key header', $seen['headers']['idempotency-key'] ?? '', '00000000-0000-4000-8000-000000000003');
+check('the charge signature covers method, path, key and body bytes', $seen['headers']['x-signature'] ?? '',
+    DominaiteClient::signRequest(SECRET, $seen['headers']['x-timestamp'] ?? '', 'POST', $seen['path'],
+        '00000000-0000-4000-8000-000000000003', $seen['body']));
+check('the charge recipe reproduces the published vector',
+    DominaiteClient::signRequest(SECRET, '1755302400', 'POST', $seen['path'], '00000000-0000-4000-8000-000000000003', $seen['body']),
+    '9ce9f54efa2533a46aa4493b97b56aeb657f41d6a18f1c008c7fd412029aebf9');
+
+unlink($recordFile);
+$revoked = 'threw';
+try {
+    $client->revokePaymentMethod(PAYMENT_METHOD_ID);
+    $revoked = 'returned';
+} catch (\Throwable $e) {
+    $revoked = get_class($e);
+}
+check('a live revoke resolves on the 204', $revoked, 'returned');
+$seen = lastRequest($recordFile);
+check('the revoke went out as DELETE on the canonical path', $seen['method'] . ' ' . $seen['path'],
+    'DELETE /merchant-api/payment-methods/' . PAYMENT_METHOD_ID);
+check('the revoke sent no body', $seen['body'], '');
+check('the revoke sent no Idempotency-Key header', array_key_exists('idempotency-key', $seen['headers']) ? 'sent' : 'absent', 'absent');
+check('the revoke signature covers an empty key and an empty body', $seen['headers']['x-signature'] ?? '',
+    DominaiteClient::signRequest(SECRET, $seen['headers']['x-timestamp'] ?? '', 'DELETE', $seen['path'], '', ''));
+check('the revoke recipe reproduces the published vector',
+    DominaiteClient::signRequest(SECRET, '1755302400', 'DELETE', $seen['path'], '', ''),
+    '9330100343c4b820504890a09829a193d5815ca39e92160fdfc13d320a802a02');
+unlink($recordFile);
+
+// An id the server does not know is a 404 through the real transport, not a transport error.
+$missing = null;
+try {
+    $client->revokePaymentMethod('pm_unknown');
+} catch (ApiException $e) {
+    $missing = $e;
+}
+check('an unknown payment method is an ApiException', $missing === null ? 'no exception' : get_class($missing), ApiException::class);
+check('the unknown payment method keeps its 404', (string) ($missing === null ? 0 : $missing->getHttpStatus()), '404');
 
 exit($failures === 0 ? 0 : 1);
