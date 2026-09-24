@@ -127,6 +127,8 @@ $badParts = [
     'numeric currency' => ['checkout', 'order-1042', 8440, '978'],
     'currency with newline' => ['checkout', 'order-1042', 8440, "EUR\n"],
     'orderId with CRLF' => ['checkout', "order-1\r\nX-Injected: yes", 8440, 'EUR'],
+    'orderId with a space' => ['checkout', 'order 1042', 8440, 'EUR'],
+    'scope with a space' => ['web checkout', 'order-1042', 8440, 'EUR'],
     'non-ascii orderId' => ['checkout', "order-\u{00e9}", 8440, 'EUR'],
     'over 100 characters' => ['checkout', str_repeat('o', 90), 8440, 'EUR'],
 ];
@@ -188,6 +190,11 @@ $injections = [
     'NUL' => "order-1\0",
     'tab' => "order-1\tX",
     'non-ascii' => "order-\u{00e9}1",
+    'inner space' => 'ORDER 1042 / attempt #2',
+    'leading space' => ' order-1',
+    'trailing space' => 'order-1 ',
+    'only a space' => ' ',
+    'DEL' => "order-1\x7F",
 ];
 foreach ($injections as $label => $bad) {
     $client = new FlakyClient();
@@ -202,7 +209,7 @@ foreach ($injections as $label => $bad) {
 }
 
 // Ordinary keys still pass - the check must not cost anyone a working integration.
-foreach (['order-1042', 'ORDER 1042 / attempt #2', str_repeat('k', 100), '~!@#$%^&*()_+={}[]|:;"<>,.?'] as $good) {
+foreach (['order-1042', 'ORDER-1042/attempt#2', str_repeat('k', 100), '~!@#$%^&*()_+={}[]|:;"<>,.?', '!', '~'] as $good) {
     $client = new FlakyClient();
     $outcome = 'rejected';
     try {

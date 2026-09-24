@@ -10,10 +10,11 @@ Breaking:
 - `idempotencyKey` is required on `createCheckoutSession()` and `chargePaymentMethod()`. A
   missing key throws `InvalidArgumentException` before anything is sent; the random fallback
   is gone.
-
   Migration: pass `'idempotencyKey' => DominaiteClient::orderIdempotencyKey('checkout',
   $orderId, $amountMinor, $currency)`. The same order at the same amount now replays the
   open session instead of opening a second payment; a changed amount gets a new key.
+- An idempotency key must be 1 to 100 visible ASCII characters (0x21-0x7E). Spaces were
+  accepted before and are now refused locally.
 
 Added:
 

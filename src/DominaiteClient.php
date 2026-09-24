@@ -412,7 +412,7 @@ class DominaiteClient
      * Creates a hosted checkout session for one payment.
      *
      * Required params: amount (int, MINOR units - cents), currency (ISO 4217),
-     * orderReference (your order id, <= 100 chars), idempotencyKey (<= 100 printable
+     * orderReference (your order id, <= 100 chars), idempotencyKey (1-100 visible
      * ASCII chars; build it with orderIdempotencyKey() so the same order at the same
      * amount always sends the same key - retrying with it never creates a second payment).
      * A missing key throws InvalidArgumentException before anything is sent.
@@ -758,7 +758,7 @@ class DominaiteClient
      *
      * @throws \InvalidArgumentException An empty part, a non-positive amount, a currency that is not
      *                                   three letters, or a result the key rules refuse (over 100
-     *                                   characters, or anything but printable ASCII).
+     *                                   characters, or anything but visible ASCII 0x21-0x7E).
      */
     public static function orderIdempotencyKey(string $scope, string $orderId, int $amountMinor, string $currency): string
     {
@@ -864,7 +864,15 @@ class DominaiteClient
         if (!is_string($idempotencyKey) || $idempotencyKey === '' || self::codePoints($idempotencyKey) > 100) {
             throw new \InvalidArgumentException('idempotencyKey must be a non-empty string of at most 100 characters');
         }
-        self::assertHeaderSafe('idempotencyKey', $idempotencyKey);
+        // Visible ASCII only (0x21-0x7E), stricter than the header rule: a space is legal in
+        // a header, but proxies and servers trim leading and trailing ones, and the key is
+        // inside the signature, so a trimmed key fails as a bad signature nobody can explain.
+        // One rule in every Dominaite SDK, so a key built in one language works in all.
+        if (preg_match('/^[\x21-\x7E]+\z/', $idempotencyKey) !== 1) {
+            throw new \InvalidArgumentException(
+                'idempotencyKey must contain only visible ASCII characters (0x21-0x7E): no spaces, control characters or non-ASCII'
+            );
+        }
 
         return $idempotencyKey;
     }

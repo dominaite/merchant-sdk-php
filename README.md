@@ -312,7 +312,8 @@ always gives the same key, so a reload or a retry replays the session that is al
 Change the amount or the currency and you get a new key, which is what you want: the gateway
 refuses a known key sent with a different amount (`IDEMPOTENCY_KEY_REUSED`). `scope` keeps
 two flows for one order apart (`checkout` and `renewal`, say); keep it a fixed string per
-flow. The result follows the usual key rules (at most 100 printable ASCII characters), and
+flow. The result follows the usual key rules (1 to 100 visible ASCII characters, 0x21-0x7E,
+so no spaces), and
 the helper throws if it would not.
 
 On a timeout, retry with the same params and so the same key:
