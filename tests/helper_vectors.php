@@ -4,8 +4,9 @@
 // Run: php tests/helper_vectors.php - exits non-zero on any mismatch.
 //
 // Why this file exists: amounts cross the wire as integer minor units, and a wrong
-// conversion is a wrong charge. Every case here is one a float-based conversion or a
-// "every currency has two decimals" shortcut gets wrong.
+// conversion is a wrong charge. Every case here is one a float-based conversion, a
+// "every currency has two decimals" shortcut or a plain ISO 4217 table gets wrong: the
+// exponents follow the gateway's currency registry, which counts HUF in whole forints.
 
 require __DIR__ . '/../src/DominaiteClient.php';
 
@@ -53,13 +54,12 @@ $conversions = [
     ['0', 'EUR', '0'],
     ['0.00', 'EUR', '0'],
     ['1000', 'JPY', '1000'],     // zero-decimal: 1000 JPY is 1000, not 100000
-    ['1000', 'KRW', '1000'],
-    ['150', 'ISK', '150'],
+    ['5000', 'HUF', '5000'],     // the gateway counts whole forints; ISO's 2 would be 500000
+    ['5000', 'huf', '5000'],
+    ['19.99', 'CAD', '1999'],
+    ['19.99', 'AUD', '1999'],
     ['1.250', 'KWD', '1250'],    // three-decimal
     ['1.25', 'BHD', '1250'],
-    ['0.001', 'OMR', '1'],
-    ['10', 'JOD', '10000'],
-    ['2.5', 'TND', '2500'],
     ['9.99', 'eur', '999'],      // currency is case-insensitive
     ['92233720368547758.07', 'EUR', (string) PHP_INT_MAX],
 ];
@@ -68,12 +68,12 @@ foreach ($conversions as [$amount, $currency, $expected]) {
 }
 check('toMinorUnits returns an int', gettype(DominaiteClient::toMinorUnits('0.30', 'EUR')), 'integer');
 
-// Every currency the SDK lists, with the exponent the owner decision pins.
+// Every currency the SDK lists, with the exponent the gateway registry uses.
 $exponents = [
-    'EUR' => 2, 'USD' => 2, 'GBP' => 2, 'BGN' => 2, 'RON' => 2, 'CHF' => 2,
-    'PLN' => 2, 'CZK' => 2, 'HUF' => 2, 'SEK' => 2, 'DKK' => 2, 'NOK' => 2,
-    'JPY' => 0, 'KRW' => 0, 'ISK' => 0,
-    'BHD' => 3, 'KWD' => 3, 'OMR' => 3, 'JOD' => 3, 'TND' => 3,
+    'EUR' => 2, 'USD' => 2, 'GBP' => 2, 'CAD' => 2, 'AUD' => 2, 'CHF' => 2, 'BGN' => 2,
+    'RON' => 2, 'PLN' => 2, 'CZK' => 2, 'SEK' => 2, 'DKK' => 2, 'NOK' => 2,
+    'JPY' => 0, 'HUF' => 0,
+    'BHD' => 3, 'KWD' => 3,
 ];
 foreach ($exponents as $currency => $exponent) {
     check("$currency has exponent $exponent", (string) DominaiteClient::minorUnitExponent($currency), (string) $exponent);
@@ -83,7 +83,10 @@ foreach ($exponents as $currency => $exponent) {
 $refusals = [
     'three decimals for EUR' => ['25.505', 'EUR'],
     'a trailing zero past the exponent' => ['25.500', 'EUR'],
+    'three zero decimals for EUR' => ['25.000', 'EUR'],
     'any decimals for JPY' => ['100.0', 'JPY'],
+    'any decimals for HUF, even zeros' => ['5000.00', 'HUF'],
+    'fillér for HUF' => ['5000.50', 'HUF'],
     'four decimals for KWD' => ['1.2500', 'KWD'],
     'a negative amount' => ['-5.00', 'EUR'],
     'a plus sign' => ['+5.00', 'EUR'],
@@ -99,11 +102,26 @@ $refusals = [
     'past PHP_INT_MAX' => ['92233720368547758.08', 'EUR'],
     'far past PHP_INT_MAX' => [str_repeat('9', 30), 'JPY'],
     'an unknown currency' => ['5.00', 'XYZ'],
-    'a currency not listed' => ['5.00', 'AUD'],
+    'a currency not listed' => ['5.00', 'MXN'],
+    'ISK, where ISO and the gateway disagree' => ['150', 'ISK'],
+    'KRW, where ISO and the gateway disagree' => ['1000', 'KRW'],
+    'OMR, where ISO and the gateway disagree' => ['0.001', 'OMR'],
+    'JOD, where ISO and the gateway disagree' => ['10', 'JOD'],
+    'TND, where ISO and the gateway disagree' => ['2.5', 'TND'],
+    'a lowercase unsupported currency' => ['1000', 'krw'],
     'an empty currency' => ['5.00', ''],
 ];
 foreach ($refusals as $label => [$amount, $currency]) {
     check("toMinorUnits refuses $label", minor($amount, $currency), 'rejected');
+}
+foreach (['ISK', 'KRW', 'OMR', 'JOD', 'TND'] as $unsupported) {
+    $outcome = 'returned';
+    try {
+        DominaiteClient::minorUnitExponent($unsupported);
+    } catch (\InvalidArgumentException $e) {
+        $outcome = strpos($e->getMessage(), 'not supported') !== false ? 'not supported' : $e->getMessage();
+    }
+    check("minorUnitExponent($unsupported) says not supported", $outcome, 'not supported');
 }
 
 // --- isPaid / isTerminal ----------------------------------------------------------------

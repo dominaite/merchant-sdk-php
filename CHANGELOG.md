@@ -23,8 +23,9 @@ Added:
   `STOREFRONT_NOT_WHITELISTED`, `STOREFRONT_INACTIVE`, `STOREFRONT_MISMATCH`, plus
   `STOREFRONT_ERROR_CODES`.
 - `StorefrontException` (extends `ApiException`) for the 409/400 storefront refusals.
-- `toMinorUnits()` and `minorUnitExponent()`: decimal string to integer minor units by
-  ISO 4217 exponent, no float math.
+- `toMinorUnits()` and `minorUnitExponent()`: decimal string to integer minor units by the
+  gateway's exponent (HUF is 0, not ISO's 2), no float math. ISK, KRW, OMR, JOD and TND
+  throw as not supported.
 - `isPaid()`, `isTerminal()` and `TERMINAL_STATUSES`.
 - Stored payment methods (`saveCard`, `chargePaymentMethod()`, `revokePaymentMethod()`),
   which landed after 0.2.0 and were never tagged.

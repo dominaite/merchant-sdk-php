@@ -247,17 +247,25 @@ class DominaiteClient
     ];
 
     /**
-     * ISO 4217 minor-unit exponents for toMinorUnits(): how many decimal places the
-     * currency's major unit splits into. Deliberately a short list of the currencies
-     * merchants use today rather than the whole standard; an unlisted currency throws
-     * instead of guessing 2, because a wrong guess is a 100x charge.
+     * Minor-unit exponents for toMinorUnits(), as the GATEWAY counts them, which is what
+     * the amount you send is read against. That is ISO 4217 except HUF: the gateway
+     * treats forints as whole units (0 decimals, the filler was withdrawn in 1999), so
+     * "2 for HUF" would be a 100x overcharge. An unlisted currency throws instead of
+     * guessing 2, because a wrong guess is a 10x or 100x charge.
      */
     private const MINOR_UNIT_EXPONENTS = [
-        'EUR' => 2, 'USD' => 2, 'GBP' => 2, 'BGN' => 2, 'RON' => 2, 'CHF' => 2,
-        'PLN' => 2, 'CZK' => 2, 'HUF' => 2, 'SEK' => 2, 'DKK' => 2, 'NOK' => 2,
-        'JPY' => 0, 'KRW' => 0, 'ISK' => 0,
-        'BHD' => 3, 'KWD' => 3, 'OMR' => 3, 'JOD' => 3, 'TND' => 3,
+        'EUR' => 2, 'USD' => 2, 'GBP' => 2, 'CAD' => 2, 'AUD' => 2, 'CHF' => 2, 'BGN' => 2,
+        'RON' => 2, 'PLN' => 2, 'CZK' => 2, 'SEK' => 2, 'DKK' => 2, 'NOK' => 2,
+        'JPY' => 0, 'HUF' => 0,
+        'BHD' => 3, 'KWD' => 3,
     ];
+
+    /**
+     * Currencies where ISO 4217 and the gateway disagree on the exponent (the gateway has
+     * no entry and falls back to 2). Converting them either way risks a silent 10x or 100x
+     * error, so toMinorUnits() refuses them outright.
+     */
+    private const UNSUPPORTED_MINOR_UNIT_CURRENCIES = ['ISK', 'KRW', 'OMR', 'JOD', 'TND'];
 
     /**
      * The statuses that keep their generic exception on every route: validation (400),
@@ -769,21 +777,23 @@ class DominaiteClient
     }
 
     /**
-     * Converts a decimal amount string to integer MINOR units, by the currency's ISO 4217
-     * exponent: toMinorUnits('0.30', 'EUR') is 30, toMinorUnits('1000', 'JPY') is 1000,
-     * toMinorUnits('1.250', 'KWD') is 1250.
+     * Converts a decimal amount string to integer MINOR units, by the currency's exponent
+     * as the gateway counts it: toMinorUnits('0.30', 'EUR') is 30, toMinorUnits('1000',
+     * 'JPY') is 1000, toMinorUnits('5000', 'HUF') is 5000, toMinorUnits('1.250', 'KWD')
+     * is 1250.
      *
      * Takes a string on purpose. A float cannot hold 0.30 exactly, and (int) (0.3 * 100)
      * is 29, so the parsing here is plain digit handling with no float or bcmath step.
      * Accepted: digits, optionally a dot and at most as many fractional digits as the
      * currency has ("25", "25.5", "25.50" for EUR). Refused with InvalidArgumentException:
-     * more fractional digits than the currency allows ("25.505" EUR, "100.0" JPY), a sign,
-     * whitespace, thousands separators, a comma as the decimal mark, exponents, an amount
-     * past PHP_INT_MAX, and a currency not in the list below. Zero converts to 0; the API
-     * itself still requires a positive amount.
+     * more fractional digits than the currency allows, even zeros ("25.000" EUR, "100.0"
+     * JPY), a sign, whitespace, thousands separators, a comma as the decimal mark,
+     * exponents, an amount past PHP_INT_MAX, and a currency not in the list below. Zero
+     * converts to 0; the API itself still requires a positive amount.
      *
-     * Exponent 2: EUR USD GBP BGN RON CHF PLN CZK HUF SEK DKK NOK. Exponent 0: JPY KRW ISK.
-     * Exponent 3: BHD KWD OMR JOD TND.
+     * Exponent 2: EUR USD GBP CAD AUD CHF BGN RON PLN CZK SEK DKK NOK. Exponent 0: JPY and
+     * HUF (whole forints, unlike ISO 4217). Exponent 3: BHD KWD. ISK, KRW, OMR, JOD and TND
+     * throw as not supported: ISO and the gateway disagree on them.
      *
      * @param string $amount   Decimal amount in MAJOR units, e.g. "25.00".
      * @param string $currency ISO 4217 code, any case.
@@ -816,13 +826,19 @@ class DominaiteClient
     }
 
     /**
-     * The ISO 4217 minor-unit exponent toMinorUnits() uses: 2 for EUR, 0 for JPY, 3 for KWD.
+     * The minor-unit exponent toMinorUnits() uses: 2 for EUR, 0 for JPY and HUF, 3 for KWD.
      *
-     * @throws \InvalidArgumentException A currency this SDK does not list.
+     * @throws \InvalidArgumentException A currency this SDK does not list, or one of the
+     *                                   unsupported ISK, KRW, OMR, JOD, TND.
      */
     public static function minorUnitExponent(string $currency): int
     {
         $code = strtoupper($currency);
+        if (in_array($code, self::UNSUPPORTED_MINOR_UNIT_CURRENCIES, true)) {
+            throw new \InvalidArgumentException(
+                "{$code} is not supported: ISO 4217 and the gateway disagree on its decimals, convert it yourself"
+            );
+        }
         if (!isset(self::MINOR_UNIT_EXPONENTS[$code])) {
             throw new \InvalidArgumentException(
                 "Unknown currency \"{$currency}\": convert to minor units yourself, or ask for it to be added"

@@ -266,10 +266,12 @@ it is not optional if you care about your books.
 
 ## Amounts are minor units
 
-`amount` is always an integer in the currency's minor unit, which depends on the currency's
-ISO 4217 exponent. EUR has two decimals, so `2500` is 25.00 EUR. JPY has none, so `1000` is
-1000 JPY, not 10.00. KWD has three, so `1250` is 1.250 KWD. The amount is locked
-server-side - what you pass here is what gets charged; nothing in the browser can change it.
+`amount` is always an integer in the currency's minor unit, which depends on how many
+decimals the gateway counts for that currency. EUR has two, so `2500` is 25.00 EUR. JPY has
+none, so `1000` is 1000 JPY, not 10.00. HUF has none either: the gateway counts whole
+forints, although ISO 4217 lists two, so `5000` is 5000 HUF. KWD has three, so `1250` is
+1.250 KWD. The amount is locked server-side - what you pass here is what gets charged;
+nothing in the browser can change it.
 
 If your shop stores prices as decimal strings, convert with `toMinorUnits()` rather than
 multiplying a float (`(int) (0.3 * 100)` is 29):
@@ -277,15 +279,18 @@ multiplying a float (`(int) (0.3 * 100)` is 29):
 ```php
 DominaiteClient::toMinorUnits('0.30', 'EUR');   // 30
 DominaiteClient::toMinorUnits('1000', 'JPY');   // 1000
+DominaiteClient::toMinorUnits('5000', 'HUF');   // 5000, whole forints
 DominaiteClient::toMinorUnits('1.250', 'KWD');  // 1250
-DominaiteClient::toMinorUnits('25.505', 'EUR'); // throws: EUR has 2 decimal places
+DominaiteClient::toMinorUnits('25.000', 'EUR'); // throws: EUR has 2 decimal places
 ```
 
 It takes a string, parses it without floats, and throws `InvalidArgumentException` for more
-decimals than the currency has, for anything that is not plain digits with an optional dot,
-and for a currency it does not know. Known today: EUR, USD, GBP, BGN, RON, CHF, PLN, CZK,
-HUF, SEK, DKK, NOK (two decimals), JPY, KRW, ISK (none), BHD, KWD, OMR, JOD, TND (three).
-`minorUnitExponent($currency)` returns the exponent on its own.
+decimals than the currency has (zeros included, so `"25.000"` EUR is refused), for anything
+that is not plain digits with an optional dot, and for a currency it does not know. Known
+today: EUR, USD, GBP, CAD, AUD, CHF, BGN, RON, PLN, CZK, SEK, DKK, NOK (two decimals), JPY
+and HUF (none), BHD and KWD (three). ISK, KRW, OMR, JOD and TND throw as not supported,
+because ISO 4217 and the gateway disagree on their decimals and either guess could be off
+by 10x or 100x. `minorUnitExponent($currency)` returns the exponent on its own.
 
 ## Retries and double-charges
 
