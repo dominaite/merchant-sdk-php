@@ -1,4 +1,4 @@
-# dominaite/dominaite-php
+# dominaite/merchant-sdk
 
 Server-side PHP client for the Dominaite merchant API. One call from your backend opens a
 hosted checkout session; a two-line script tag renders the payment widget on your page. Card
@@ -14,7 +14,7 @@ is the fallback for when you have not set one up yet.
 ## Install
 
 ```bash
-composer require dominaite/dominaite-php
+composer require dominaite/merchant-sdk
 ```
 
 PHP 7.4 or newer with `ext-curl`, `ext-json` and `ext-mbstring`. No other dependencies.
