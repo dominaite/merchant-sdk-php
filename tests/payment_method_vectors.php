@@ -159,14 +159,12 @@ check('charge idempotency key is readable afterwards', (string) $client->getLast
 $client = new RecordingClient($charge);
 $client->chargePaymentMethod(PAYMENT_METHOD_ID, [
     'orderReference' => 'order-1043', 'description' => 'Monthly plan', 'currency' => 'EUR', 'amount' => 2500,
-    'customer' => ['email' => 'not-on-this-route'],
+    'customer' => ['email' => 'not-on-this-route'], 'idempotencyKey' => CHARGE_KEY,
 ]);
 check('charge body is built field by field in contract order', encode($client->calls[0]['body']),
     '{"amount":2500,"currency":"EUR","orderReference":"order-1043","description":"Monthly plan"}');
-check('charge generates an idempotency key when the caller omits one',
-    preg_match('/^[0-9a-f]{32}$/', $client->calls[0]['key']) === 1 ? 'generated' : $client->calls[0]['key'], 'generated');
-check('the generated charge key is readable afterwards',
-    $client->getLastIdempotencyKey() === $client->calls[0]['key'] ? 'same key' : 'lost', 'same key');
+check('the idempotency key rides the header, never the charge body',
+    array_key_exists('idempotencyKey', $client->calls[0]['body']) ? 'leaked' : 'absent', 'absent');
 
 // --- chargePaymentMethod: declines are results, refusals are typed exceptions ----------
 // A 402 says success=false and CHARGE_DECLINED, but the charge is right there with its
@@ -241,6 +239,29 @@ check('a codeless 503 on a charge is still a retryable transport error',
         (new RecordingClient(['success' => false], 503))->chargePaymentMethod(PAYMENT_METHOD_ID, $chargeParams);
     }), TransportException::class);
 
+// A 503 that carries PAYMENT_PROCESSING_UNAVAILABLE must stay on the retry path on both
+// routes. On a charge it is the typed exception whose code says "nothing charged, retry
+// later with the same key"; on a session create, where the gateway normally answers this
+// code as a 200 refusal, a 503 is the retryable transport error. Neither may become a
+// generic ApiException, which reads as "your request is wrong, do not retry".
+$unavailable = ['success' => false, 'error' => ['message' => 'Card payments are not available right now.',
+    'code' => DominaiteClient::PAYMENT_PROCESSING_UNAVAILABLE, 'statusCode' => 503]];
+$thrown = null;
+try {
+    (new RecordingClient($unavailable, 503))->chargePaymentMethod(PAYMENT_METHOD_ID, $chargeParams);
+} catch (\Throwable $e) {
+    $thrown = $e;
+}
+check('a charge 503 PAYMENT_PROCESSING_UNAVAILABLE is a ChargeException',
+    $thrown === null ? 'no exception' : get_class($thrown), ChargeException::class);
+check('the charge 503 keeps its code for the retry decision',
+    $thrown instanceof ChargeException ? $thrown->getHttpStatus() . ' ' . $thrown->getErrorCode() : '',
+    '503 PAYMENT_PROCESSING_UNAVAILABLE');
+check('a session 503 PAYMENT_PROCESSING_UNAVAILABLE is a retryable transport error',
+    thrownBy(static function () use ($unavailable, $sessionParams): void {
+        (new RecordingClient($unavailable, 503))->createCheckoutSession($sessionParams);
+    }), TransportException::class);
+
 // A 2xx without a chargeId is not a charge either, whatever success says.
 check('a 201 without a charge body is an ApiException',
     thrownBy(static function () use ($chargeParams): void {
@@ -268,13 +289,15 @@ foreach ($cases as $label => $override) {
     check("charge with $label never reaches the transport", (string) count($client->calls), '0');
     check("charge with $label leaves no stale key", $client->getLastIdempotencyKey() === null ? 'null' : 'set', 'null');
 }
-foreach (['amount', 'currency', 'orderReference'] as $required) {
+foreach (['amount', 'currency', 'orderReference', 'idempotencyKey'] as $required) {
     $params = $chargeParams;
     unset($params[$required]);
+    $client = new RecordingClient($charge);
     check("charge requires $required",
-        thrownBy(static function () use ($charge, $params): void {
-            (new RecordingClient($charge))->chargePaymentMethod(PAYMENT_METHOD_ID, $params);
+        thrownBy(static function () use ($client, $params): void {
+            $client->chargePaymentMethod(PAYMENT_METHOD_ID, $params);
         }), \InvalidArgumentException::class);
+    check("charge without $required never reaches the transport", (string) count($client->calls), '0');
 }
 
 // The id goes into the signed canonical path verbatim, so anything that is not one

@@ -54,6 +54,23 @@ if (strpos($path, '/merchant-api/payment-methods/') === 0) {
 }
 
 switch ($path) {
+    case '/merchant-api/checkout/sessions':
+        // The gateway's answer to a mint for a storefront whose domain the provider has
+        // not whitelisted yet: a 409 in the standard error envelope.
+        http_response_code(409);
+        header('Content-Type: application/json');
+        echo json_encode([
+            'success' => false,
+            'data' => null,
+            'error' => [
+                'code' => 'STOREFRONT_NOT_WHITELISTED',
+                'message' => "This storefront's domain is not yet whitelisted with the payment provider",
+                'statusCode' => 409,
+            ],
+            'metadata' => ['requestId' => 'live', 'timestamp' => '2026-09-24T10:00:00Z', 'apiVersion' => '1.0', 'processingTimeMs' => 1],
+        ]);
+        return true;
+
     case '/html-503':
         http_response_code(503);
         header('Content-Type: text/html');

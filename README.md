@@ -1,4 +1,4 @@
-# dominaite/dominaite-php
+# dominaite/merchant-sdk
 
 Server-side PHP client for the Dominaite merchant API. One call from your backend opens a
 hosted checkout session; a two-line script tag renders the payment widget on your page. Card
@@ -14,7 +14,7 @@ is the fallback for when you have not set one up yet.
 ## Install
 
 ```bash
-composer require dominaite/dominaite-php
+composer require dominaite/merchant-sdk
 ```
 
 PHP 7.4 or newer with `ext-curl`, `ext-json` and `ext-mbstring`. No other dependencies.
@@ -89,15 +89,21 @@ require __DIR__ . '/vendor/autoload.php';
 use Dominaite\DominaiteClient;
 use Dominaite\Exception\CheckoutRefusedException;
 use Dominaite\Exception\RateLimitException;
+use Dominaite\Exception\StorefrontException;
 use Dominaite\Exception\TransportException;
 
 $client = new DominaiteClient(getenv('DOMINAITE_KEY_ID'), getenv('DOMINAITE_SECRET'));
 
+$amount = 2500;                              // minor units: 2500 = 25.00 EUR
+
 try {
     $session = $client->createCheckoutSession([
-        'amount'         => 2500,            // minor units: 2500 = 25.00 EUR
+        'amount'         => $amount,
         'currency'       => 'EUR',
         'orderReference' => 'order-1042',    // your own order id, shows up in your dashboard
+        // Required. Same order + same amount = same key, so a reload or a retry gets the
+        // session that is already open instead of a second payment.
+        'idempotencyKey' => DominaiteClient::orderIdempotencyKey('checkout', 'order-1042', $amount, 'EUR'),
         'customer'       => [
             // Pass everything you already know - prefilled fields are hidden from the
             // payer, so the checkout form stays short.
@@ -112,13 +118,18 @@ try {
     // Machine-readable: $e->getErrorCode() - see the exception docblock for the codes.
     http_response_code(409);
     exit('Payment unavailable: ' . $e->getErrorCode());
+} catch (StorefrontException $e) {
+    // This website cannot take payments yet (or any more). Not retryable - see below.
+    error_log('Dominaite storefront refusal: ' . $e->getErrorCode());
+    http_response_code(503);
+    exit('Online payments are not available on this site yet');
 } catch (RateLimitException $e) {
     // You are over the rate limit. Nothing is retried for you - back off first.
     http_response_code(503);
     header('Retry-After: ' . ($e->getRetryAfterSeconds() ?? 5));
     exit('Payment temporarily unavailable');
 } catch (TransportException $e) {
-    // Network blip or a 5xx - retry with $client->getLastIdempotencyKey(), never a fresh key.
+    // Network blip or a 5xx - retry with the same params, so the same key, never a fresh one.
     http_response_code(503);
     exit('Payment temporarily unavailable');
 }
@@ -135,6 +146,22 @@ try {
 100 character Cyrillic or Greek reference is 200 bytes and is fine. Emoji and rarer CJK
 characters count double on the server, so stay a couple of characters clear of the limit if
 your references contain them; the server has the final say either way.
+
+### Storefront errors
+
+If your merchant account has more than one website, each one is a storefront, and a
+session is refused when its storefront cannot take payments. These come back as HTTP 4xx
+and the SDK raises `StorefrontException` (an `ApiException`, so older catch blocks still see
+it). Branch on `getErrorCode()`, using the constants on `DominaiteClient`:
+
+| Code | HTTP | Meaning | What to do |
+|------|------|---------|------------|
+| `STOREFRONT_NOT_WHITELISTED` | 409 | The site's domain is not yet whitelisted with the payment provider. | Nothing to retry. Ask Dominaite to finish onboarding the domain. |
+| `STOREFRONT_INACTIVE` | 409 | The storefront was deactivated or deleted. | Nothing to retry. Check the location in your dashboard. |
+| `STOREFRONT_MISMATCH` | 400 | The API key belongs to another storefront than the request names. | Use the key issued for this site. |
+
+Replaying a key that was first used for a different storefront answers `STOREFRONT_MISMATCH`
+as an HTTP 200 refusal, so that one case arrives as `CheckoutRefusedException`.
 
 That's the checkout half: the session call above, the script tag, and your domain bound to
 your checkout by Dominaite during onboarding. The other half is the webhook that tells you
@@ -239,31 +266,66 @@ it is not optional if you care about your books.
 
 ## Amounts are minor units
 
-`amount` is always an integer in the currency's minor unit: `2500` is 25.00 EUR, `1000` is
-10.00 JPY-equivalent in a two-decimal currency. The amount is locked server-side - what you
-pass here is what gets charged; nothing in the browser can change it.
+`amount` is always an integer in the currency's minor unit, which depends on how many
+decimals the gateway counts for that currency. EUR has two, so `2500` is 25.00 EUR. JPY has
+none, so `1000` is 1000 JPY, not 10.00. HUF has none either: the gateway counts whole
+forints, although ISO 4217 lists two, so `5000` is 5000 HUF. KWD has three, so `1250` is
+1.250 KWD. The amount is locked server-side - what you pass here is what gets charged;
+nothing in the browser can change it.
+
+If your shop stores prices as decimal strings, convert with `toMinorUnits()` rather than
+multiplying a float (`(int) (0.3 * 100)` is 29):
+
+```php
+DominaiteClient::toMinorUnits('0.30', 'EUR');   // 30
+DominaiteClient::toMinorUnits('1000', 'JPY');   // 1000
+DominaiteClient::toMinorUnits('5000', 'HUF');   // 5000, whole forints
+DominaiteClient::toMinorUnits('1.250', 'KWD');  // 1250
+DominaiteClient::toMinorUnits('25.000', 'EUR'); // throws: EUR has 2 decimal places
+```
+
+It takes a string, parses it without floats, and throws `InvalidArgumentException` for more
+decimals than the currency has (zeros included, so `"25.000"` EUR is refused), for anything
+that is not plain digits with an optional dot, and for a currency it does not know. Known
+today: EUR, USD, GBP, CAD, AUD, CHF, BGN, RON, PLN, CZK, SEK, DKK, NOK (two decimals), JPY
+and HUF (none), BHD and KWD (three). ISK, KRW, OMR, JOD and TND throw as not supported,
+because ISO 4217 and the gateway disagree on their decimals and either guess could be off
+by 10x or 100x. `minorUnitExponent($currency)` returns the exponent on its own.
 
 ## Retries and double-charges
 
-Every `createCheckoutSession` call carries an idempotency key (auto-generated, or pass your
-own as `idempotencyKey`). Retrying with the same key never opens a second payment - on a
-timeout, retry with the same key rather than generating a new one. When you let the SDK
-generate the key, read it back with `getLastIdempotencyKey()` so the retry can reuse it:
+`idempotencyKey` is required on `createCheckoutSession()` and `chargePaymentMethod()`. Leave
+it out and the SDK throws `InvalidArgumentException` before anything is sent. It used to
+generate a random key for you; that is gone, because a random key per request turns every
+page reload, back button or retried timeout into a second payment for the same order.
+
+Derive the key from the order instead:
 
 ```php
+$key = DominaiteClient::orderIdempotencyKey('checkout', $order->id, $amountMinor, $currency);
+// "checkout-1042-2500-EUR"
+```
+
+The shape is `{scope}-{orderId}-{amountMinor}-{CURRENCY}`. The same order at the same amount
+always gives the same key, so a reload or a retry replays the session that is already open
+(same `transactionId`, same `cashierKey` and `cashierToken`) instead of opening a new one.
+Change the amount or the currency and you get a new key, which is what you want: the gateway
+refuses a known key sent with a different amount (`IDEMPOTENCY_KEY_REUSED`). `scope` keeps
+two flows for one order apart (`checkout` and `renewal`, say); keep it a fixed string per
+flow. The result follows the usual key rules (1 to 100 visible ASCII characters, 0x21-0x7E,
+so no spaces), and
+the helper throws if it would not.
+
+On a timeout, retry with the same params and so the same key:
+
+```php
+$params['idempotencyKey'] = DominaiteClient::orderIdempotencyKey('checkout', 'order-1042', 2500, 'EUR');
 $session = null;
-$key = null;
 
 for ($attempt = 1; $attempt <= 3 && $session === null; $attempt++) {
-    if ($key !== null) {
-        $params['idempotencyKey'] = $key;
-    }
     try {
         $session = $client->createCheckoutSession($params);
     } catch (TransportException $e) {
-        // Read the key here, in the catch - store it against your order before you
-        // sleep or hand off, because the next create() call overwrites it.
-        $key = $client->getLastIdempotencyKey();
         if ($attempt === 3) {
             throw $e;
         }
@@ -272,14 +334,16 @@ for ($attempt = 1; $attempt <= 3 && $session === null; $attempt++) {
 }
 ```
 
-**A replay does not hand you the original session back.** If the first attempt did reach the
-gateway, the retry answers HTTP 200 with `success=false` and a replay code - `DUPLICATE_REQUEST`,
-`ALREADY_PROCESSED`, `PRIOR_ATTEMPT_FAILED` or `IDEMPOTENCY_KEY_REUSED` - which the SDK raises
-as a `CheckoutRefusedException`. The original session's `cashierKey` and `cashierToken` are not
-in that response, so a retry cannot be your only path to rendering the widget. What the refusal
-gives you is the transaction id to reconcile against; see "Recovering from a replay refusal"
-below. Store `transactionId` and the idempotency key when a create succeeds, and treat the
-replay refusal as "go look up what the first attempt did", not as an error to show the payer.
+`getLastIdempotencyKey()` still reads back the key of the last attempt that went out, for a
+generic catch block that no longer has the params.
+
+A replay only hands back the original session while that session is open and unexpired. If
+the first attempt already completed, failed, or was sent with a different amount, the retry
+answers HTTP 200 with `success=false` and a replay code (`DUPLICATE_REQUEST`,
+`ALREADY_PROCESSED`, `PRIOR_ATTEMPT_FAILED` or `IDEMPOTENCY_KEY_REUSED`), which the SDK raises
+as a `CheckoutRefusedException` carrying the transaction id to reconcile against; see
+"Recovering from a replay refusal" below. Treat it as "go look up what the first attempt did",
+not as an error to show the payer.
 
 ## Rate limits
 
@@ -331,6 +395,7 @@ $session = $client->createCheckoutSession([
     'amount'         => 2500,
     'currency'       => 'EUR',
     'orderReference' => 'sub-8817-first',
+    'idempotencyKey' => DominaiteClient::orderIdempotencyKey('checkout', 'sub-8817-first', 2500, 'EUR'),
     'saveCard'       => true,
 ]);
 // ... the payer completes the hosted checkout ...
@@ -347,7 +412,8 @@ try {
         'currency'       => 'EUR',
         'orderReference' => 'sub-8817-2026-10',
         'description'    => 'Monthly plan, October',
-        'idempotencyKey' => 'sub-8817-2026-10', // derive it from the billing period, never random per attempt
+        // Derived from the billing period, never random per attempt.
+        'idempotencyKey' => DominaiteClient::orderIdempotencyKey('renewal', 'sub-8817-2026-10', 2500, 'EUR'),
     ]);
 
     switch ($charge['status']) {
@@ -405,10 +471,10 @@ try {
 }
 ```
 
-A charge is signed exactly like a session and carries an `Idempotency-Key`, so a retry after
-a timeout with the **same** key never charges the card twice: the gateway replays its first
-answer, HTTP status included. `getLastIdempotencyKey()` reads the key back the same way it does
-for a session. The HTTP status is the contract on this route: 201 (or 200 on a replay) returns
+A charge is signed exactly like a session and carries a required `Idempotency-Key`, so a
+retry after a timeout with the **same** key never charges the card twice: the gateway replays
+its first answer, HTTP status included. `getLastIdempotencyKey()` reads the key back the same
+way it does for a session. The HTTP status is the contract on this route: 201 (or 200 on a replay) returns
 the charge, 402 returns the charge too (`status` `failed` plus `declineClass`), and 409, 422,
 502 and 503 throw `ChargeException` with `getErrorCode()`, `getHttpStatus()`, the gateway's
 message and, when the gateway attached the charge row, `getCharge()` and `getTransactionId()`.
@@ -450,6 +516,16 @@ awaiting capture. Never treat it as an abandoned order.
 
 Treat any status you do not recognise as still-open as well: a value the API adds later should
 make you keep polling, never silently close an order that is still live.
+
+Two helpers encode those rules so you do not have to:
+
+```php
+DominaiteClient::isPaid($status['status']);     // true only for 'succeeded'
+DominaiteClient::isTerminal($status['status']); // stop polling: succeeded, failed, cancelled,
+                                                // abandoned, refunded, partially_refunded
+```
+
+Everything else, `disputed` and unknown values included, is not terminal.
 
 Poll after the payer returns to you, or on your order timeout - not in a tight loop; the
 endpoint is rate limited per key.

@@ -192,7 +192,8 @@ foreach (DominaiteClient::REFUSAL_ERROR_CODES as $code) {
         'errorMessage' => 'Refused.',
     ]);
     try {
-        $client->createCheckoutSession(['amount' => 8440, 'currency' => 'EUR', 'orderReference' => 'order-1042']);
+        $client->createCheckoutSession(['amount' => 8440, 'currency' => 'EUR', 'orderReference' => 'order-1042',
+            'idempotencyKey' => 'order-1042']);
         check("refusal surfaces errorCode: $code", 'returned normally', $code);
     } catch (CheckoutRefusedException $refusal) {
         check("refusal surfaces errorCode: $code", $refusal->getErrorCode(), $code);
@@ -223,6 +224,7 @@ $checkout = $successClient->createCheckoutSession([
     'amount' => 8440,
     'currency' => 'EUR',
     'orderReference' => 'order-1042',
+    'idempotencyKey' => 'order-1042',
 ]);
 check('createCheckoutSession accepts the fixture success example',
     keysOf($checkout), keysOf($session['successExample']['checkout']));
@@ -234,13 +236,19 @@ check('checkout carries the transaction id', (string) $checkout['transactionId']
 check('checkout amount stays an int in minor units',
     var_export($checkout['amount'], true), '8440');
 
-// IDEMPOTENCY_KEY_REQUIRED is a gateway 400 this SDK must never provoke: a POST always
-// carries a generated key of legal length, and a GET signs the empty key by design.
-$generated = $successClient->idempotencyKeys[0];
-check('POST generates an idempotency key when the caller omits one',
-    $generated !== '' ? 'generated' : 'empty', 'generated');
-check('generated idempotency key is within the 1-100 char limit',
-    strlen($generated) >= 1 && strlen($generated) <= 100 ? 'in range' : 'len ' . strlen($generated), 'in range');
+// IDEMPOTENCY_KEY_REQUIRED is a gateway 400 this SDK must never provoke: a POST without
+// a key is refused locally, before anything is signed, and a GET signs the empty key by
+// design. There is no generated fallback - a random key per call is a second payment on
+// every reload.
+$keyless = new CannedClient($session['successExample']);
+$outcome = 'accepted';
+try {
+    $keyless->createCheckoutSession(['amount' => 8440, 'currency' => 'EUR', 'orderReference' => 'order-1042']);
+} catch (\InvalidArgumentException $e) {
+    $outcome = 'rejected locally';
+}
+check('POST without an idempotency key is rejected before the call', $outcome, 'rejected locally');
+check('the keyless POST never reached the transport', (string) count($keyless->calls), '0');
 check('GET signs an empty idempotency key', listOf($pingClient->idempotencyKeys), '');
 
 // A caller-supplied key is passed through untouched, and an illegal one is the caller's
@@ -283,6 +291,7 @@ try {
         'amount' => 8440,
         'currency' => 'EUR',
         'orderReference' => 'order-1042',
+        'idempotencyKey' => 'order-1042',
     ]);
 } catch (CheckoutRefusedException $refusal) {
     $verdict = 'threw CheckoutRefusedException';
@@ -400,7 +409,8 @@ check('charge path matches the fixture',
     DominaiteClient::PAYMENT_METHODS_PATH . '/{paymentMethodId}/charges', (string) $charge['path']);
 check('charge is a POST that answers 201 and declines with 402',
     $charge['method'] . ' ' . $charge['httpStatus'] . ' ' . $charge['declinedHttpStatus'], 'POST 201 402');
-$chargeParams = ['amount' => 8440, 'currency' => 'EUR', 'orderReference' => 'order-1042'];
+$chargeParams = ['amount' => 8440, 'currency' => 'EUR', 'orderReference' => 'order-1042',
+    'idempotencyKey' => 'renewal-order-1042-8440-EUR'];
 
 // 201: the envelope is unwrapped and the charge is exactly the fixture's fields.
 $chargeClient = new CannedClient($charge['successExample'], 201);
@@ -409,8 +419,8 @@ check('chargePaymentMethod accepts the fixture success example', keysOf($chargeR
 check('charge field set matches the fixture', keysOf($chargeResult), sortedList($charge['fields']));
 check('chargePaymentMethod is a POST on the fixture path', listOf($chargeClient->calls),
     'POST ' . str_replace('{paymentMethodId}', $paymentMethodId, (string) $charge['path']));
-check('chargePaymentMethod generates an idempotency key when the caller omits one',
-    $chargeClient->idempotencyKeys[0] !== '' ? 'generated' : 'empty', 'generated');
+check('chargePaymentMethod sends the caller idempotency key verbatim',
+    listOf($chargeClient->idempotencyKeys), 'renewal-order-1042-8440-EUR');
 check('charge reads a vocabulary status',
     in_array($chargeResult['status'], DominaiteClient::CHARGE_STATUS_VOCABULARY, true) ? 'in vocabulary' : $chargeResult['status'],
     'in vocabulary');

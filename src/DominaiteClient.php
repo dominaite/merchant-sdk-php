@@ -10,6 +10,7 @@ use Dominaite\Exception\ChargeException;
 use Dominaite\Exception\CheckoutRefusedException;
 use Dominaite\Exception\RateLimitException;
 use Dominaite\Exception\RevokeException;
+use Dominaite\Exception\StorefrontException;
 use Dominaite\Exception\TransportException;
 
 /**
@@ -26,6 +27,7 @@ use Dominaite\Exception\TransportException;
  *       'amount'         => 2500,          // minor units: 25.00 EUR
  *       'currency'       => 'EUR',
  *       'orderReference' => 'order-1042',  // your own order id
+ *       'idempotencyKey' => DominaiteClient::orderIdempotencyKey('checkout', 'order-1042', 2500, 'EUR'),
  *       'customer'       => ['firstName' => 'Ana', 'lastName' => 'K', 'email' => 'ana@example.com'],
  *   ]);
  *   // Hand $session['cashierKey'] + $session['cashierToken'] to the embed snippet.
@@ -97,23 +99,81 @@ class DominaiteClient
     ];
 
     /**
+     * The statuses after which a payment does not move on its own: stop polling. Only
+     * succeeded means money in hand (isPaid()). disputed is left out on purpose: a dispute
+     * resolves one way or the other. Unknown values are not terminal, see getStatus().
+     */
+    public const TERMINAL_STATUSES = [
+        'succeeded',
+        'failed',
+        'cancelled',
+        'abandoned',
+        'refunded',
+        'partially_refunded',
+    ];
+
+    /** Card payments are off right now; retry later with the same key. HTTP 200 refusal on a session, 503 on a charge. */
+    public const PAYMENT_PROCESSING_UNAVAILABLE = 'PAYMENT_PROCESSING_UNAVAILABLE';
+
+    /** A request with this idempotency key is still in flight or its session is open; retry the SAME key shortly. */
+    public const DUPLICATE_REQUEST = 'DUPLICATE_REQUEST';
+
+    /** The payment for this idempotency key has already been taken; reconcile, do not charge again. */
+    public const ALREADY_PROCESSED = 'ALREADY_PROCESSED';
+
+    /** This idempotency key was used with a different amount, currency or card-saving choice; a bug on your side. */
+    public const IDEMPOTENCY_KEY_REUSED = 'IDEMPOTENCY_KEY_REUSED';
+
+    /** The attempt under this idempotency key ended without payment; the key is spent, reconcile and use a new one. */
+    public const PRIOR_ATTEMPT_FAILED = 'PRIOR_ATTEMPT_FAILED';
+
+    /**
+     * HTTP 409: the storefront's domain is not yet whitelisted with the payment provider,
+     * and this environment requires it. Not retryable until onboarding finishes the
+     * whitelisting; contact Dominaite with the storefront's domain.
+     */
+    public const STOREFRONT_NOT_WHITELISTED = 'STOREFRONT_NOT_WHITELISTED';
+
+    /** HTTP 409: the storefront (online location) was deactivated or deleted. Not retryable. */
+    public const STOREFRONT_INACTIVE = 'STOREFRONT_INACTIVE';
+
+    /**
+     * HTTP 400: the API key is bound to one storefront and the request named another. A
+     * configuration bug: use the key issued for that storefront. On a replay of a key
+     * first used for a different storefront it arrives as an HTTP 200 refusal instead.
+     */
+    public const STOREFRONT_MISMATCH = 'STOREFRONT_MISMATCH';
+
+    /**
      * Every errorCode a refused createCheckoutSession() can carry, as pinned by the
      * canonical contract fixture. These arrive as HTTP 200 with success=false and reach
      * the caller as a CheckoutRefusedException - branch on getErrorCode().
      */
     public const REFUSAL_ERROR_CODES = [
-        'PAYMENT_PROCESSING_UNAVAILABLE',
-        'DUPLICATE_REQUEST',
-        'ALREADY_PROCESSED',
-        'IDEMPOTENCY_KEY_REUSED',
-        'PRIOR_ATTEMPT_FAILED',
+        self::PAYMENT_PROCESSING_UNAVAILABLE,
+        self::DUPLICATE_REQUEST,
+        self::ALREADY_PROCESSED,
+        self::IDEMPOTENCY_KEY_REUSED,
+        self::PRIOR_ATTEMPT_FAILED,
+    ];
+
+    /**
+     * The storefront refusals at session mint: 409 STOREFRONT_NOT_WHITELISTED, 409
+     * STOREFRONT_INACTIVE, 400 STOREFRONT_MISMATCH. A 4xx carrying one of these raises
+     * StorefrontException (an ApiException), so getErrorCode() and getHttpStatus() are
+     * there to branch on. None of them is fixed by retrying the same request.
+     */
+    public const STOREFRONT_ERROR_CODES = [
+        self::STOREFRONT_NOT_WHITELISTED,
+        self::STOREFRONT_INACTIVE,
+        self::STOREFRONT_MISMATCH,
     ];
 
     /**
      * Input-validation codes on the create endpoint. Unlike the refusals above these are
      * HTTP 400, not the success=false shape, and surface as ApiException. This SDK
-     * generates and length-checks the idempotency key itself, so a correct integration
-     * never sees IDEMPOTENCY_KEY_REQUIRED.
+     * requires and length-checks the idempotency key before sending, so a correct
+     * integration never sees IDEMPOTENCY_KEY_REQUIRED.
      */
     public const VALIDATION_ERROR_CODES = [
         'IDEMPOTENCY_KEY_REQUIRED',
@@ -185,6 +245,27 @@ class DominaiteClient
         'UPSTREAM_CONTRACT_ERROR',
         'MERCHANT_API_UNAVAILABLE',
     ];
+
+    /**
+     * Minor-unit exponents for toMinorUnits(), as the GATEWAY counts them, which is what
+     * the amount you send is read against. That is ISO 4217 except HUF: the gateway
+     * treats forints as whole units (0 decimals, the filler was withdrawn in 1999), so
+     * "2 for HUF" would be a 100x overcharge. An unlisted currency throws instead of
+     * guessing 2, because a wrong guess is a 10x or 100x charge.
+     */
+    private const MINOR_UNIT_EXPONENTS = [
+        'EUR' => 2, 'USD' => 2, 'GBP' => 2, 'CAD' => 2, 'AUD' => 2, 'CHF' => 2, 'BGN' => 2,
+        'RON' => 2, 'PLN' => 2, 'CZK' => 2, 'SEK' => 2, 'DKK' => 2, 'NOK' => 2,
+        'JPY' => 0, 'HUF' => 0,
+        'BHD' => 3, 'KWD' => 3,
+    ];
+
+    /**
+     * Currencies where ISO 4217 and the gateway disagree on the exponent (the gateway has
+     * no entry and falls back to 2). Converting them either way risks a silent 10x or 100x
+     * error, so toMinorUnits() refuses them outright.
+     */
+    private const UNSUPPORTED_MINOR_UNIT_CURRENCIES = ['ISK', 'KRW', 'OMR', 'JOD', 'TND'];
 
     /**
      * The statuses that keep their generic exception on every route: validation (400),
@@ -331,25 +412,29 @@ class DominaiteClient
      * Creates a hosted checkout session for one payment.
      *
      * Required params: amount (int, MINOR units - cents), currency (ISO 4217),
-     * orderReference (your order id, <= 100 chars).
+     * orderReference (your order id, <= 100 chars), idempotencyKey (1-100 visible
+     * ASCII chars; build it with orderIdempotencyKey() so the same order at the same
+     * amount always sends the same key - retrying with it never creates a second payment).
+     * A missing key throws InvalidArgumentException before anything is sent.
      * Optional: customer{firstName,lastName,email,phone}, country (ISO 3166-1 alpha-2),
      * language (ISO 639-1), theme ('light'|'dark'|'bright'), description,
      * saveCard (bool - keep the card on file once this payment is approved, so you can
      * charge it again with chargePaymentMethod(); the stored method shows up as
-     * storedPaymentMethod on getStatus(), and the card details never reach you),
-     * idempotencyKey (auto-generated when omitted - retrying with the same key never
-     * creates a second payment; read the generated one back with getLastIdempotencyKey()).
+     * storedPaymentMethod on getStatus(), and the card details never reach you).
      *
-     * Retrying a key the gateway already saw does NOT return the original session: it
-     * answers HTTP 200 with success=false and a replay code, which arrives here as a
-     * CheckoutRefusedException. The first session's cashierKey/cashierToken are not in
-     * that response - reconcile via the refusal's transaction id and getStatus().
+     * Re-sending a key the gateway already saw, with the same amount and currency, returns
+     * the ORIGINAL session while it is still open and unexpired: same transactionId, same
+     * cashierKey/cashierToken. That is what makes a reload or a retried timeout safe. Any
+     * other replay answers HTTP 200 with success=false and a replay code, which arrives
+     * here as a CheckoutRefusedException naming the transaction to reconcile with
+     * getStatus().
      *
      * @param array<string,mixed> $params
      * @return array{transactionId:string,orderId:string,cashierKey:string,cashierToken:string,amount:int,currency:string,expiresAt:string}
      *
      * @throws AuthenticationException Wrong/revoked credentials or bad signature (fix config; do not retry).
      * @throws CheckoutRefusedException The gateway refused the session (inspect getErrorCode()).
+     * @throws StorefrontException     The storefront cannot take payments (STOREFRONT_ERROR_CODES, HTTP 409 or 400).
      * @throws ApiException            Unexpected API response.
      * @throws RateLimitException     HTTP 429 - you are over the rate limit; back off (getRetryAfterSeconds()).
      * @throws TransportException      Network-level failure (retry WITH the same idempotencyKey - getLastIdempotencyKey()).
@@ -371,9 +456,8 @@ class DominaiteClient
         unset($params['idempotencyKey']);
 
         // Recorded BEFORE the call so a caller who catches TransportException can read the
-        // key the timed-out attempt used and retry with it. A generated key that only ever
-        // existed inside this method would leave a retry no choice but a fresh key, and a
-        // fresh key is a second real payment for the same order.
+        // key the timed-out attempt used and retry with it; a fresh key is a second real
+        // payment for the same order.
         $this->lastIdempotencyKey = $idempotencyKey;
 
         $response = $this->request('POST', self::SESSIONS_PATH, $params, $idempotencyKey);
@@ -397,11 +481,11 @@ class DominaiteClient
 
     /**
      * The idempotency key the last createCheckoutSession() or chargePaymentMethod() call
-     * sent, generated or yours.
+     * sent. Always the one you passed: the SDK no longer generates keys.
      *
-     * Read it in your catch block. On a timeout you cannot know whether the gateway
-     * created the session, and retrying with a NEW key charges the order twice - retry
-     * with this one, or hand it to getStatus() reconciliation later:
+     * Handy in a generic catch block that did not keep the params around. On a timeout
+     * you cannot know whether the gateway created the session, and retrying with a NEW key
+     * charges the order twice - retry with this one:
      *
      *   try {
      *       $session = $client->createCheckoutSession($params);
@@ -480,16 +564,40 @@ class DominaiteClient
     }
 
     /**
+     * True only for 'succeeded', the one status that means the payment is complete.
+     * requires_capture (funds held), processing and anything unknown are not paid.
+     *
+     *   if (DominaiteClient::isPaid($status['status'])) { fulfil($order); }
+     */
+    public static function isPaid(string $status): bool
+    {
+        return $status === 'succeeded';
+    }
+
+    /**
+     * True when the status will not change on its own, so polling can stop: succeeded,
+     * failed, cancelled, abandoned, refunded, partially_refunded (TERMINAL_STATUSES).
+     * pending, processing, requires_capture, disputed and any value this SDK does not
+     * know are not terminal: keep polling rather than close an order that is still live.
+     */
+    public static function isTerminal(string $status): bool
+    {
+        return in_array($status, self::TERMINAL_STATUSES, true);
+    }
+
+    /**
      * Charges a card kept on file, off-session: no widget, no payer present.
      *
      * $paymentMethodId is storedPaymentMethod['id'] from getStatus() of a session you
      * created with saveCard. The charge is signed like a session and carries an
-     * Idempotency-Key (auto-generated unless you pass one; read it back with
-     * getLastIdempotencyKey()), so retrying after a timeout WITH THE SAME KEY never
-     * charges the card twice: the gateway replays its first answer, HTTP status included.
+     * Idempotency-Key, so retrying after a timeout WITH THE SAME KEY never charges the
+     * card twice: the gateway replays its first answer, HTTP status included. Derive the
+     * key from what you are billing (orderIdempotencyKey('renewal', $periodId, ...)), never
+     * a random value per attempt.
      *
      * Required params: amount (int, MINOR units), currency (ISO 4217), orderReference
-     * (<= 100 chars). Optional: description, idempotencyKey.
+     * (<= 100 chars), idempotencyKey (a missing key throws InvalidArgumentException before
+     * anything is sent). Optional: description.
      *
      * The HTTP status is the contract on this route. 201 (200 on a replay) returns the
      * charge, status 'succeeded', 'pending' or 'cancelled'. 402 returns the charge too:
@@ -627,19 +735,144 @@ class DominaiteClient
     }
 
     /**
-     * Mints a key when none was given and bounds the one that was.
+     * The idempotency key for one order at one price: "{scope}-{orderId}-{amountMinor}-{CURRENCY}".
+     *
+     * Pass the result as idempotencyKey to createCheckoutSession() (or chargePaymentMethod()).
+     * Deriving the key from the order instead of minting a random one per request is what
+     * makes a reload, a back button or a retried request safe: the same order at the same
+     * amount always sends the same key, so the gateway replays the session it already
+     * opened instead of opening a second payment. A changed amount or currency is a
+     * different payment and gets a different key, because the gateway refuses a known key
+     * with a different body (IDEMPOTENCY_KEY_REUSED).
+     *
+     *   $key = DominaiteClient::orderIdempotencyKey('shop', 'order-1042', 2500, 'eur');
+     *   // "shop-order-1042-2500-EUR"
+     *
+     * $scope names the flow the key belongs to ('checkout', 'renewal', ...) so two flows
+     * for the same order never share a key. Keep it a fixed string per flow.
+     *
+     * @param string $scope       A fixed label for the flow, e.g. 'checkout'.
+     * @param string $orderId     Your order id.
+     * @param int    $amountMinor The amount you send, in MINOR units.
+     * @param string $currency    ISO 4217 code; uppercased here.
+     *
+     * @throws \InvalidArgumentException An empty part, a non-positive amount, a currency that is not
+     *                                   three letters, or a result the key rules refuse (over 100
+     *                                   characters, or anything but visible ASCII 0x21-0x7E).
+     */
+    public static function orderIdempotencyKey(string $scope, string $orderId, int $amountMinor, string $currency): string
+    {
+        if ($scope === '' || $orderId === '') {
+            throw new \InvalidArgumentException('scope and orderId must not be empty');
+        }
+        if ($amountMinor <= 0) {
+            throw new \InvalidArgumentException('amountMinor must be a positive integer in MINOR units');
+        }
+        $currency = strtoupper($currency);
+        if (preg_match('/^[A-Z]{3}\z/', $currency) !== 1) {
+            throw new \InvalidArgumentException('currency must be a three-letter ISO 4217 code');
+        }
+
+        return self::normalizeIdempotencyKey($scope . '-' . $orderId . '-' . $amountMinor . '-' . $currency);
+    }
+
+    /**
+     * Converts a decimal amount string to integer MINOR units, by the currency's exponent
+     * as the gateway counts it: toMinorUnits('0.30', 'EUR') is 30, toMinorUnits('1000',
+     * 'JPY') is 1000, toMinorUnits('5000', 'HUF') is 5000, toMinorUnits('1.250', 'KWD')
+     * is 1250.
+     *
+     * Takes a string on purpose. A float cannot hold 0.30 exactly, and (int) (0.3 * 100)
+     * is 29, so the parsing here is plain digit handling with no float or bcmath step.
+     * Accepted: digits, optionally a dot and at most as many fractional digits as the
+     * currency has ("25", "25.5", "25.50" for EUR). Refused with InvalidArgumentException:
+     * more fractional digits than the currency allows, even zeros ("25.000" EUR, "100.0"
+     * JPY), a sign, whitespace, thousands separators, a comma as the decimal mark,
+     * exponents, an amount past PHP_INT_MAX, and a currency not in the list below. Zero
+     * converts to 0; the API itself still requires a positive amount.
+     *
+     * Exponent 2: EUR USD GBP CAD AUD CHF BGN RON PLN CZK SEK DKK NOK. Exponent 0: JPY and
+     * HUF (whole forints, unlike ISO 4217). Exponent 3: BHD KWD. ISK, KRW, OMR, JOD and TND
+     * throw as not supported: ISO and the gateway disagree on them.
+     *
+     * @param string $amount   Decimal amount in MAJOR units, e.g. "25.00".
+     * @param string $currency ISO 4217 code, any case.
+     *
+     * @throws \InvalidArgumentException Malformed amount, too many decimals, or an unknown currency.
+     */
+    public static function toMinorUnits(string $amount, string $currency): int
+    {
+        $exponent = self::minorUnitExponent($currency);
+        if (preg_match('/^([0-9]+)(?:\.([0-9]+))?\z/', $amount, $parts) !== 1) {
+            throw new \InvalidArgumentException('amount must be a plain decimal string like "25.00" (digits and at most one dot)');
+        }
+        $fraction = $parts[2] ?? '';
+        if (strlen($fraction) > $exponent) {
+            throw new \InvalidArgumentException(
+                strtoupper($currency) . " has {$exponent} decimal place(s); \"{$amount}\" has " . strlen($fraction)
+            );
+        }
+
+        $digits = ltrim($parts[1] . str_pad($fraction, $exponent, '0'), '0');
+        if ($digits === '') {
+            return 0;
+        }
+        $max = (string) PHP_INT_MAX;
+        if (strlen($digits) > strlen($max) || (strlen($digits) === strlen($max) && strcmp($digits, $max) > 0)) {
+            throw new \InvalidArgumentException('amount is too large to represent in minor units');
+        }
+
+        return (int) $digits;
+    }
+
+    /**
+     * The minor-unit exponent toMinorUnits() uses: 2 for EUR, 0 for JPY and HUF, 3 for KWD.
+     *
+     * @throws \InvalidArgumentException A currency this SDK does not list, or one of the
+     *                                   unsupported ISK, KRW, OMR, JOD, TND.
+     */
+    public static function minorUnitExponent(string $currency): int
+    {
+        $code = strtoupper($currency);
+        if (in_array($code, self::UNSUPPORTED_MINOR_UNIT_CURRENCIES, true)) {
+            throw new \InvalidArgumentException(
+                "{$code} is not supported: ISO 4217 and the gateway disagree on its decimals, convert it yourself"
+            );
+        }
+        if (!isset(self::MINOR_UNIT_EXPONENTS[$code])) {
+            throw new \InvalidArgumentException(
+                "Unknown currency \"{$currency}\": convert to minor units yourself, or ask for it to be added"
+            );
+        }
+
+        return self::MINOR_UNIT_EXPONENTS[$code];
+    }
+
+    /**
+     * Requires a key and bounds it. There is no generated fallback: a random key per call
+     * turns every reload or retry that forgot to reuse it into a second payment.
      *
      * @param mixed $idempotencyKey
      */
     private static function normalizeIdempotencyKey($idempotencyKey): string
     {
         if ($idempotencyKey === null) {
-            $idempotencyKey = bin2hex(random_bytes(16));
+            throw new \InvalidArgumentException(
+                'idempotencyKey is required; derive it from your order with DominaiteClient::orderIdempotencyKey()'
+            );
         }
         if (!is_string($idempotencyKey) || $idempotencyKey === '' || self::codePoints($idempotencyKey) > 100) {
             throw new \InvalidArgumentException('idempotencyKey must be a non-empty string of at most 100 characters');
         }
-        self::assertHeaderSafe('idempotencyKey', $idempotencyKey);
+        // Visible ASCII only (0x21-0x7E), stricter than the header rule: a space is legal in
+        // a header, but proxies and servers trim leading and trailing ones, and the key is
+        // inside the signature, so a trimmed key fails as a bad signature nobody can explain.
+        // One rule in every Dominaite SDK, so a key built in one language works in all.
+        if (preg_match('/^[\x21-\x7E]+\z/', $idempotencyKey) !== 1) {
+            throw new \InvalidArgumentException(
+                'idempotencyKey must contain only visible ASCII characters (0x21-0x7E): no spaces, control characters or non-ASCII'
+            );
+        }
 
         return $idempotencyKey;
     }
@@ -968,7 +1201,8 @@ class DominaiteClient
      * The generic reading of a failed reply: 5xx is the API being unavailable, 4xx a
      * rejection. The machine-readable code rides along when the API sent one: a
      * validation rejection like IDEMPOTENCY_KEY_REQUIRED is only actionable if the
-     * caller can branch on it.
+     * caller can branch on it. A storefront code gets its own ApiException subclass,
+     * because it is an onboarding state to act on, not a bad request to debug.
      *
      * @param array{status:int,envelope:array<string,mixed>,payload:array<string,mixed>,error:array<string,mixed>} $reply
      */
@@ -978,12 +1212,14 @@ class DominaiteClient
             return self::unavailable($reply['status']);
         }
         $errorCode = $reply['payload']['errorCode'] ?? $reply['error']['code'] ?? null;
+        $errorCode = is_string($errorCode) && $errorCode !== '' ? $errorCode : null;
+        $message = (string) ($reply['payload']['errorMessage'] ?? $reply['error']['message'] ?? 'Request rejected');
 
-        return new ApiException(
-            $reply['status'],
-            (string) ($reply['payload']['errorMessage'] ?? $reply['error']['message'] ?? 'Request rejected'),
-            is_string($errorCode) && $errorCode !== '' ? $errorCode : null
-        );
+        if ($errorCode !== null && in_array($errorCode, self::STOREFRONT_ERROR_CODES, true)) {
+            return new StorefrontException($reply['status'], $message, $errorCode);
+        }
+
+        return new ApiException($reply['status'], $message, $errorCode);
     }
 
     private static function unavailable(int $status): TransportException

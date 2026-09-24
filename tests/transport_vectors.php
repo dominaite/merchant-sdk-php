@@ -16,11 +16,13 @@ require __DIR__ . '/../src/Exception/ApiException.php';
 require __DIR__ . '/../src/Exception/AuthenticationException.php';
 require __DIR__ . '/../src/Exception/CheckoutRefusedException.php';
 require __DIR__ . '/../src/Exception/RateLimitException.php';
+require __DIR__ . '/../src/Exception/StorefrontException.php';
 require __DIR__ . '/../src/Exception/TransportException.php';
 
 use Dominaite\DominaiteClient;
 use Dominaite\Exception\ApiException;
 use Dominaite\Exception\RateLimitException;
+use Dominaite\Exception\StorefrontException;
 use Dominaite\Exception\TransportException;
 
 $failures = 0;
@@ -238,5 +240,29 @@ try {
 }
 check('an unknown payment method is an ApiException', $missing === null ? 'no exception' : get_class($missing), ApiException::class);
 check('the unknown payment method keeps its 404', (string) ($missing === null ? 0 : $missing->getHttpStatus()), '404');
+
+// --- storefront refusals on the wire ---------------------------------------------------
+// A mint for a storefront the provider has not whitelisted answers 409 with the code in
+// the error envelope. Through real curl it must reach the caller as the typed exception
+// with the code readable, not as a generic 4xx.
+$refused = null;
+try {
+    $client->createCheckoutSession([
+        'amount' => 2500, 'currency' => 'EUR', 'orderReference' => 'order-1042',
+        'idempotencyKey' => DominaiteClient::orderIdempotencyKey('checkout', 'order-1042', 2500, 'EUR'),
+    ]);
+} catch (StorefrontException $e) {
+    $refused = $e;
+} catch (\Throwable $e) {
+    $refused = $e;
+}
+check('a live 409 STOREFRONT_NOT_WHITELISTED is a StorefrontException',
+    $refused === null ? 'no exception' : get_class($refused), StorefrontException::class);
+check('the live storefront refusal carries its code',
+    $refused instanceof ApiException ? (string) $refused->getErrorCode() : '', DominaiteClient::STOREFRONT_NOT_WHITELISTED);
+check('the live storefront refusal carries its 409',
+    $refused instanceof ApiException ? (string) $refused->getHttpStatus() : '', '409');
+check('the key of the refused create is still readable',
+    (string) $client->getLastIdempotencyKey(), 'checkout-order-1042-2500-EUR');
 
 exit($failures === 0 ? 0 : 1);

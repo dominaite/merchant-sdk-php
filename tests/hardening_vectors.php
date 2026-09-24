@@ -16,11 +16,13 @@ require __DIR__ . '/../src/Exception/ApiException.php';
 require __DIR__ . '/../src/Exception/AuthenticationException.php';
 require __DIR__ . '/../src/Exception/CheckoutRefusedException.php';
 require __DIR__ . '/../src/Exception/RateLimitException.php';
+require __DIR__ . '/../src/Exception/StorefrontException.php';
 require __DIR__ . '/../src/Exception/TransportException.php';
 
 use Dominaite\DominaiteClient;
 use Dominaite\Exception\ApiException;
 use Dominaite\Exception\RateLimitException;
+use Dominaite\Exception\StorefrontException;
 use Dominaite\Exception\TransportException;
 
 $failures = 0;
@@ -204,6 +206,42 @@ foreach ($accepted as $label => $url) {
 check('default baseUrl is accepted',
     thrownBy(static function (): void { new DominaiteClient(KEY_ID, SECRET); }), 'no exception');
 
+// --- Storefront refusals are a typed exception with the code on it ---------------------
+// The gateway refuses a mint for a storefront that is not whitelisted (409), inactive
+// (409) or not the one the key is bound to (400). Those are onboarding states the
+// merchant acts on, so they must be catchable by type and carry the code.
+$storefrontCases = [
+    [409, DominaiteClient::STOREFRONT_NOT_WHITELISTED, "This storefront's domain is not yet whitelisted with the payment provider"],
+    [409, DominaiteClient::STOREFRONT_INACTIVE, 'This storefront is inactive'],
+    [400, DominaiteClient::STOREFRONT_MISMATCH, 'This API key is bound to a different storefront than the request names.'],
+];
+foreach ($storefrontCases as [$status, $code, $message]) {
+    $body = json_encode(['success' => false, 'data' => null,
+        'error' => ['code' => $code, 'message' => $message, 'statusCode' => $status]]);
+    $thrown = null;
+    try {
+        $responseClient->handle($status, (string) $body);
+    } catch (\Throwable $e) {
+        $thrown = $e;
+    }
+    check("$status $code is a StorefrontException", $thrown === null ? 'no exception' : get_class($thrown), StorefrontException::class);
+    check("$status $code is still an ApiException for existing catch blocks",
+        $thrown instanceof ApiException ? 'ApiException' : 'not', 'ApiException');
+    check("$status $code carries its code", $thrown instanceof ApiException ? (string) $thrown->getErrorCode() : '', $code);
+    check("$status $code carries its status", $thrown instanceof ApiException ? (string) $thrown->getHttpStatus() : '', (string) $status);
+    check("$status $code carries the gateway message", $thrown === null ? '' : $thrown->getMessage(), $message);
+}
+check('a 409 with another code stays a plain ApiException',
+    thrownBy(static function () use ($responseClient): void {
+        $responseClient->handle(409, '{"success":false,"error":{"code":"CONFLICT","message":"x"}}');
+    }),
+    ApiException::class);
+check('a 5xx carrying a storefront code stays the retryable transport error',
+    thrownBy(static function () use ($responseClient): void {
+        $responseClient->handle(503, '{"success":false,"error":{"code":"STOREFRONT_INACTIVE"}}');
+    }),
+    TransportException::class);
+
 // --- A12: length limits count characters, not bytes -------------------------------------
 // 100 Cyrillic characters are 200 bytes in UTF-8. A byte-counting check rejects an
 // orderReference the API accepts, and the merchant cannot tell why.
@@ -216,6 +254,7 @@ check('100-character Cyrillic orderReference is accepted',
     thrownBy(static function () use ($unicodeClient, $cyrillic): void {
         $unicodeClient->createCheckoutSession([
             'amount' => 8440, 'currency' => 'EUR', 'orderReference' => $cyrillic,
+            'idempotencyKey' => 'order-1042',
         ]);
     }),
     'no exception');
@@ -226,6 +265,7 @@ check('101-character orderReference is rejected',
     thrownBy(static function () use ($cyrillic): void {
         (new RecordingClient(KEY_ID, SECRET))->createCheckoutSession([
             'amount' => 8440, 'currency' => 'EUR', 'orderReference' => $cyrillic . 'д',
+            'idempotencyKey' => 'order-1042',
         ]);
     }),
     'InvalidArgumentException');
@@ -233,6 +273,7 @@ check('empty orderReference is rejected',
     thrownBy(static function (): void {
         (new RecordingClient(KEY_ID, SECRET))->createCheckoutSession([
             'amount' => 8440, 'currency' => 'EUR', 'orderReference' => '',
+            'idempotencyKey' => 'order-1042',
         ]);
     }),
     'InvalidArgumentException');
