@@ -66,6 +66,45 @@ check(
 
 check('validation responses are HTTP 400', (string) $wire['validationHttpStatus'], '400');
 
+// Every code the SDK names as a constant is spelled exactly as the gateway sends it.
+$named = [
+    'PAYMENT_PROCESSING_UNAVAILABLE' => DominaiteClient::PAYMENT_PROCESSING_UNAVAILABLE,
+    'DUPLICATE_REQUEST' => DominaiteClient::DUPLICATE_REQUEST,
+    'ALREADY_PROCESSED' => DominaiteClient::ALREADY_PROCESSED,
+    'IDEMPOTENCY_KEY_REUSED' => DominaiteClient::IDEMPOTENCY_KEY_REUSED,
+    'PRIOR_ATTEMPT_FAILED' => DominaiteClient::PRIOR_ATTEMPT_FAILED,
+    'STOREFRONT_NOT_WHITELISTED' => DominaiteClient::STOREFRONT_NOT_WHITELISTED,
+    'STOREFRONT_INACTIVE' => DominaiteClient::STOREFRONT_INACTIVE,
+    'STOREFRONT_MISMATCH' => DominaiteClient::STOREFRONT_MISMATCH,
+];
+foreach ($named as $name => $value) {
+    check("constant $name carries its own wire spelling", $value, $name);
+}
+check('the refusal list is built from the named constants',
+    sortedJson(DominaiteClient::REFUSAL_ERROR_CODES),
+    sortedJson(array_slice(array_values($named), 0, 5)));
+check('the storefront list is exactly the storefront constants',
+    sortedJson(DominaiteClient::STOREFRONT_ERROR_CODES),
+    sortedJson(array_slice(array_values($named), 5)));
+check('storefront codes are not HTTP 200 refusals',
+    json_encode(array_values(array_intersect(DominaiteClient::STOREFRONT_ERROR_CODES, DominaiteClient::REFUSAL_ERROR_CODES))), '[]');
+
+// The storefront codes are not in the published contract yet. Once the gateway lists
+// them, their HTTP status has to be the one the SDK documents.
+$storefrontStatus = [
+    'STOREFRONT_NOT_WHITELISTED' => 409,
+    'STOREFRONT_INACTIVE' => 409,
+    'STOREFRONT_MISMATCH' => 400,
+];
+foreach ($wire['errorCodes'] as $group) {
+    foreach ($group as $entry) {
+        if (isset($storefrontStatus[$entry['code']])) {
+            check("the contract's {$entry['code']} status matches the SDK",
+                (string) $entry['httpStatus'], (string) $storefrontStatus[$entry['code']]);
+        }
+    }
+}
+
 check('the contract still lists this SDK', in_array('php', $wire['sdks'], true) ? 'listed' : 'missing', 'listed');
 
 if ($failures > 0) {

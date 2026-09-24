@@ -10,6 +10,7 @@ use Dominaite\Exception\ChargeException;
 use Dominaite\Exception\CheckoutRefusedException;
 use Dominaite\Exception\RateLimitException;
 use Dominaite\Exception\RevokeException;
+use Dominaite\Exception\StorefrontException;
 use Dominaite\Exception\TransportException;
 
 /**
@@ -97,17 +98,61 @@ class DominaiteClient
         'abandoned',
     ];
 
+    /** Card payments are off right now; retry later with the same key. HTTP 200 refusal on a session, 503 on a charge. */
+    public const PAYMENT_PROCESSING_UNAVAILABLE = 'PAYMENT_PROCESSING_UNAVAILABLE';
+
+    /** A request with this idempotency key is still in flight or its session is open; retry the SAME key shortly. */
+    public const DUPLICATE_REQUEST = 'DUPLICATE_REQUEST';
+
+    /** The payment for this idempotency key has already been taken; reconcile, do not charge again. */
+    public const ALREADY_PROCESSED = 'ALREADY_PROCESSED';
+
+    /** This idempotency key was used with a different amount, currency or card-saving choice; a bug on your side. */
+    public const IDEMPOTENCY_KEY_REUSED = 'IDEMPOTENCY_KEY_REUSED';
+
+    /** The attempt under this idempotency key ended without payment; the key is spent, reconcile and use a new one. */
+    public const PRIOR_ATTEMPT_FAILED = 'PRIOR_ATTEMPT_FAILED';
+
+    /**
+     * HTTP 409: the storefront's domain is not yet whitelisted with the payment provider,
+     * and this environment requires it. Not retryable until onboarding finishes the
+     * whitelisting; contact Dominaite with the storefront's domain.
+     */
+    public const STOREFRONT_NOT_WHITELISTED = 'STOREFRONT_NOT_WHITELISTED';
+
+    /** HTTP 409: the storefront (online location) was deactivated or deleted. Not retryable. */
+    public const STOREFRONT_INACTIVE = 'STOREFRONT_INACTIVE';
+
+    /**
+     * HTTP 400: the API key is bound to one storefront and the request named another. A
+     * configuration bug: use the key issued for that storefront. On a replay of a key
+     * first used for a different storefront it arrives as an HTTP 200 refusal instead.
+     */
+    public const STOREFRONT_MISMATCH = 'STOREFRONT_MISMATCH';
+
     /**
      * Every errorCode a refused createCheckoutSession() can carry, as pinned by the
      * canonical contract fixture. These arrive as HTTP 200 with success=false and reach
      * the caller as a CheckoutRefusedException - branch on getErrorCode().
      */
     public const REFUSAL_ERROR_CODES = [
-        'PAYMENT_PROCESSING_UNAVAILABLE',
-        'DUPLICATE_REQUEST',
-        'ALREADY_PROCESSED',
-        'IDEMPOTENCY_KEY_REUSED',
-        'PRIOR_ATTEMPT_FAILED',
+        self::PAYMENT_PROCESSING_UNAVAILABLE,
+        self::DUPLICATE_REQUEST,
+        self::ALREADY_PROCESSED,
+        self::IDEMPOTENCY_KEY_REUSED,
+        self::PRIOR_ATTEMPT_FAILED,
+    ];
+
+    /**
+     * The storefront refusals at session mint: 409 STOREFRONT_NOT_WHITELISTED, 409
+     * STOREFRONT_INACTIVE, 400 STOREFRONT_MISMATCH. A 4xx carrying one of these raises
+     * StorefrontException (an ApiException), so getErrorCode() and getHttpStatus() are
+     * there to branch on. None of them is fixed by retrying the same request.
+     */
+    public const STOREFRONT_ERROR_CODES = [
+        self::STOREFRONT_NOT_WHITELISTED,
+        self::STOREFRONT_INACTIVE,
+        self::STOREFRONT_MISMATCH,
     ];
 
     /**
@@ -354,6 +399,7 @@ class DominaiteClient
      *
      * @throws AuthenticationException Wrong/revoked credentials or bad signature (fix config; do not retry).
      * @throws CheckoutRefusedException The gateway refused the session (inspect getErrorCode()).
+     * @throws StorefrontException     The storefront cannot take payments (STOREFRONT_ERROR_CODES, HTTP 409 or 400).
      * @throws ApiException            Unexpected API response.
      * @throws RateLimitException     HTTP 429 - you are over the rate limit; back off (getRetryAfterSeconds()).
      * @throws TransportException      Network-level failure (retry WITH the same idempotencyKey - getLastIdempotencyKey()).
@@ -1018,7 +1064,8 @@ class DominaiteClient
      * The generic reading of a failed reply: 5xx is the API being unavailable, 4xx a
      * rejection. The machine-readable code rides along when the API sent one: a
      * validation rejection like IDEMPOTENCY_KEY_REQUIRED is only actionable if the
-     * caller can branch on it.
+     * caller can branch on it. A storefront code gets its own ApiException subclass,
+     * because it is an onboarding state to act on, not a bad request to debug.
      *
      * @param array{status:int,envelope:array<string,mixed>,payload:array<string,mixed>,error:array<string,mixed>} $reply
      */
@@ -1028,12 +1075,14 @@ class DominaiteClient
             return self::unavailable($reply['status']);
         }
         $errorCode = $reply['payload']['errorCode'] ?? $reply['error']['code'] ?? null;
+        $errorCode = is_string($errorCode) && $errorCode !== '' ? $errorCode : null;
+        $message = (string) ($reply['payload']['errorMessage'] ?? $reply['error']['message'] ?? 'Request rejected');
 
-        return new ApiException(
-            $reply['status'],
-            (string) ($reply['payload']['errorMessage'] ?? $reply['error']['message'] ?? 'Request rejected'),
-            is_string($errorCode) && $errorCode !== '' ? $errorCode : null
-        );
+        if ($errorCode !== null && in_array($errorCode, self::STOREFRONT_ERROR_CODES, true)) {
+            return new StorefrontException($reply['status'], $message, $errorCode);
+        }
+
+        return new ApiException($reply['status'], $message, $errorCode);
     }
 
     private static function unavailable(int $status): TransportException

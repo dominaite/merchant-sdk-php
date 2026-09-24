@@ -89,6 +89,7 @@ require __DIR__ . '/vendor/autoload.php';
 use Dominaite\DominaiteClient;
 use Dominaite\Exception\CheckoutRefusedException;
 use Dominaite\Exception\RateLimitException;
+use Dominaite\Exception\StorefrontException;
 use Dominaite\Exception\TransportException;
 
 $client = new DominaiteClient(getenv('DOMINAITE_KEY_ID'), getenv('DOMINAITE_SECRET'));
@@ -117,6 +118,11 @@ try {
     // Machine-readable: $e->getErrorCode() - see the exception docblock for the codes.
     http_response_code(409);
     exit('Payment unavailable: ' . $e->getErrorCode());
+} catch (StorefrontException $e) {
+    // This website cannot take payments yet (or any more). Not retryable - see below.
+    error_log('Dominaite storefront refusal: ' . $e->getErrorCode());
+    http_response_code(503);
+    exit('Online payments are not available on this site yet');
 } catch (RateLimitException $e) {
     // You are over the rate limit. Nothing is retried for you - back off first.
     http_response_code(503);
@@ -140,6 +146,22 @@ try {
 100 character Cyrillic or Greek reference is 200 bytes and is fine. Emoji and rarer CJK
 characters count double on the server, so stay a couple of characters clear of the limit if
 your references contain them; the server has the final say either way.
+
+### Storefront errors
+
+If your merchant account has more than one website, each one is a storefront, and a
+session is refused when its storefront cannot take payments. These come back as HTTP 4xx
+and the SDK raises `StorefrontException` (an `ApiException`, so older catch blocks still see
+it). Branch on `getErrorCode()`, using the constants on `DominaiteClient`:
+
+| Code | HTTP | Meaning | What to do |
+|------|------|---------|------------|
+| `STOREFRONT_NOT_WHITELISTED` | 409 | The site's domain is not yet whitelisted with the payment provider. | Nothing to retry. Ask Dominaite to finish onboarding the domain. |
+| `STOREFRONT_INACTIVE` | 409 | The storefront was deactivated or deleted. | Nothing to retry. Check the location in your dashboard. |
+| `STOREFRONT_MISMATCH` | 400 | The API key belongs to another storefront than the request names. | Use the key issued for this site. |
+
+Replaying a key that was first used for a different storefront answers `STOREFRONT_MISMATCH`
+as an HTTP 200 refusal, so that one case arrives as `CheckoutRefusedException`.
 
 That's the checkout half: the session call above, the script tag, and your domain bound to
 your checkout by Dominaite during onboarding. The other half is the webhook that tells you
