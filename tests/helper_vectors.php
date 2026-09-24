@@ -1,6 +1,6 @@
 <?php
 // Dependency-free tests for the static helpers integrators build on: minor-unit
-// conversion and the status predicates.
+// conversion and the status predicates (isPaid, isTerminal).
 // Run: php tests/helper_vectors.php - exits non-zero on any mismatch.
 //
 // Why this file exists: amounts cross the wire as integer minor units, and a wrong
@@ -105,6 +105,35 @@ $refusals = [
 foreach ($refusals as $label => [$amount, $currency]) {
     check("toMinorUnits refuses $label", minor($amount, $currency), 'rejected');
 }
+
+// --- isPaid / isTerminal ----------------------------------------------------------------
+// The whole vocabulary, one row each, so a status added to STATUS_VOCABULARY without a
+// decision here fails the count check below.
+$verdicts = [
+    'pending' => ['paid' => false, 'terminal' => false],
+    'processing' => ['paid' => false, 'terminal' => false],
+    'succeeded' => ['paid' => true, 'terminal' => true],
+    'failed' => ['paid' => false, 'terminal' => true],
+    'refunded' => ['paid' => false, 'terminal' => true],
+    'partially_refunded' => ['paid' => false, 'terminal' => true],
+    'cancelled' => ['paid' => false, 'terminal' => true],
+    'disputed' => ['paid' => false, 'terminal' => false],
+    'requires_capture' => ['paid' => false, 'terminal' => false],
+    'abandoned' => ['paid' => false, 'terminal' => true],
+];
+check('every status in the vocabulary has a verdict here',
+    json_encode(array_keys($verdicts)), json_encode(DominaiteClient::STATUS_VOCABULARY));
+foreach ($verdicts as $status => $verdict) {
+    check("isPaid($status)", var_export(DominaiteClient::isPaid($status), true), var_export($verdict['paid'], true));
+    check("isTerminal($status)", var_export(DominaiteClient::isTerminal($status), true), var_export($verdict['terminal'], true));
+}
+foreach (['chargeback_pending', '', 'SUCCEEDED', ' succeeded'] as $unknown) {
+    $label = var_export($unknown, true);
+    check("an unknown status $label is not paid", var_export(DominaiteClient::isPaid($unknown), true), 'false');
+    check("an unknown status $label is not terminal", var_export(DominaiteClient::isTerminal($unknown), true), 'false');
+}
+check('every terminal status is in the vocabulary',
+    json_encode(array_values(array_diff(DominaiteClient::TERMINAL_STATUSES, DominaiteClient::STATUS_VOCABULARY))), '[]');
 
 if ($failures > 0) {
     echo "\n$failures helper check(s) failed\n";

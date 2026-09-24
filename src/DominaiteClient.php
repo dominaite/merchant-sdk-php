@@ -98,6 +98,20 @@ class DominaiteClient
         'abandoned',
     ];
 
+    /**
+     * The statuses after which a payment does not move on its own: stop polling. Only
+     * succeeded means money in hand (isPaid()). disputed is left out on purpose: a dispute
+     * resolves one way or the other. Unknown values are not terminal, see getStatus().
+     */
+    public const TERMINAL_STATUSES = [
+        'succeeded',
+        'failed',
+        'cancelled',
+        'abandoned',
+        'refunded',
+        'partially_refunded',
+    ];
+
     /** Card payments are off right now; retry later with the same key. HTTP 200 refusal on a session, 503 on a charge. */
     public const PAYMENT_PROCESSING_UNAVAILABLE = 'PAYMENT_PROCESSING_UNAVAILABLE';
 
@@ -539,6 +553,28 @@ class DominaiteClient
         }
 
         return $status;
+    }
+
+    /**
+     * True only for 'succeeded', the one status that means the payment is complete.
+     * requires_capture (funds held), processing and anything unknown are not paid.
+     *
+     *   if (DominaiteClient::isPaid($status['status'])) { fulfil($order); }
+     */
+    public static function isPaid(string $status): bool
+    {
+        return $status === 'succeeded';
+    }
+
+    /**
+     * True when the status will not change on its own, so polling can stop: succeeded,
+     * failed, cancelled, abandoned, refunded, partially_refunded (TERMINAL_STATUSES).
+     * pending, processing, requires_capture, disputed and any value this SDK does not
+     * know are not terminal: keep polling rather than close an order that is still live.
+     */
+    public static function isTerminal(string $status): bool
+    {
+        return in_array($status, self::TERMINAL_STATUSES, true);
     }
 
     /**

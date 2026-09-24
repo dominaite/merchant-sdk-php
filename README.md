@@ -511,6 +511,16 @@ awaiting capture. Never treat it as an abandoned order.
 Treat any status you do not recognise as still-open as well: a value the API adds later should
 make you keep polling, never silently close an order that is still live.
 
+Two helpers encode those rules so you do not have to:
+
+```php
+DominaiteClient::isPaid($status['status']);     // true only for 'succeeded'
+DominaiteClient::isTerminal($status['status']); // stop polling: succeeded, failed, cancelled,
+                                                // abandoned, refunded, partially_refunded
+```
+
+Everything else, `disputed` and unknown values included, is not terminal.
+
 Poll after the payer returns to you, or on your order timeout - not in a tight loop; the
 endpoint is rate limited per key.
 
