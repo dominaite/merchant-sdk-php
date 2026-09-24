@@ -45,7 +45,7 @@ class DominaiteClient
      */
     public const PAYMENT_METHODS_PATH = '/merchant-api/payment-methods';
     public const PING_PATH = '/merchant-api/ping';
-    private const USER_AGENT = 'dominaite-php/1.0.0 (php ' . PHP_VERSION . ')';
+    private const USER_AGENT = 'dominaite-php/0.3.0 (php ' . PHP_VERSION . ')';
     private const TIMEOUT_SECONDS = 15;
 
     /**
