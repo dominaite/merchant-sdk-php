@@ -266,9 +266,26 @@ it is not optional if you care about your books.
 
 ## Amounts are minor units
 
-`amount` is always an integer in the currency's minor unit: `2500` is 25.00 EUR, `1000` is
-10.00 JPY-equivalent in a two-decimal currency. The amount is locked server-side - what you
-pass here is what gets charged; nothing in the browser can change it.
+`amount` is always an integer in the currency's minor unit, which depends on the currency's
+ISO 4217 exponent. EUR has two decimals, so `2500` is 25.00 EUR. JPY has none, so `1000` is
+1000 JPY, not 10.00. KWD has three, so `1250` is 1.250 KWD. The amount is locked
+server-side - what you pass here is what gets charged; nothing in the browser can change it.
+
+If your shop stores prices as decimal strings, convert with `toMinorUnits()` rather than
+multiplying a float (`(int) (0.3 * 100)` is 29):
+
+```php
+DominaiteClient::toMinorUnits('0.30', 'EUR');   // 30
+DominaiteClient::toMinorUnits('1000', 'JPY');   // 1000
+DominaiteClient::toMinorUnits('1.250', 'KWD');  // 1250
+DominaiteClient::toMinorUnits('25.505', 'EUR'); // throws: EUR has 2 decimal places
+```
+
+It takes a string, parses it without floats, and throws `InvalidArgumentException` for more
+decimals than the currency has, for anything that is not plain digits with an optional dot,
+and for a currency it does not know. Known today: EUR, USD, GBP, BGN, RON, CHF, PLN, CZK,
+HUF, SEK, DKK, NOK (two decimals), JPY, KRW, ISK (none), BHD, KWD, OMR, JOD, TND (three).
+`minorUnitExponent($currency)` returns the exponent on its own.
 
 ## Retries and double-charges
 

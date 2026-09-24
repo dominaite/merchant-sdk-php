@@ -233,6 +233,19 @@ class DominaiteClient
     ];
 
     /**
+     * ISO 4217 minor-unit exponents for toMinorUnits(): how many decimal places the
+     * currency's major unit splits into. Deliberately a short list of the currencies
+     * merchants use today rather than the whole standard; an unlisted currency throws
+     * instead of guessing 2, because a wrong guess is a 100x charge.
+     */
+    private const MINOR_UNIT_EXPONENTS = [
+        'EUR' => 2, 'USD' => 2, 'GBP' => 2, 'BGN' => 2, 'RON' => 2, 'CHF' => 2,
+        'PLN' => 2, 'CZK' => 2, 'HUF' => 2, 'SEK' => 2, 'DKK' => 2, 'NOK' => 2,
+        'JPY' => 0, 'KRW' => 0, 'ISK' => 0,
+        'BHD' => 3, 'KWD' => 3, 'OMR' => 3, 'JOD' => 3, 'TND' => 3,
+    ];
+
+    /**
      * The statuses that keep their generic exception on every route: validation (400),
      * authentication (401, 403), an id that is not yours (404) and rate limiting (429).
      * Any other failure that carries an error code on a payment-method route is that
@@ -717,6 +730,70 @@ class DominaiteClient
         }
 
         return self::normalizeIdempotencyKey($scope . '-' . $orderId . '-' . $amountMinor . '-' . $currency);
+    }
+
+    /**
+     * Converts a decimal amount string to integer MINOR units, by the currency's ISO 4217
+     * exponent: toMinorUnits('0.30', 'EUR') is 30, toMinorUnits('1000', 'JPY') is 1000,
+     * toMinorUnits('1.250', 'KWD') is 1250.
+     *
+     * Takes a string on purpose. A float cannot hold 0.30 exactly, and (int) (0.3 * 100)
+     * is 29, so the parsing here is plain digit handling with no float or bcmath step.
+     * Accepted: digits, optionally a dot and at most as many fractional digits as the
+     * currency has ("25", "25.5", "25.50" for EUR). Refused with InvalidArgumentException:
+     * more fractional digits than the currency allows ("25.505" EUR, "100.0" JPY), a sign,
+     * whitespace, thousands separators, a comma as the decimal mark, exponents, an amount
+     * past PHP_INT_MAX, and a currency not in the list below. Zero converts to 0; the API
+     * itself still requires a positive amount.
+     *
+     * Exponent 2: EUR USD GBP BGN RON CHF PLN CZK HUF SEK DKK NOK. Exponent 0: JPY KRW ISK.
+     * Exponent 3: BHD KWD OMR JOD TND.
+     *
+     * @param string $amount   Decimal amount in MAJOR units, e.g. "25.00".
+     * @param string $currency ISO 4217 code, any case.
+     *
+     * @throws \InvalidArgumentException Malformed amount, too many decimals, or an unknown currency.
+     */
+    public static function toMinorUnits(string $amount, string $currency): int
+    {
+        $exponent = self::minorUnitExponent($currency);
+        if (preg_match('/^([0-9]+)(?:\.([0-9]+))?\z/', $amount, $parts) !== 1) {
+            throw new \InvalidArgumentException('amount must be a plain decimal string like "25.00" (digits and at most one dot)');
+        }
+        $fraction = $parts[2] ?? '';
+        if (strlen($fraction) > $exponent) {
+            throw new \InvalidArgumentException(
+                strtoupper($currency) . " has {$exponent} decimal place(s); \"{$amount}\" has " . strlen($fraction)
+            );
+        }
+
+        $digits = ltrim($parts[1] . str_pad($fraction, $exponent, '0'), '0');
+        if ($digits === '') {
+            return 0;
+        }
+        $max = (string) PHP_INT_MAX;
+        if (strlen($digits) > strlen($max) || (strlen($digits) === strlen($max) && strcmp($digits, $max) > 0)) {
+            throw new \InvalidArgumentException('amount is too large to represent in minor units');
+        }
+
+        return (int) $digits;
+    }
+
+    /**
+     * The ISO 4217 minor-unit exponent toMinorUnits() uses: 2 for EUR, 0 for JPY, 3 for KWD.
+     *
+     * @throws \InvalidArgumentException A currency this SDK does not list.
+     */
+    public static function minorUnitExponent(string $currency): int
+    {
+        $code = strtoupper($currency);
+        if (!isset(self::MINOR_UNIT_EXPONENTS[$code])) {
+            throw new \InvalidArgumentException(
+                "Unknown currency \"{$currency}\": convert to minor units yourself, or ask for it to be added"
+            );
+        }
+
+        return self::MINOR_UNIT_EXPONENTS[$code];
     }
 
     /**

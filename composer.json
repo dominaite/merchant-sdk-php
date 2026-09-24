@@ -31,7 +31,8 @@
             "php tests/contract_vectors.php",
             "php tests/payment_method_vectors.php",
             "php tests/hardening_vectors.php",
-            "php tests/transport_vectors.php"
+            "php tests/transport_vectors.php",
+            "php tests/helper_vectors.php"
         ]
     }
 }
