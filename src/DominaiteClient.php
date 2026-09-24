@@ -26,6 +26,7 @@ use Dominaite\Exception\TransportException;
  *       'amount'         => 2500,          // minor units: 25.00 EUR
  *       'currency'       => 'EUR',
  *       'orderReference' => 'order-1042',  // your own order id
+ *       'idempotencyKey' => DominaiteClient::orderIdempotencyKey('checkout', 'order-1042', 2500, 'EUR'),
  *       'customer'       => ['firstName' => 'Ana', 'lastName' => 'K', 'email' => 'ana@example.com'],
  *   ]);
  *   // Hand $session['cashierKey'] + $session['cashierToken'] to the embed snippet.
@@ -112,8 +113,8 @@ class DominaiteClient
     /**
      * Input-validation codes on the create endpoint. Unlike the refusals above these are
      * HTTP 400, not the success=false shape, and surface as ApiException. This SDK
-     * generates and length-checks the idempotency key itself, so a correct integration
-     * never sees IDEMPOTENCY_KEY_REQUIRED.
+     * requires and length-checks the idempotency key before sending, so a correct
+     * integration never sees IDEMPOTENCY_KEY_REQUIRED.
      */
     public const VALIDATION_ERROR_CODES = [
         'IDEMPOTENCY_KEY_REQUIRED',
@@ -331,19 +332,22 @@ class DominaiteClient
      * Creates a hosted checkout session for one payment.
      *
      * Required params: amount (int, MINOR units - cents), currency (ISO 4217),
-     * orderReference (your order id, <= 100 chars).
+     * orderReference (your order id, <= 100 chars), idempotencyKey (<= 100 printable
+     * ASCII chars; build it with orderIdempotencyKey() so the same order at the same
+     * amount always sends the same key - retrying with it never creates a second payment).
+     * A missing key throws InvalidArgumentException before anything is sent.
      * Optional: customer{firstName,lastName,email,phone}, country (ISO 3166-1 alpha-2),
      * language (ISO 639-1), theme ('light'|'dark'|'bright'), description,
      * saveCard (bool - keep the card on file once this payment is approved, so you can
      * charge it again with chargePaymentMethod(); the stored method shows up as
-     * storedPaymentMethod on getStatus(), and the card details never reach you),
-     * idempotencyKey (auto-generated when omitted - retrying with the same key never
-     * creates a second payment; read the generated one back with getLastIdempotencyKey()).
+     * storedPaymentMethod on getStatus(), and the card details never reach you).
      *
-     * Retrying a key the gateway already saw does NOT return the original session: it
-     * answers HTTP 200 with success=false and a replay code, which arrives here as a
-     * CheckoutRefusedException. The first session's cashierKey/cashierToken are not in
-     * that response - reconcile via the refusal's transaction id and getStatus().
+     * Re-sending a key the gateway already saw, with the same amount and currency, returns
+     * the ORIGINAL session while it is still open and unexpired: same transactionId, same
+     * cashierKey/cashierToken. That is what makes a reload or a retried timeout safe. Any
+     * other replay answers HTTP 200 with success=false and a replay code, which arrives
+     * here as a CheckoutRefusedException naming the transaction to reconcile with
+     * getStatus().
      *
      * @param array<string,mixed> $params
      * @return array{transactionId:string,orderId:string,cashierKey:string,cashierToken:string,amount:int,currency:string,expiresAt:string}
@@ -371,9 +375,8 @@ class DominaiteClient
         unset($params['idempotencyKey']);
 
         // Recorded BEFORE the call so a caller who catches TransportException can read the
-        // key the timed-out attempt used and retry with it. A generated key that only ever
-        // existed inside this method would leave a retry no choice but a fresh key, and a
-        // fresh key is a second real payment for the same order.
+        // key the timed-out attempt used and retry with it; a fresh key is a second real
+        // payment for the same order.
         $this->lastIdempotencyKey = $idempotencyKey;
 
         $response = $this->request('POST', self::SESSIONS_PATH, $params, $idempotencyKey);
@@ -397,11 +400,11 @@ class DominaiteClient
 
     /**
      * The idempotency key the last createCheckoutSession() or chargePaymentMethod() call
-     * sent, generated or yours.
+     * sent. Always the one you passed: the SDK no longer generates keys.
      *
-     * Read it in your catch block. On a timeout you cannot know whether the gateway
-     * created the session, and retrying with a NEW key charges the order twice - retry
-     * with this one, or hand it to getStatus() reconciliation later:
+     * Handy in a generic catch block that did not keep the params around. On a timeout
+     * you cannot know whether the gateway created the session, and retrying with a NEW key
+     * charges the order twice - retry with this one:
      *
      *   try {
      *       $session = $client->createCheckoutSession($params);
@@ -484,12 +487,14 @@ class DominaiteClient
      *
      * $paymentMethodId is storedPaymentMethod['id'] from getStatus() of a session you
      * created with saveCard. The charge is signed like a session and carries an
-     * Idempotency-Key (auto-generated unless you pass one; read it back with
-     * getLastIdempotencyKey()), so retrying after a timeout WITH THE SAME KEY never
-     * charges the card twice: the gateway replays its first answer, HTTP status included.
+     * Idempotency-Key, so retrying after a timeout WITH THE SAME KEY never charges the
+     * card twice: the gateway replays its first answer, HTTP status included. Derive the
+     * key from what you are billing (orderIdempotencyKey('renewal', $periodId, ...)), never
+     * a random value per attempt.
      *
      * Required params: amount (int, MINOR units), currency (ISO 4217), orderReference
-     * (<= 100 chars). Optional: description, idempotencyKey.
+     * (<= 100 chars), idempotencyKey (a missing key throws InvalidArgumentException before
+     * anything is sent). Optional: description.
      *
      * The HTTP status is the contract on this route. 201 (200 on a replay) returns the
      * charge, status 'succeeded', 'pending' or 'cancelled'. 402 returns the charge too:
@@ -627,14 +632,59 @@ class DominaiteClient
     }
 
     /**
-     * Mints a key when none was given and bounds the one that was.
+     * The idempotency key for one order at one price: "{scope}-{orderId}-{amountMinor}-{CURRENCY}".
+     *
+     * Pass the result as idempotencyKey to createCheckoutSession() (or chargePaymentMethod()).
+     * Deriving the key from the order instead of minting a random one per request is what
+     * makes a reload, a back button or a retried request safe: the same order at the same
+     * amount always sends the same key, so the gateway replays the session it already
+     * opened instead of opening a second payment. A changed amount or currency is a
+     * different payment and gets a different key, because the gateway refuses a known key
+     * with a different body (IDEMPOTENCY_KEY_REUSED).
+     *
+     *   $key = DominaiteClient::orderIdempotencyKey('shop', 'order-1042', 2500, 'eur');
+     *   // "shop-order-1042-2500-EUR"
+     *
+     * $scope names the flow the key belongs to ('checkout', 'renewal', ...) so two flows
+     * for the same order never share a key. Keep it a fixed string per flow.
+     *
+     * @param string $scope       A fixed label for the flow, e.g. 'checkout'.
+     * @param string $orderId     Your order id.
+     * @param int    $amountMinor The amount you send, in MINOR units.
+     * @param string $currency    ISO 4217 code; uppercased here.
+     *
+     * @throws \InvalidArgumentException An empty part, a non-positive amount, a currency that is not
+     *                                   three letters, or a result the key rules refuse (over 100
+     *                                   characters, or anything but printable ASCII).
+     */
+    public static function orderIdempotencyKey(string $scope, string $orderId, int $amountMinor, string $currency): string
+    {
+        if ($scope === '' || $orderId === '') {
+            throw new \InvalidArgumentException('scope and orderId must not be empty');
+        }
+        if ($amountMinor <= 0) {
+            throw new \InvalidArgumentException('amountMinor must be a positive integer in MINOR units');
+        }
+        $currency = strtoupper($currency);
+        if (preg_match('/^[A-Z]{3}\z/', $currency) !== 1) {
+            throw new \InvalidArgumentException('currency must be a three-letter ISO 4217 code');
+        }
+
+        return self::normalizeIdempotencyKey($scope . '-' . $orderId . '-' . $amountMinor . '-' . $currency);
+    }
+
+    /**
+     * Requires a key and bounds it. There is no generated fallback: a random key per call
+     * turns every reload or retry that forgot to reuse it into a second payment.
      *
      * @param mixed $idempotencyKey
      */
     private static function normalizeIdempotencyKey($idempotencyKey): string
     {
         if ($idempotencyKey === null) {
-            $idempotencyKey = bin2hex(random_bytes(16));
+            throw new \InvalidArgumentException(
+                'idempotencyKey is required; derive it from your order with DominaiteClient::orderIdempotencyKey()'
+            );
         }
         if (!is_string($idempotencyKey) || $idempotencyKey === '' || self::codePoints($idempotencyKey) > 100) {
             throw new \InvalidArgumentException('idempotencyKey must be a non-empty string of at most 100 characters');

@@ -9,9 +9,9 @@ namespace Dominaite\Exception;
  * Safe to retry WITH THE SAME idempotency key; a retried key never creates a second payment.
  * Read the key off the client with getLastIdempotencyKey().
  *
- * If the first attempt did reach the gateway, the retry comes back as a
- * CheckoutRefusedException carrying a replay code, not as the original session - the
- * cashier fields are not replayed. Reconcile with getStatus() from there.
+ * If the first attempt did reach the gateway and its session is still open, the retry
+ * returns that same session. Otherwise it comes back as a CheckoutRefusedException
+ * carrying a replay code; reconcile with getStatus() from there.
  */
 class TransportException extends \RuntimeException
 {

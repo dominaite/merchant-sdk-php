@@ -1,6 +1,7 @@
 <?php
-// Dependency-free tests for the idempotency key: it stays the same across a retried
-// call, and it can never smuggle extra HTTP headers.
+// Dependency-free tests for the idempotency key: it is required, the order-derived
+// helper builds a stable one, it stays the same across a retried call, and it can never
+// smuggle extra HTTP headers.
 // Run: php tests/idempotency_vectors.php - exits non-zero on any mismatch.
 //
 // Why this file exists: the key is the gateway's only duplicate-payment guard. A retry
@@ -73,42 +74,93 @@ final class FlakyClient extends DominaiteClient
 
 $params = ['amount' => 8440, 'currency' => 'EUR', 'orderReference' => 'order-1042'];
 
-// 1. The generated key is reachable from the catch block, which is the only thing that
-//    makes "retry with the same key" possible when the caller supplied none.
-$timeout = new FlakyClient(1);
+// 1. The key is required. A missing key is refused before anything is signed or sent:
+//    the old random fallback turned every reload that forgot to reuse a key into a
+//    second payment for the same order.
+$keyless = new FlakyClient();
 $caught = 'no throw';
 try {
-    $timeout->createCheckoutSession($params);
-} catch (TransportException $e) {
-    $caught = 'TransportException';
+    $keyless->createCheckoutSession($params);
+} catch (\InvalidArgumentException $e) {
+    $caught = 'InvalidArgumentException';
 }
-check('a timed-out create surfaces TransportException', $caught, 'TransportException');
-check('the generated key is readable after the failure',
-    $timeout->getLastIdempotencyKey() === $timeout->keysSent[0] ? 'same key' : 'lost', 'same key');
+check('a create without an idempotency key throws before the call', $caught, 'InvalidArgumentException');
+check('nothing was sent for the keyless create', (string) count($keyless->keysSent), '0');
+check('the keyless create leaves no key to read back',
+    $keyless->getLastIdempotencyKey() === null ? 'null' : 'set', 'null');
+$explicitNull = new FlakyClient();
+$caught = 'no throw';
+try {
+    $explicitNull->createCheckoutSession($params + ['idempotencyKey' => null]);
+} catch (\InvalidArgumentException $e) {
+    $caught = 'InvalidArgumentException';
+}
+check('an explicit null key is refused the same way', $caught, 'InvalidArgumentException');
 
-// 2. Retrying that call with the key it exposed sends the SAME key on every attempt.
-//    A second key here would be a second real payment for one order.
+// 2. The order-derived key: "{scope}-{orderId}-{amountMinor}-{CURRENCY}".
+check('the derived key has the documented shape',
+    DominaiteClient::orderIdempotencyKey('checkout', 'order-1042', 8440, 'EUR'), 'checkout-order-1042-8440-EUR');
+check('the currency is uppercased',
+    DominaiteClient::orderIdempotencyKey('checkout', 'order-1042', 8440, 'eur'), 'checkout-order-1042-8440-EUR');
+check('the same order at the same amount derives the same key (a reload replays)',
+    DominaiteClient::orderIdempotencyKey('checkout', 'order-1042', 8440, 'EUR')
+        === DominaiteClient::orderIdempotencyKey('checkout', 'order-1042', 8440, 'eur') ? 'same' : 'different', 'same');
+check('a changed amount derives a new key',
+    DominaiteClient::orderIdempotencyKey('checkout', 'order-1042', 8440, 'EUR')
+        !== DominaiteClient::orderIdempotencyKey('checkout', 'order-1042', 8441, 'EUR') ? 'different' : 'same', 'different');
+check('a changed currency derives a new key',
+    DominaiteClient::orderIdempotencyKey('checkout', 'order-1042', 8440, 'EUR')
+        !== DominaiteClient::orderIdempotencyKey('checkout', 'order-1042', 8440, 'BGN') ? 'different' : 'same', 'different');
+check('a different scope derives a new key for the same order',
+    DominaiteClient::orderIdempotencyKey('checkout', 'order-1042', 8440, 'EUR')
+        !== DominaiteClient::orderIdempotencyKey('renewal', 'order-1042', 8440, 'EUR') ? 'different' : 'same', 'different');
+
+// The derived key goes through the same rules as a hand-written one, so it can never
+// be a key the SDK would refuse at send time.
+$badParts = [
+    'empty scope' => ['', 'order-1042', 8440, 'EUR'],
+    'empty orderId' => ['checkout', '', 8440, 'EUR'],
+    'zero amount' => ['checkout', 'order-1042', 0, 'EUR'],
+    'negative amount' => ['checkout', 'order-1042', -1, 'EUR'],
+    'two-letter currency' => ['checkout', 'order-1042', 8440, 'EU'],
+    'four-letter currency' => ['checkout', 'order-1042', 8440, 'EURO'],
+    'numeric currency' => ['checkout', 'order-1042', 8440, '978'],
+    'currency with newline' => ['checkout', 'order-1042', 8440, "EUR\n"],
+    'orderId with CRLF' => ['checkout', "order-1\r\nX-Injected: yes", 8440, 'EUR'],
+    'non-ascii orderId' => ['checkout', "order-\u{00e9}", 8440, 'EUR'],
+    'over 100 characters' => ['checkout', str_repeat('o', 90), 8440, 'EUR'],
+];
+foreach ($badParts as $label => $parts) {
+    $outcome = 'accepted';
+    try {
+        DominaiteClient::orderIdempotencyKey(...$parts);
+    } catch (\InvalidArgumentException $e) {
+        $outcome = 'rejected';
+    }
+    check("derived key refused: $label", $outcome, 'rejected');
+}
+check('a derived key of exactly 100 characters is accepted',
+    (string) strlen(DominaiteClient::orderIdempotencyKey('checkout', str_repeat('o', 100 - strlen('checkout--8440-EUR')), 8440, 'EUR')),
+    '100');
+
+// Retrying with the derived key sends that SAME key on every attempt. A second key
+// here would be a second real payment for one order.
 $retried = new FlakyClient(2);
-$key = null;
+$derived = DominaiteClient::orderIdempotencyKey('checkout', 'order-1042', 8440, 'EUR');
 $attempts = 0;
 for ($i = 0; $i < 3; $i++) {
     $attempts++;
     try {
-        $retryParams = $params;
-        if ($key !== null) {
-            $retryParams['idempotencyKey'] = $key;
-        }
-        $retried->createCheckoutSession($retryParams);
+        $retried->createCheckoutSession($params + ['idempotencyKey' => $derived]);
         break;
     } catch (TransportException $e) {
-        $key = $retried->getLastIdempotencyKey();
+        // retry with the same params, so the same key
     }
 }
 check('the retry loop ran three attempts', (string) $attempts, '3');
-check('every attempt sent one and the same idempotency key',
-    (string) count(array_unique($retried->keysSent)), '1');
-check('the exposed key is the one that was sent',
-    (string) $retried->getLastIdempotencyKey(), $retried->keysSent[0]);
+check('every attempt sent the derived key', implode(',', array_unique($retried->keysSent)), $derived);
+check('a timed-out attempt leaves its key readable for a generic catch block',
+    (string) $retried->getLastIdempotencyKey(), $derived);
 
 // 3. A caller-supplied key is used unchanged, on every attempt.
 $mine = new FlakyClient(1);

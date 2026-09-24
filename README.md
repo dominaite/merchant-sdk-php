@@ -93,11 +93,16 @@ use Dominaite\Exception\TransportException;
 
 $client = new DominaiteClient(getenv('DOMINAITE_KEY_ID'), getenv('DOMINAITE_SECRET'));
 
+$amount = 2500;                              // minor units: 2500 = 25.00 EUR
+
 try {
     $session = $client->createCheckoutSession([
-        'amount'         => 2500,            // minor units: 2500 = 25.00 EUR
+        'amount'         => $amount,
         'currency'       => 'EUR',
         'orderReference' => 'order-1042',    // your own order id, shows up in your dashboard
+        // Required. Same order + same amount = same key, so a reload or a retry gets the
+        // session that is already open instead of a second payment.
+        'idempotencyKey' => DominaiteClient::orderIdempotencyKey('checkout', 'order-1042', $amount, 'EUR'),
         'customer'       => [
             // Pass everything you already know - prefilled fields are hidden from the
             // payer, so the checkout form stays short.
@@ -118,7 +123,7 @@ try {
     header('Retry-After: ' . ($e->getRetryAfterSeconds() ?? 5));
     exit('Payment temporarily unavailable');
 } catch (TransportException $e) {
-    // Network blip or a 5xx - retry with $client->getLastIdempotencyKey(), never a fresh key.
+    // Network blip or a 5xx - retry with the same params, so the same key, never a fresh one.
     http_response_code(503);
     exit('Payment temporarily unavailable');
 }
@@ -245,25 +250,37 @@ pass here is what gets charged; nothing in the browser can change it.
 
 ## Retries and double-charges
 
-Every `createCheckoutSession` call carries an idempotency key (auto-generated, or pass your
-own as `idempotencyKey`). Retrying with the same key never opens a second payment - on a
-timeout, retry with the same key rather than generating a new one. When you let the SDK
-generate the key, read it back with `getLastIdempotencyKey()` so the retry can reuse it:
+`idempotencyKey` is required on `createCheckoutSession()` and `chargePaymentMethod()`. Leave
+it out and the SDK throws `InvalidArgumentException` before anything is sent. It used to
+generate a random key for you; that is gone, because a random key per request turns every
+page reload, back button or retried timeout into a second payment for the same order.
+
+Derive the key from the order instead:
 
 ```php
+$key = DominaiteClient::orderIdempotencyKey('checkout', $order->id, $amountMinor, $currency);
+// "checkout-1042-2500-EUR"
+```
+
+The shape is `{scope}-{orderId}-{amountMinor}-{CURRENCY}`. The same order at the same amount
+always gives the same key, so a reload or a retry replays the session that is already open
+(same `transactionId`, same `cashierKey` and `cashierToken`) instead of opening a new one.
+Change the amount or the currency and you get a new key, which is what you want: the gateway
+refuses a known key sent with a different amount (`IDEMPOTENCY_KEY_REUSED`). `scope` keeps
+two flows for one order apart (`checkout` and `renewal`, say); keep it a fixed string per
+flow. The result follows the usual key rules (at most 100 printable ASCII characters), and
+the helper throws if it would not.
+
+On a timeout, retry with the same params and so the same key:
+
+```php
+$params['idempotencyKey'] = DominaiteClient::orderIdempotencyKey('checkout', 'order-1042', 2500, 'EUR');
 $session = null;
-$key = null;
 
 for ($attempt = 1; $attempt <= 3 && $session === null; $attempt++) {
-    if ($key !== null) {
-        $params['idempotencyKey'] = $key;
-    }
     try {
         $session = $client->createCheckoutSession($params);
     } catch (TransportException $e) {
-        // Read the key here, in the catch - store it against your order before you
-        // sleep or hand off, because the next create() call overwrites it.
-        $key = $client->getLastIdempotencyKey();
         if ($attempt === 3) {
             throw $e;
         }
@@ -272,14 +289,16 @@ for ($attempt = 1; $attempt <= 3 && $session === null; $attempt++) {
 }
 ```
 
-**A replay does not hand you the original session back.** If the first attempt did reach the
-gateway, the retry answers HTTP 200 with `success=false` and a replay code - `DUPLICATE_REQUEST`,
-`ALREADY_PROCESSED`, `PRIOR_ATTEMPT_FAILED` or `IDEMPOTENCY_KEY_REUSED` - which the SDK raises
-as a `CheckoutRefusedException`. The original session's `cashierKey` and `cashierToken` are not
-in that response, so a retry cannot be your only path to rendering the widget. What the refusal
-gives you is the transaction id to reconcile against; see "Recovering from a replay refusal"
-below. Store `transactionId` and the idempotency key when a create succeeds, and treat the
-replay refusal as "go look up what the first attempt did", not as an error to show the payer.
+`getLastIdempotencyKey()` still reads back the key of the last attempt that went out, for a
+generic catch block that no longer has the params.
+
+A replay only hands back the original session while that session is open and unexpired. If
+the first attempt already completed, failed, or was sent with a different amount, the retry
+answers HTTP 200 with `success=false` and a replay code (`DUPLICATE_REQUEST`,
+`ALREADY_PROCESSED`, `PRIOR_ATTEMPT_FAILED` or `IDEMPOTENCY_KEY_REUSED`), which the SDK raises
+as a `CheckoutRefusedException` carrying the transaction id to reconcile against; see
+"Recovering from a replay refusal" below. Treat it as "go look up what the first attempt did",
+not as an error to show the payer.
 
 ## Rate limits
 
@@ -331,6 +350,7 @@ $session = $client->createCheckoutSession([
     'amount'         => 2500,
     'currency'       => 'EUR',
     'orderReference' => 'sub-8817-first',
+    'idempotencyKey' => DominaiteClient::orderIdempotencyKey('checkout', 'sub-8817-first', 2500, 'EUR'),
     'saveCard'       => true,
 ]);
 // ... the payer completes the hosted checkout ...
@@ -347,7 +367,8 @@ try {
         'currency'       => 'EUR',
         'orderReference' => 'sub-8817-2026-10',
         'description'    => 'Monthly plan, October',
-        'idempotencyKey' => 'sub-8817-2026-10', // derive it from the billing period, never random per attempt
+        // Derived from the billing period, never random per attempt.
+        'idempotencyKey' => DominaiteClient::orderIdempotencyKey('renewal', 'sub-8817-2026-10', 2500, 'EUR'),
     ]);
 
     switch ($charge['status']) {
@@ -405,10 +426,10 @@ try {
 }
 ```
 
-A charge is signed exactly like a session and carries an `Idempotency-Key`, so a retry after
-a timeout with the **same** key never charges the card twice: the gateway replays its first
-answer, HTTP status included. `getLastIdempotencyKey()` reads the key back the same way it does
-for a session. The HTTP status is the contract on this route: 201 (or 200 on a replay) returns
+A charge is signed exactly like a session and carries a required `Idempotency-Key`, so a
+retry after a timeout with the **same** key never charges the card twice: the gateway replays
+its first answer, HTTP status included. `getLastIdempotencyKey()` reads the key back the same
+way it does for a session. The HTTP status is the contract on this route: 201 (or 200 on a replay) returns
 the charge, 402 returns the charge too (`status` `failed` plus `declineClass`), and 409, 422,
 502 and 503 throw `ChargeException` with `getErrorCode()`, `getHttpStatus()`, the gateway's
 message and, when the gateway attached the charge row, `getCharge()` and `getTransactionId()`.

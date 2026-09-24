@@ -159,14 +159,12 @@ check('charge idempotency key is readable afterwards', (string) $client->getLast
 $client = new RecordingClient($charge);
 $client->chargePaymentMethod(PAYMENT_METHOD_ID, [
     'orderReference' => 'order-1043', 'description' => 'Monthly plan', 'currency' => 'EUR', 'amount' => 2500,
-    'customer' => ['email' => 'not-on-this-route'],
+    'customer' => ['email' => 'not-on-this-route'], 'idempotencyKey' => CHARGE_KEY,
 ]);
 check('charge body is built field by field in contract order', encode($client->calls[0]['body']),
     '{"amount":2500,"currency":"EUR","orderReference":"order-1043","description":"Monthly plan"}');
-check('charge generates an idempotency key when the caller omits one',
-    preg_match('/^[0-9a-f]{32}$/', $client->calls[0]['key']) === 1 ? 'generated' : $client->calls[0]['key'], 'generated');
-check('the generated charge key is readable afterwards',
-    $client->getLastIdempotencyKey() === $client->calls[0]['key'] ? 'same key' : 'lost', 'same key');
+check('the idempotency key rides the header, never the charge body',
+    array_key_exists('idempotencyKey', $client->calls[0]['body']) ? 'leaked' : 'absent', 'absent');
 
 // --- chargePaymentMethod: declines are results, refusals are typed exceptions ----------
 // A 402 says success=false and CHARGE_DECLINED, but the charge is right there with its
@@ -268,13 +266,15 @@ foreach ($cases as $label => $override) {
     check("charge with $label never reaches the transport", (string) count($client->calls), '0');
     check("charge with $label leaves no stale key", $client->getLastIdempotencyKey() === null ? 'null' : 'set', 'null');
 }
-foreach (['amount', 'currency', 'orderReference'] as $required) {
+foreach (['amount', 'currency', 'orderReference', 'idempotencyKey'] as $required) {
     $params = $chargeParams;
     unset($params[$required]);
+    $client = new RecordingClient($charge);
     check("charge requires $required",
-        thrownBy(static function () use ($charge, $params): void {
-            (new RecordingClient($charge))->chargePaymentMethod(PAYMENT_METHOD_ID, $params);
+        thrownBy(static function () use ($client, $params): void {
+            $client->chargePaymentMethod(PAYMENT_METHOD_ID, $params);
         }), \InvalidArgumentException::class);
+    check("charge without $required never reaches the transport", (string) count($client->calls), '0');
 }
 
 // The id goes into the signed canonical path verbatim, so anything that is not one

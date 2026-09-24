@@ -216,6 +216,7 @@ check('100-character Cyrillic orderReference is accepted',
     thrownBy(static function () use ($unicodeClient, $cyrillic): void {
         $unicodeClient->createCheckoutSession([
             'amount' => 8440, 'currency' => 'EUR', 'orderReference' => $cyrillic,
+            'idempotencyKey' => 'order-1042',
         ]);
     }),
     'no exception');
@@ -226,6 +227,7 @@ check('101-character orderReference is rejected',
     thrownBy(static function () use ($cyrillic): void {
         (new RecordingClient(KEY_ID, SECRET))->createCheckoutSession([
             'amount' => 8440, 'currency' => 'EUR', 'orderReference' => $cyrillic . 'д',
+            'idempotencyKey' => 'order-1042',
         ]);
     }),
     'InvalidArgumentException');
@@ -233,6 +235,7 @@ check('empty orderReference is rejected',
     thrownBy(static function (): void {
         (new RecordingClient(KEY_ID, SECRET))->createCheckoutSession([
             'amount' => 8440, 'currency' => 'EUR', 'orderReference' => '',
+            'idempotencyKey' => 'order-1042',
         ]);
     }),
     'InvalidArgumentException');
