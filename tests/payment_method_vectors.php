@@ -239,6 +239,29 @@ check('a codeless 503 on a charge is still a retryable transport error',
         (new RecordingClient(['success' => false], 503))->chargePaymentMethod(PAYMENT_METHOD_ID, $chargeParams);
     }), TransportException::class);
 
+// A 503 that carries PAYMENT_PROCESSING_UNAVAILABLE must stay on the retry path on both
+// routes. On a charge it is the typed exception whose code says "nothing charged, retry
+// later with the same key"; on a session create, where the gateway normally answers this
+// code as a 200 refusal, a 503 is the retryable transport error. Neither may become a
+// generic ApiException, which reads as "your request is wrong, do not retry".
+$unavailable = ['success' => false, 'error' => ['message' => 'Card payments are not available right now.',
+    'code' => DominaiteClient::PAYMENT_PROCESSING_UNAVAILABLE, 'statusCode' => 503]];
+$thrown = null;
+try {
+    (new RecordingClient($unavailable, 503))->chargePaymentMethod(PAYMENT_METHOD_ID, $chargeParams);
+} catch (\Throwable $e) {
+    $thrown = $e;
+}
+check('a charge 503 PAYMENT_PROCESSING_UNAVAILABLE is a ChargeException',
+    $thrown === null ? 'no exception' : get_class($thrown), ChargeException::class);
+check('the charge 503 keeps its code for the retry decision',
+    $thrown instanceof ChargeException ? $thrown->getHttpStatus() . ' ' . $thrown->getErrorCode() : '',
+    '503 PAYMENT_PROCESSING_UNAVAILABLE');
+check('a session 503 PAYMENT_PROCESSING_UNAVAILABLE is a retryable transport error',
+    thrownBy(static function () use ($unavailable, $sessionParams): void {
+        (new RecordingClient($unavailable, 503))->createCheckoutSession($sessionParams);
+    }), TransportException::class);
+
 // A 2xx without a chargeId is not a charge either, whatever success says.
 check('a 201 without a charge body is an ApiException',
     thrownBy(static function () use ($chargeParams): void {
