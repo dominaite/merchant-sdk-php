@@ -158,15 +158,16 @@ class DominaiteClient
     ];
 
     /**
-     * The storefront refusals at session mint: 409 STOREFRONT_NOT_WHITELISTED, 409
-     * STOREFRONT_INACTIVE, 400 STOREFRONT_MISMATCH. A 4xx carrying one of these raises
-     * StorefrontException (an ApiException), so getErrorCode() and getHttpStatus() are
-     * there to branch on. None of them is fixed by retrying the same request.
+     * The storefront refusals at session mint, in the contract's order: 400
+     * STOREFRONT_MISMATCH, 409 STOREFRONT_INACTIVE, 409 STOREFRONT_NOT_WHITELISTED. A 4xx
+     * carrying one of these raises StorefrontException (an ApiException), so
+     * getErrorCode() and getHttpStatus() are there to branch on. None of them is fixed by
+     * retrying the same request, and none is in REFUSAL_ERROR_CODES.
      */
     public const STOREFRONT_ERROR_CODES = [
-        self::STOREFRONT_NOT_WHITELISTED,
-        self::STOREFRONT_INACTIVE,
         self::STOREFRONT_MISMATCH,
+        self::STOREFRONT_INACTIVE,
+        self::STOREFRONT_NOT_WHITELISTED,
     ];
 
     /**
@@ -182,13 +183,30 @@ class DominaiteClient
     /**
      * Every value a stored payment method's `status` can carry, in the API's own order.
      * Only active methods can be charged; revoked is what revokePaymentMethod() leaves
-     * behind, expired means the card's expiry date has passed. Treat an unknown value
-     * as not chargeable.
+     * behind, expired means the card's expiry date has passed, retired means the
+     * platform stopped the card on its own (retiredReason says why) and it never becomes
+     * active again, so ask the customer to save a card again. Treat an unknown value as
+     * not chargeable.
      */
     public const STORED_PAYMENT_METHOD_STATUS_VOCABULARY = [
         'active',
         'revoked',
         'expired',
+        'retired',
+    ];
+
+    /**
+     * Every value a stored payment method's `retiredReason` can carry, in the API's own
+     * order. hard_decline: a charge on it was declined as final. chargeback: a charge on
+     * it was disputed. source_sale_reversed: the payment that saved it was fully refunded
+     * or disputed. retiredReason is null on a card the platform has not retired, and kept
+     * if you revoke a retired card. Treat an unknown value as retired for an unknown
+     * reason.
+     */
+    public const STORED_PAYMENT_METHOD_RETIRED_REASON_VOCABULARY = [
+        'hard_decline',
+        'chargeback',
+        'source_sale_reversed',
     ];
 
     /**
@@ -526,10 +544,11 @@ class DominaiteClient
      * should make you keep polling, never silently close an order that is still live.
      *
      * storedPaymentMethod is the card kept on file by a session created with saveCard:
-     * {id, brand, last4, expiryMonth, expiryYear, status}, present once the payment is
-     * approved (and it stays after a revoke, with status 'revoked'); absent or null until
-     * then, for sessions without saveCard, and for declined or abandoned ones. brand,
-     * last4 and the expiry are null when the provider did not report them. It never
+     * {id, brand, last4, expiryMonth, expiryYear, status, retiredReason}, present once the
+     * payment is approved (and it stays after a revoke, with status 'revoked'); absent or
+     * null until then, for sessions without saveCard, and for declined or abandoned ones.
+     * brand, last4 and the expiry are null when the provider did not report them.
+     * retiredReason is null unless the platform retired the card (status 'retired'). It never
      * carries the card number or the provider token. Store storedPaymentMethod['id']
      * against your customer - it is what chargePaymentMethod() and
      * revokePaymentMethod() take. It is not the paymentMethod field, which is the
@@ -537,7 +556,7 @@ class DominaiteClient
      * passes through untouched.
      *
      * @param string $transactionId The transactionId returned by createCheckoutSession().
-     * @return array{transactionId:string,orderId:string,orderReference:?string,status:string,amount:int,currency:string,refundedAmount:?int,createdAt:string,updatedAt:?string,expiresAt:?string,storedPaymentMethod?:?array{id:string,brand:?string,last4:?string,expiryMonth:?int,expiryYear:?int,status:string}}
+     * @return array{transactionId:string,orderId:string,orderReference:?string,status:string,amount:int,currency:string,refundedAmount:?int,createdAt:string,updatedAt:?string,expiresAt:?string,storedPaymentMethod?:?array{id:string,brand:?string,last4:?string,expiryMonth:?int,expiryYear:?int,status:string,retiredReason:?string}}
      *
      * @throws AuthenticationException Wrong/revoked credentials or bad signature (fix config; do not retry).
      * @throws ApiException            Unknown transaction id (HTTP 404) or unexpected response.
@@ -1248,7 +1267,8 @@ class DominaiteClient
 
     /**
      * Same rule for the card on file: brand, last4 and the expiry are absent when the
-     * provider did not report them.
+     * provider did not report them, and retiredReason is absent unless the platform
+     * retired the card.
      *
      * @param array<string,mixed> $data
      * @return array<string,mixed>
@@ -1261,6 +1281,7 @@ class DominaiteClient
         $data['expiryMonth'] = is_int($data['expiryMonth'] ?? null) ? $data['expiryMonth'] : null;
         $data['expiryYear'] = is_int($data['expiryYear'] ?? null) ? $data['expiryYear'] : null;
         $data['status'] = (string) ($data['status'] ?? '');
+        $data['retiredReason'] = is_string($data['retiredReason'] ?? null) ? $data['retiredReason'] : null;
 
         return $data;
     }

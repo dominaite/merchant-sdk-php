@@ -491,6 +491,12 @@ Revoking signs an empty key and an empty body, like `getStatus()`. A revoke that
 `PAYMENT_METHOD_NOT_ACTIVE`. An id that is not yours is an `ApiException` with
 `getHttpStatus()` 404.
 
+The platform can also retire a card on its own: `status` `retired`, with `retiredReason` set to
+`hard_decline`, `chargeback` or `source_sale_reversed`
+(`DominaiteClient::STORED_PAYMENT_METHOD_RETIRED_REASON_VOCABULARY`). A retired card is refused
+with `PAYMENT_METHOD_NOT_ACTIVE` too and never becomes active again, so ask the customer to save
+a card again. `retiredReason` is `null` on every other card.
+
 ## Fallback: status polling
 
 Use this when you have not registered a webhook endpoint yet, inside your reconciliation
