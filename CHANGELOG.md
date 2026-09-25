@@ -3,6 +3,15 @@
 Versions follow semver. The package installs from git tags, so a version exists once its
 `v` tag does.
 
+## 0.3.1 (unreleased)
+
+Added:
+
+- Webhook docs for the `2026-09-25` envelope: `apiVersion` on every event, the
+  `agreement.*` and `charge.*` events, and ordering them by `data.sequence` per object.
+  Additive on the wire: `verifyWebhook()` is unchanged and the canonical signature vector
+  still verifies. Events recorded before these fields existed arrive without them.
+
 ## 0.3.0
 
 Breaking:

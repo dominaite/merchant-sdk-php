@@ -219,6 +219,7 @@ checked against a 300 second window, so a captured delivery cannot be replayed l
 {
   "id": "delivery id, your dedupe key",
   "type": "payment.succeeded",
+  "apiVersion": "2026-09-25",
   "createdAt": "2026-08-20T14:00:00Z",
   "data": {
     "transactionId": "...",
@@ -239,10 +240,60 @@ Flat envelope, no `success` wrapper to branch on. Amounts are minor units: `amou
 you get paid, `grossAmount` is what moved on the card, `surchargeAmount` is the difference
 when a surcharge applies.
 
+`apiVersion` is the date of the payload shape the event was rendered in, currently
+`2026-09-25`. Fields are only ever added under a version, never renamed or removed, so
+ignore fields you do not recognise. A retry resends the bytes of the first attempt, so an
+event recorded before the field existed arrives without it: read it as
+`$event['apiVersion'] ?? null`. The signature covers the raw body whatever it carries,
+so nothing changes in how you verify.
+
 Events: `payment.succeeded`, `payment.failed`, `payment.requires_capture`,
 `payment.cancelled`, `payment.abandoned`, `payment.refunded`, `payment.disputed`.
 `payment.succeeded` is the only one that means money in hand. In-flight states (`pending`,
 `processing`) are not webhooked, so drive that part of your UX from the session status.
+
+### Agreement and charge events: order by sequence
+
+`agreement.activated`, `agreement.past_due`, `agreement.cancelled`, `charge.succeeded`,
+`charge.failed` and `charge.retrying` ride the same signed envelope. Their `data` carries an
+integer `sequence` that counts the announced changes of one object. It only ever rises, and
+a redelivery carries the same number.
+
+> Deliveries can arrive out of order. Keep the highest sequence you have processed per
+> object and discard any event whose sequence is not higher; when you need current state,
+> read the object by id. createdAt can repeat across events, so order by sequence, not
+> createdAt. A sequence of 0 only comes from events recorded before the counter existed;
+> treat it as older than any positive number.
+
+The object is:
+
+- `agreement.*`: the agreement, `data.id`.
+- `charge.*` the platform placed for an agreement: the agreement period, `data.agreementId`
+  plus `data.periodNumber`, so the attempts of one period compare with each other.
+- `charge.*` for a one-off `chargePaymentMethod()`: `data.chargeId` (`agreementId` is null).
+
+```php
+$data = $event['data'];
+if (strpos($event['type'], 'agreement.') === 0) {
+    $object = 'agreement:' . $data['id'];
+} elseif ($data['agreementId'] !== null) {
+    $object = 'period:' . $data['agreementId'] . ':' . $data['periodNumber'];
+} else {
+    $object = 'charge:' . $data['chargeId'];
+}
+
+$sequence = $data['sequence'] ?? 0;           // absent on events recorded before the counter
+$highest = $store->highestSequence($object);  // null when you have not seen this object yet
+if ($highest !== null && $sequence <= $highest) {
+    return;                                   // stale or repeated: newer state is already applied
+}
+apply_event($event);
+$store->saveHighestSequence($object, $sequence);
+```
+
+Keep deduping on the envelope `id` as well: that catches the same delivery twice, the
+sequence catches an older delivery arriving after a newer one. `payment.*` events carry no
+sequence.
 
 ### Delivery guarantees
 
