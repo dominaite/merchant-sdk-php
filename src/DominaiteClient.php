@@ -628,6 +628,13 @@ class DominaiteClient
      * gateway's string category of how the payer paid ('card', 'wallet', ...) and
      * passes through untouched.
      *
+     * payment.* webhooks carry the same object as data.storedPaymentMethod, null or absent
+     * when no card was saved. It can also be null when a card WAS saved: on a
+     * server-to-server sale approved synchronously, on a sale whose outcome the platform
+     * confirmed later, and whenever the card was stored after the approval was announced.
+     * This status read is the source of truth: on a saveCard session whose webhook has no
+     * card, read it here.
+     *
      * @param string $transactionId The transactionId returned by createCheckoutSession().
      * @return array{transactionId:string,orderId:string,orderReference:?string,status:string,amount:int,currency:string,refundedAmount:?int,createdAt:string,updatedAt:?string,expiresAt:?string,storedPaymentMethod?:?array{id:string,brand:?string,last4:?string,expiryMonth:?int,expiryYear:?int,status:string,retiredReason:?string}}
      *

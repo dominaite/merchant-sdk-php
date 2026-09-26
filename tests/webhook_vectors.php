@@ -162,4 +162,58 @@ check('legacy one-off charge keeps chargeId and createdAt',
     $legacyEvent['data']['chargeId'] . ' ' . $legacyEvent['createdAt'],
     'ch_7b1d3f5a9c2e4b6d8f0a1c3e5b7d9f2a 2026-09-20T08:00:00Z');
 
+// 8. data.storedPaymentMethod on payment.* events: the same object getStatus() returns as
+// storedPaymentMethod, the card kept on file by a saveCard session. Null or absent when no
+// card was saved, and it can be null even when one was: the status read is the source of
+// truth. MACs computed with openssl, like section 7.
+$activeCardBody = '{"id":"3c1f7a2e-8b4d-4e6a-9c0f-1d2e3f4a5b6c","type":"payment.succeeded","apiVersion":"2026-09-25","createdAt":"2026-09-25T09:30:00Z","data":{"transactionId":"0f1e2d3c-4b5a-4978-8796-a5b4c3d2e1f0","status":"succeeded","previousStatus":"pending","kind":"sale","amount":8440,"grossAmount":8440,"surchargeAmount":0,"currency":"EUR","originalTransactionId":null,"idempotencyKey":"checkout-order-1042-8440-EUR","storedPaymentMethod":{"id":"pm_0a1b2c3d4e5f60718293a4b5c6d7e8f9","brand":"visa","last4":"4242","expiryMonth":12,"expiryYear":2030,"status":"active","retiredReason":null}}}';
+$activeCardMac = 'ff325de2572d6a50cc383b98a9fb892e81cf169891a1cde3ff6905a54f01face';
+$nullCardBody = '{"id":"4d2a8b3f-9c5e-4f7b-8d1a-2e3f4a5b6c7d","type":"payment.succeeded","apiVersion":"2026-09-25","createdAt":"2026-09-25T09:30:00Z","data":{"transactionId":"1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d","status":"succeeded","previousStatus":"pending","kind":"sale","amount":8440,"grossAmount":8440,"surchargeAmount":0,"currency":"EUR","originalTransactionId":null,"idempotencyKey":"checkout-order-1042-8440-EUR","storedPaymentMethod":null}}';
+$nullCardMac = 'f905dcd6a0eb124854de3c68d9bb356b6a54180376a9d74a16322639f4d4bfd4';
+$absentCardBody = '{"id":"5e3b9c4a-0d6f-4a8c-9e2b-3f4a5b6c7d8e","type":"payment.succeeded","apiVersion":"2026-09-25","createdAt":"2026-09-25T09:30:00Z","data":{"transactionId":"2b3c4d5e-6f7a-4b8c-9d0e-1f2a3b4c5d6e","status":"succeeded","previousStatus":"pending","kind":"sale","amount":8440,"grossAmount":8440,"surchargeAmount":0,"currency":"EUR","originalTransactionId":null,"idempotencyKey":"checkout-order-1042-8440-EUR"}}';
+$absentCardMac = 'c647b963f2d3309dc15b0edf85c5af5cdf3f0f6a940c22747a6ae3762c8acdde';
+$retiredCardBody = '{"id":"6f4c0d5b-1e7a-4b9d-8f3c-4a5b6c7d8e9f","type":"payment.requires_capture","apiVersion":"2026-09-25","createdAt":"2026-09-25T09:30:00Z","data":{"transactionId":"3c4d5e6f-7a8b-4c9d-8e0f-2a3b4c5d6e7f","status":"requires_capture","previousStatus":"pending","kind":"sale","amount":8440,"grossAmount":8440,"surchargeAmount":0,"currency":"EUR","originalTransactionId":null,"idempotencyKey":"checkout-order-1042-8440-EUR","storedPaymentMethod":{"id":"pm_1b2c3d4e5f60718293a4b5c6d7e8f90a","brand":"mastercard","last4":"5454","expiryMonth":3,"expiryYear":2028,"status":"retired","retiredReason":"hard_decline"}}}';
+$retiredCardMac = 'aed216a0e5a07e6252fd3081abddf2946875ef113b89bf23cb85b0a92f261d2f';
+
+$cardFixture = json_decode((string) file_get_contents(__DIR__ . '/merchant-api-contract.json'), true);
+$cardFields = $cardFixture['endpoints']['getStatus']['storedPaymentMethodFields'];
+sort($cardFields);
+
+foreach ([
+    'active card' => [$activeCardBody, $activeCardMac],
+    'null card' => [$nullCardBody, $nullCardMac],
+    'absent card' => [$absentCardBody, $absentCardMac],
+    'retired card' => [$retiredCardBody, $retiredCardMac],
+] as $label => [$cardBody, $cardMac]) {
+    check("payment event with $label verifies",
+        verdict($cardBody, 't=' . $eventTimestamp . ',v1=' . $cardMac, $secret, 300, $eventTimestamp), 'true');
+}
+check('storedPaymentMethod is inside the MAC: a changed card id fails',
+    verdict(str_replace('pm_0a1b', 'pm_ffff', $activeCardBody), 't=' . $eventTimestamp . ',v1=' . $activeCardMac, $secret, 300, $eventTimestamp),
+    'false');
+
+// The documented read: $event['data']['storedPaymentMethod'] ?? null.
+$activeCard = json_decode($activeCardBody, true)['data']['storedPaymentMethod'] ?? null;
+$activeKeys = is_array($activeCard) ? array_keys($activeCard) : [];
+sort($activeKeys);
+check('an active card has the same fields as getStatus() storedPaymentMethod', implode(',', $activeKeys), implode(',', $cardFields));
+check('an active card carries its pm_ id', (string) ($activeCard['id'] ?? ''), 'pm_0a1b2c3d4e5f60718293a4b5c6d7e8f9');
+check('an active card is chargeable', (string) ($activeCard['status'] ?? ''), 'active');
+check('an active card has no retiredReason', var_export($activeCard['retiredReason'] ?? null, true), 'NULL');
+check('an active card expiry stays an int', var_export($activeCard['expiryMonth'] ?? null, true) . '/' . var_export($activeCard['expiryYear'] ?? null, true), '12/2030');
+check('an active card status is in the vocabulary',
+    in_array($activeCard['status'] ?? null, DominaiteClient::STORED_PAYMENT_METHOD_STATUS_VOCABULARY, true) ? 'in vocabulary' : 'not', 'in vocabulary');
+
+check('a null card reads as null', var_export(json_decode($nullCardBody, true)['data']['storedPaymentMethod'] ?? null, true), 'NULL');
+check('an absent card reads as null', var_export(json_decode($absentCardBody, true)['data']['storedPaymentMethod'] ?? null, true), 'NULL');
+
+$retiredCard = json_decode($retiredCardBody, true)['data']['storedPaymentMethod'] ?? null;
+$retiredKeys = is_array($retiredCard) ? array_keys($retiredCard) : [];
+sort($retiredKeys);
+check('a retired card has the same fields as getStatus() storedPaymentMethod', implode(',', $retiredKeys), implode(',', $cardFields));
+check('a retired card reads as retired', (string) ($retiredCard['status'] ?? ''), 'retired');
+check('a retired card carries hard_decline', (string) ($retiredCard['retiredReason'] ?? ''), 'hard_decline');
+check('hard_decline is in the retired reason vocabulary',
+    in_array($retiredCard['retiredReason'] ?? null, DominaiteClient::STORED_PAYMENT_METHOD_RETIRED_REASON_VOCABULARY, true) ? 'in vocabulary' : 'not', 'in vocabulary');
+
 exit($failures === 0 ? 0 : 1);
