@@ -252,6 +252,35 @@ Events: `payment.succeeded`, `payment.failed`, `payment.requires_capture`,
 `payment.succeeded` is the only one that means money in hand. In-flight states (`pending`,
 `processing`) are not webhooked, so drive that part of your UX from the session status.
 
+### Saved card on payment events
+
+`payment.succeeded` and `payment.requires_capture` carry `data.storedPaymentMethod` when the
+payment saved a card (`saveCard`): the same object `getStatus()` returns as
+`storedPaymentMethod`, with the same fields and values. On every other `payment.*` event it
+is null.
+
+```json
+"storedPaymentMethod": {
+  "id": "pm_0a1b2c3d4e5f60718293a4b5c6d7e8f9",
+  "brand": "visa",
+  "last4": "4242",
+  "expiryMonth": 12,
+  "expiryYear": 2030,
+  "status": "active",
+  "retiredReason": null
+}
+```
+
+`status` is `active`, `revoked`, `expired` or `retired`; `retiredReason` is `hard_decline`,
+`chargeback`, `source_sale_reversed` or null. Webhook nulls arrive as an explicit `null`,
+but events recorded before the field existed do not carry it at all, so read it as
+`$event['data']['storedPaymentMethod'] ?? null`.
+
+> It can also be null when a card WAS saved: on a server-to-server sale approved
+> synchronously, on a sale whose outcome the platform confirmed later, and whenever the card
+> was stored after the approval was announced. `getStatus()` is the source of truth. On a
+> `saveCard` payment whose event has no card, read the status to pick it up.
+
 ### Agreement and charge events: order by sequence
 
 `agreement.activated`, `agreement.past_due`, `agreement.cancelled`, `charge.succeeded`,
@@ -345,8 +374,8 @@ by 10x or 100x. `minorUnitExponent($currency)` returns the exponent on its own.
 
 ## Retries and double-charges
 
-`idempotencyKey` is required on `createCheckoutSession()` and `chargePaymentMethod()`. Leave
-it out and the SDK throws `InvalidArgumentException` before anything is sent. It used to
+`idempotencyKey` is required on `createCheckoutSession()`, `chargePaymentMethod()` and
+`createRefund()`. Leave it out and the SDK throws `InvalidArgumentException` before anything is sent. It used to
 generate a random key for you; that is gone, because a random key per request turns every
 page reload, back button or retried timeout into a second payment for the same order.
 
@@ -547,6 +576,80 @@ The platform can also retire a card on its own: `status` `retired`, with `retire
 (`DominaiteClient::STORED_PAYMENT_METHOD_RETIRED_REASON_VOCABULARY`). A retired card is refused
 with `PAYMENT_METHOD_NOT_ACTIVE` too and never becomes active again, so ask the customer to save
 a card again. `retiredReason` is `null` on every other card.
+
+## Refunds
+
+`createRefund()` refunds a payment, all of it or part of it. `$transactionId` is the id
+`createCheckoutSession()` or `chargePaymentMethod()` returned; only card-not-present payments
+of your own account can be refunded, any other id is `PAYMENT_NOT_FOUND`. A refund is always
+in the payment's currency, and the amount is in minor units by the same rules as a payment
+(see [Amounts are minor units](#amounts-are-minor-units)).
+
+```php
+use Dominaite\Exception\RefundException;
+
+try {
+    // Part of a HUF payment: HUF has no decimals on the gateway, so this is 1500 HUF.
+    $refund = $client->createRefund($transactionId, [
+        'amount'         => DominaiteClient::toMinorUnits('1500', 'HUF'),
+        'reason'         => 'Returned item',              // optional, at most 500 characters
+        // Derived from YOUR refund (return or credit-note id), never random per attempt.
+        'idempotencyKey' => 'refund-' . $creditNoteId,
+    ]);
+    $db->saveRefund($creditNoteId, $refund['refundId']);  // re_..., status pending
+
+    // Everything still refundable: leave amount out and no amount is sent.
+    // $client->createRefund($transactionId, ['idempotencyKey' => 'refund-' . $creditNoteId]);
+} catch (RefundException $e) {
+    switch ($e->getErrorCode()) {
+        case 'REFUND_AMOUNT_EXCEEDED':  // 422: more than what is left, the message says how much is
+        case 'PAYMENT_NOT_REFUNDABLE':  // 422: not paid, already fully refunded, or all of it in progress
+            // Nothing was queued and the key is not burnt.
+            break;
+        case 'DUPLICATE_REQUEST':       // 409: this key is in flight, retry the SAME key shortly
+            break;
+        case 'IDEMPOTENCY_KEY_REUSED':  // 422: the key was used for a different refund, a bug on your side
+        case 'PAYMENT_NOT_FOUND':       // 404: not a card-not-present payment of yours
+            break;
+    }
+}
+```
+
+The refund runs asynchronously: the 202 means queued, not done. `idempotencyKey` is
+required and signed like a charge's, and the same key always answers the same `refundId`
+and never refunds twice; a replay answers with the refund as it stands now. A 500 (a
+`TransportException`) means nothing was queued: retry with the **same** key,
+`getLastIdempotencyKey()` reads it back. `RefundException` extends `ApiException` and
+`isRetryable()` tells the two retryable codes (`DUPLICATE_REQUEST`, `REFUND_NOT_FOUND`) from
+the rest.
+
+Read the outcome with `getRefund()`, or wait for the `payment.refunded` webhook:
+
+```php
+$refund = $client->getRefund($transactionId, $refundId);
+// ['refundId' => 're_...', 'transactionId' => ..., 'status' => 'succeeded', 'amount' => 1500,
+//  'currency' => 'HUF', 'failureCode' => null, 'failureMessage' => null,
+//  'completedAt' => '2026-09-26T10:05:40.1200000Z']
+```
+
+- `status` is `pending` (queued), `processing` (with the payment provider), `succeeded` or
+  `failed`. `succeeded` and `failed` are final. A failed refund is final for its key: a new
+  attempt needs a new key.
+- `amount` is the amount requested while `pending` (null for a full refund), the amount being
+  refunded while `processing` (null until a full refund has been sized), the amount actually
+  refunded once it has succeeded, and always null on a failed refund.
+- `failureCode` is set on a failed refund only: `REFUND_FAILED`, `REFUND_AMOUNT_EXCEEDED` or
+  `PAYMENT_NOT_REFUNDABLE` (`DominaiteClient::REFUND_FAILURE_CODES`). Treat a code you do not
+  know as `REFUND_FAILED`. `REFUND_FAILED` is never an HTTP error.
+- Right after the 202 the refund may not be picked up yet: `getRefund()` then throws
+  `RefundException` with `REFUND_NOT_FOUND`. Poll again for up to 60 seconds.
+- The gateway omits null fields on the wire; the SDK reads them as null, so every key is
+  always there.
+
+A completed refund fires `payment.refunded`, once per refund, partial or full. On it,
+`data.transactionId` is the refund's own transaction id, `data.amount` is that refund's
+amount and `data.originalTransactionId` is the payment you refunded. **A failed refund fires
+no webhook**: poll `getRefund()` if you need to know about failures.
 
 ## Fallback: status polling
 

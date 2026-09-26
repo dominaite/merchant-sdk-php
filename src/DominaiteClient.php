@@ -9,6 +9,7 @@ use Dominaite\Exception\AuthenticationException;
 use Dominaite\Exception\ChargeException;
 use Dominaite\Exception\CheckoutRefusedException;
 use Dominaite\Exception\RateLimitException;
+use Dominaite\Exception\RefundException;
 use Dominaite\Exception\RevokeException;
 use Dominaite\Exception\StorefrontException;
 use Dominaite\Exception\TransportException;
@@ -44,6 +45,12 @@ class DominaiteClient
      * {id} revokes it - both signed on this path with the id verbatim.
      */
     public const PAYMENT_METHODS_PATH = '/merchant-api/payment-methods';
+    /**
+     * Canonical path of payments. POST {transactionId}/refunds refunds one, GET
+     * {transactionId}/refunds/{refundId} reads a refund back - both signed on this path
+     * with the lowercase transaction id.
+     */
+    public const PAYMENTS_PATH = '/merchant-api/payments';
     public const PING_PATH = '/merchant-api/ping';
     private const USER_AGENT = 'dominaite-php/0.3.0 (php ' . PHP_VERSION . ')';
     private const TIMEOUT_SECONDS = 15;
@@ -262,6 +269,72 @@ class DominaiteClient
     public const REVOKE_ERROR_CODES = [
         'UPSTREAM_CONTRACT_ERROR',
         'MERCHANT_API_UNAVAILABLE',
+    ];
+
+    /** HTTP 404 on a refund route: no card-not-present payment with this id under your account. */
+    public const PAYMENT_NOT_FOUND = 'PAYMENT_NOT_FOUND';
+
+    /**
+     * HTTP 404 on getRefund() only: no refund with this id on this payment. Right after the
+     * 202 the refund may not be picked up yet, so poll again for up to 60 seconds.
+     */
+    public const REFUND_NOT_FOUND = 'REFUND_NOT_FOUND';
+
+    /**
+     * The payment cannot be refunded: not paid, already fully refunded, or everything left
+     * is already being refunded. HTTP 422 on createRefund() (nothing queued, the key is not
+     * burnt), or the failureCode of a failed refund.
+     */
+    public const PAYMENT_NOT_REFUNDABLE = 'PAYMENT_NOT_REFUNDABLE';
+
+    /**
+     * The amount is more than what is left to refund, counting refunds in progress. HTTP
+     * 422 on createRefund() (nothing queued, the key is not burnt), or the failureCode of a
+     * failed refund.
+     */
+    public const REFUND_AMOUNT_EXCEEDED = 'REFUND_AMOUNT_EXCEEDED';
+
+    /** failureCode of a refund the provider did not complete. Never an HTTP error. */
+    public const REFUND_FAILED = 'REFUND_FAILED';
+
+    /**
+     * Every value a refund's `status` can carry, in the API's own order. pending: queued.
+     * processing: with the payment provider. succeeded and failed are final; failed is
+     * final for its idempotency key, so a new attempt needs a new key.
+     */
+    public const REFUND_STATUS_VOCABULARY = [
+        'pending',
+        'processing',
+        'succeeded',
+        'failed',
+    ];
+
+    /**
+     * Every errorCode the refund routes raise as a RefundException, in the API's own order:
+     * 404 PAYMENT_NOT_FOUND, 404 REFUND_NOT_FOUND (getRefund() only, retryable), 422
+     * PAYMENT_NOT_REFUNDABLE and REFUND_AMOUNT_EXCEEDED (nothing queued, key not burnt), 422
+     * IDEMPOTENCY_KEY_REUSED, 409 DUPLICATE_REQUEST (retryable with the SAME key) and 400
+     * IDEMPOTENCY_KEY_REQUIRED. REFUND_FAILED is deliberately not one of them: it is the
+     * failureCode of a failed refund.
+     */
+    public const REFUND_ERROR_CODES = [
+        self::PAYMENT_NOT_FOUND,
+        self::REFUND_NOT_FOUND,
+        self::PAYMENT_NOT_REFUNDABLE,
+        self::REFUND_AMOUNT_EXCEEDED,
+        self::IDEMPOTENCY_KEY_REUSED,
+        self::DUPLICATE_REQUEST,
+        'IDEMPOTENCY_KEY_REQUIRED',
+    ];
+
+    /**
+     * Every value a failed refund's `failureCode` can carry, in the API's own order. Treat
+     * an unknown value as REFUND_FAILED.
+     */
+    public const REFUND_FAILURE_CODES = [
+        self::REFUND_AMOUNT_EXCEEDED,
+        self::PAYMENT_NOT_REFUNDABLE,
+        self::REFUND_FAILED,
     ];
 
     /**
@@ -498,8 +571,8 @@ class DominaiteClient
     }
 
     /**
-     * The idempotency key the last createCheckoutSession() or chargePaymentMethod() call
-     * sent. Always the one you passed: the SDK no longer generates keys.
+     * The idempotency key the last createCheckoutSession(), chargePaymentMethod() or
+     * createRefund() call sent. Always the one you passed: the SDK no longer generates keys.
      *
      * Handy in a generic catch block that did not keep the params around. On a timeout
      * you cannot know whether the gateway created the session, and retrying with a NEW key
@@ -515,12 +588,12 @@ class DominaiteClient
      * rejected locally without reaching the API - it always means "the key of the most
      * recent attempt that went out", never an older order's.
      *
-     * It is a single slot on a client you can reuse, so the next createCheckoutSession()
-     * or chargePaymentMethod() overwrites it. On a long-lived worker that means reading it
+     * It is a single slot on a client you can reuse, so the next createCheckoutSession(),
+     * chargePaymentMethod() or createRefund() overwrites it. On a long-lived worker that means reading it
      * in the catch block and storing it against your order, not going back for it later.
      *
-     * ping(), getStatus() and revokePaymentMethod() sign an empty key by design and leave
-     * this untouched.
+     * ping(), getStatus(), getRefund() and revokePaymentMethod() sign an empty key by design
+     * and leave this untouched.
      */
     public function getLastIdempotencyKey(): ?string
     {
@@ -555,6 +628,14 @@ class DominaiteClient
      * gateway's string category of how the payer paid ('card', 'wallet', ...) and
      * passes through untouched.
      *
+     * payment.succeeded and payment.requires_capture webhooks carry the same object as
+     * data.storedPaymentMethod, null when no card was saved (and on every other payment.*
+     * event); an event recorded before the field existed does not carry it at all. It can also be null when a card WAS saved: on a
+     * server-to-server sale approved synchronously, on a sale whose outcome the platform
+     * confirmed later, and whenever the card was stored after the approval was announced.
+     * This status read is the source of truth: on a saveCard session whose webhook has no
+     * card, read it here.
+     *
      * @param string $transactionId The transactionId returned by createCheckoutSession().
      * @return array{transactionId:string,orderId:string,orderReference:?string,status:string,amount:int,currency:string,refundedAmount:?int,createdAt:string,updatedAt:?string,expiresAt:?string,storedPaymentMethod?:?array{id:string,brand:?string,last4:?string,expiryMonth:?int,expiryYear:?int,status:string,retiredReason:?string}}
      *
@@ -565,10 +646,7 @@ class DominaiteClient
      */
     public function getStatus(string $transactionId): array
     {
-        $normalized = strtolower(trim($transactionId));
-        if (preg_match('/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/', $normalized) !== 1) {
-            throw new \InvalidArgumentException('transactionId must be the UUID returned by createCheckoutSession()');
-        }
+        $normalized = self::normalizeTransactionId($transactionId);
 
         $status = $this->request('GET', self::SESSIONS_PATH . '/' . $normalized, null, '');
 
@@ -730,6 +808,133 @@ class DominaiteClient
             );
         }
         throw self::rejection($reply);
+    }
+
+    /**
+     * Refunds a payment, all of it or part of it. The refund runs asynchronously: HTTP 202
+     * means queued, not done.
+     *
+     * $transactionId is the id createCheckoutSession() or chargePaymentMethod() returned.
+     * Required param: idempotencyKey. Derive it from YOUR refund (a return or credit-note
+     * id), never a random value per attempt: the same key always answers the same refundId
+     * and never refunds twice, and a replay answers 202 with the refund as it stands now.
+     * A missing key throws InvalidArgumentException before anything is sent. Optional:
+     * amount (int, MINOR units of the payment's currency, see toMinorUnits()); omit it (or
+     * pass null) to refund everything still refundable, and no amount key is sent. reason
+     * (string, at most 500 characters, stored with the refund).
+     *
+     * Returns the refund: {refundId, transactionId, status, amount, currency, failureCode,
+     * failureMessage, completedAt}, the same shape getRefund() reads. status is pending or
+     * processing here, as a rule. Read the outcome with getRefund(), or wait for the
+     * payment.refunded webhook, which fires when the money has moved. A failed refund
+     * sends no webhook: poll getRefund() if you need to know about failures.
+     *
+     * @param array<string,mixed> $params
+     * @return array{refundId:string,transactionId:string,status:string,amount:?int,currency:string,failureCode:?string,failureMessage:?string,completedAt:?string}
+     *
+     * @throws RefundException         A code in REFUND_ERROR_CODES: branch on getErrorCode(). isRetryable()
+     *                                 is true for DUPLICATE_REQUEST (retry the SAME key for up to 120s).
+     * @throws AuthenticationException Wrong/revoked credentials or bad signature (fix config; do not retry).
+     * @throws ApiException            Validation (HTTP 400) or an unexpected response.
+     * @throws RateLimitException     HTTP 429 - back off (getRetryAfterSeconds()), retry with the same key.
+     * @throws TransportException      Network-level failure or a 5xx: nothing was queued on a 500, retry
+     *                                 WITH the same idempotencyKey (getLastIdempotencyKey()).
+     */
+    public function createRefund(string $transactionId, array $params): array
+    {
+        $this->lastIdempotencyKey = null;
+
+        $id = self::normalizeTransactionId($transactionId);
+        if (isset($params['amount']) && (!is_int($params['amount']) || $params['amount'] <= 0)) {
+            throw new \InvalidArgumentException('amount must be a positive integer in MINOR units, or omitted to refund everything still refundable');
+        }
+        if (isset($params['reason']) && !is_string($params['reason'])) {
+            throw new \InvalidArgumentException('reason must be a string');
+        }
+        $idempotencyKey = self::normalizeIdempotencyKey($params['idempotencyKey'] ?? null);
+
+        // Built field by field: the body is what gets signed. A full refund sends no
+        // amount key at all, which is what the gateway reads as "everything left".
+        $body = [];
+        if (isset($params['amount'])) {
+            $body['amount'] = $params['amount'];
+        }
+        if (isset($params['reason'])) {
+            $body['reason'] = $params['reason'];
+        }
+
+        $this->lastIdempotencyKey = $idempotencyKey;
+
+        return self::refundReply(
+            $this->send('POST', self::PAYMENTS_PATH . '/' . $id . '/refunds', $body, $idempotencyKey)
+        );
+    }
+
+    /**
+     * Reads one refund back: {refundId, transactionId, status, amount, currency,
+     * failureCode, failureMessage, completedAt}.
+     *
+     * status is one of REFUND_STATUS_VOCABULARY; succeeded and failed are final. amount is
+     * the amount requested on pending (null for a full refund), the amount being refunded on
+     * processing (null until a full refund has been sized), the amount actually refunded on
+     * succeeded, and always null on failed. failureCode and failureMessage are
+     * set on failed only; failureCode is one of REFUND_FAILURE_CODES, and an unknown value
+     * means REFUND_FAILED. completedAt is set once the refund is final. The gateway omits
+     * null fields on the wire; they read as null here.
+     *
+     * Right after createRefund() the refund may not be picked up yet: REFUND_NOT_FOUND
+     * then comes back as a RefundException with isRetryable() true. Poll again for up to
+     * 60 seconds; after that the id is unknown.
+     *
+     * @param string $transactionId The payment the refund belongs to.
+     * @param string $refundId      The refundId createRefund() returned.
+     * @return array{refundId:string,transactionId:string,status:string,amount:?int,currency:string,failureCode:?string,failureMessage:?string,completedAt:?string}
+     *
+     * @throws RefundException         PAYMENT_NOT_FOUND or REFUND_NOT_FOUND (HTTP 404): branch on getErrorCode().
+     * @throws AuthenticationException Wrong/revoked credentials or bad signature (fix config; do not retry).
+     * @throws ApiException            Unexpected response.
+     * @throws RateLimitException     HTTP 429 - back off (getRetryAfterSeconds()).
+     * @throws TransportException      Network-level failure or a 5xx (safe to retry).
+     */
+    public function getRefund(string $transactionId, string $refundId): array
+    {
+        $id = self::normalizeTransactionId($transactionId);
+        $refund = self::normalizeRefundId($refundId);
+
+        // GET signs an EMPTY idempotency key and an EMPTY body, like getStatus().
+        return self::refundReply(
+            $this->send('GET', self::PAYMENTS_PATH . '/' . $id . '/refunds/' . $refund, null, '')
+        );
+    }
+
+    /**
+     * The reading shared by both refund routes: the refund on a 2xx, a RefundException for
+     * a code in REFUND_ERROR_CODES, the generic exceptions for everything else.
+     *
+     * @param array{status:int,envelope:array<string,mixed>,payload:array<string,mixed>,error:array<string,mixed>} $reply
+     * @return array<string,mixed>
+     */
+    private static function refundReply(array $reply): array
+    {
+        $data = $reply['envelope']['data'] ?? null;
+        if ($reply['status'] < 400 && is_array($data) && is_string($data['refundId'] ?? null)) {
+            return self::refund($data);
+        }
+
+        $errorCode = $reply['error']['code'] ?? null;
+        if ($reply['status'] >= 400 && $reply['status'] < 500
+            && is_string($errorCode) && in_array($errorCode, self::REFUND_ERROR_CODES, true)) {
+            throw new RefundException(
+                $reply['status'],
+                (string) ($reply['error']['message'] ?? 'The refund was refused.'),
+                $errorCode,
+                $reply['envelope']
+            );
+        }
+        if ($reply['status'] >= 400) {
+            throw self::rejection($reply);
+        }
+        throw new ApiException($reply['status'], 'The API answered without a refund body', 'UNEXPECTED_RESPONSE');
     }
 
     /**
@@ -907,6 +1112,28 @@ class DominaiteClient
         return $normalized;
     }
 
+    /** A transaction id goes into the signed path in lowercase hyphenated form. */
+    private static function normalizeTransactionId(string $transactionId): string
+    {
+        $normalized = strtolower(trim($transactionId));
+        if (preg_match('/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/', $normalized) !== 1) {
+            throw new \InvalidArgumentException('transactionId must be the UUID returned by createCheckoutSession()');
+        }
+
+        return $normalized;
+    }
+
+    /** Same guard as a payment method id: the refund id is one segment of the signed path. */
+    private static function normalizeRefundId(string $refundId): string
+    {
+        $normalized = trim($refundId);
+        if (preg_match(self::PAYMENT_METHOD_ID_PATTERN, $normalized) !== 1) {
+            throw new \InvalidArgumentException('refundId must be the refundId createRefund() returned');
+        }
+
+        return $normalized;
+    }
+
     /**
      * Verifies the signature on an incoming webhook delivery.
      *
@@ -1058,6 +1285,10 @@ class DominaiteClient
     {
         if ($body === null) {
             $json = '';
+        } elseif ($body === []) {
+            // A full refund with no reason: json_encode() would send an empty PHP array
+            // as the JSON list [], and the route reads a JSON object.
+            $json = '{}';
         } else {
             $json = json_encode($body, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
             if ($json === false) {
@@ -1261,6 +1492,27 @@ class DominaiteClient
         $data['declineClass'] = is_string($data['declineClass'] ?? null) ? $data['declineClass'] : null;
         $data['declineCode'] = is_string($data['declineCode'] ?? null) ? $data['declineCode'] : null;
         $data['transactionId'] = (string) ($data['transactionId'] ?? '');
+
+        return $data;
+    }
+
+    /**
+     * The refund as one shape: the gateway omits amount, failureCode, failureMessage and
+     * completedAt when they are null, so absent reads as null.
+     *
+     * @param array<string,mixed> $data
+     * @return array<string,mixed>
+     */
+    private static function refund(array $data): array
+    {
+        $data['refundId'] = (string) $data['refundId'];
+        $data['transactionId'] = (string) ($data['transactionId'] ?? '');
+        $data['status'] = (string) ($data['status'] ?? '');
+        $data['amount'] = is_int($data['amount'] ?? null) ? $data['amount'] : null;
+        $data['currency'] = (string) ($data['currency'] ?? '');
+        $data['failureCode'] = is_string($data['failureCode'] ?? null) ? $data['failureCode'] : null;
+        $data['failureMessage'] = is_string($data['failureMessage'] ?? null) ? $data['failureMessage'] : null;
+        $data['completedAt'] = is_string($data['completedAt'] ?? null) ? $data['completedAt'] : null;
 
         return $data;
     }

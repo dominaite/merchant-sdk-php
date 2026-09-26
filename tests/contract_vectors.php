@@ -18,6 +18,7 @@ require __DIR__ . '/../src/Exception/AuthenticationException.php';
 require __DIR__ . '/../src/Exception/ChargeException.php';
 require __DIR__ . '/../src/Exception/CheckoutRefusedException.php';
 require __DIR__ . '/../src/Exception/RateLimitException.php';
+require __DIR__ . '/../src/Exception/RefundException.php';
 require __DIR__ . '/../src/Exception/RevokeException.php';
 require __DIR__ . '/../src/Exception/StorefrontException.php';
 require __DIR__ . '/../src/Exception/TransportException.php';
@@ -26,6 +27,7 @@ use Dominaite\DominaiteClient;
 use Dominaite\Exception\ApiException;
 use Dominaite\Exception\ChargeException;
 use Dominaite\Exception\CheckoutRefusedException;
+use Dominaite\Exception\RefundException;
 use Dominaite\Exception\RevokeException;
 use Dominaite\Exception\StorefrontException;
 use Dominaite\Exception\TransportException;
@@ -648,5 +650,100 @@ check('a codeless 503 on a revoke is a retryable transport error',
     thrownBy(static function () use ($paymentMethodId): void {
         (new CannedClient(['success' => false], 503))->revokePaymentMethod($paymentMethodId);
     }), TransportException::class);
+
+// --- refunds ----------------------------------------------------------------------------
+// The vocabularies, in the fixture's order.
+check('refund status vocabulary matches the fixture',
+    listOf(DominaiteClient::REFUND_STATUS_VOCABULARY), listOf($fixture['refundStatusVocabulary']));
+check('refund error codes match the fixture',
+    listOf(DominaiteClient::REFUND_ERROR_CODES), listOf($fixture['refundErrorCodes']));
+check('refund failure codes match the fixture',
+    listOf(DominaiteClient::REFUND_FAILURE_CODES), listOf($fixture['refundFailureCodes']));
+check('REFUND_FAILED is a failure code, never a refund error code',
+    in_array('REFUND_FAILED', DominaiteClient::REFUND_ERROR_CODES, true) ? 'listed' : 'not listed', 'not listed');
+
+$createRefund = $endpoints['createRefund'];
+$getRefund = $endpoints['getRefund'];
+check('refund paths match the fixture',
+    DominaiteClient::PAYMENTS_PATH . '/{transactionId}/refunds ' . DominaiteClient::PAYMENTS_PATH . '/{transactionId}/refunds/{refundId}',
+    $createRefund['path'] . ' ' . $getRefund['path']);
+check('createRefund is a POST that answers 202', $createRefund['method'] . ' ' . $createRefund['httpStatus'], 'POST 202');
+check('getRefund is a GET that answers 200', $getRefund['method'] . ' ' . $getRefund['httpStatus'], 'GET 200');
+check('both refund routes answer the same field set', sortedList($createRefund['fields']), sortedList($getRefund['fields']));
+
+$refundTransactionId = (string) $createRefund['partialExample']['data']['transactionId'];
+$refundParams = ['amount' => 2500, 'idempotencyKey' => 'refund-credit-note-77'];
+
+// Every example deserializes into exactly the fixture's fields: as spelled (nulls absent
+// already, the gateway omits them) and with every field the SDK must fill in.
+$refundExamples = [
+    'createRefund partialExample' => [$createRefund['partialExample'], 202, 'create'],
+    'createRefund fullExample' => [$createRefund['fullExample'], 202, 'create'],
+    'getRefund succeededExample' => [$getRefund['succeededExample'], 200, 'get'],
+    'getRefund failedExample' => [$getRefund['failedExample'], 200, 'get'],
+];
+foreach ($refundExamples as $label => [$example, $httpStatus, $route]) {
+    $client = new CannedClient($example, $httpStatus);
+    $read = $route === 'create'
+        ? $client->createRefund($refundTransactionId, $refundParams)
+        : $client->getRefund($refundTransactionId, (string) $example['data']['refundId']);
+    check("$label field set matches the fixture", keysOf($read), sortedList($createRefund['fields']));
+    check("$label carries its refund id", (string) $read['refundId'], (string) $example['data']['refundId']);
+    check("$label status is in the vocabulary",
+        in_array($read['status'], DominaiteClient::REFUND_STATUS_VOCABULARY, true) ? 'in vocabulary' : (string) $read['status'], 'in vocabulary');
+    check("$label refund id is re_ plus 32 hex characters",
+        preg_match('/^re_[0-9a-f]{32}$/', (string) $read['refundId']) === 1 ? 'well-formed' : (string) $read['refundId'], 'well-formed');
+    foreach ($createRefund['fields'] as $field) {
+        check("$label reads $field as sent or null",
+            var_export($read[$field], true), var_export($example['data'][$field] ?? null, true));
+    }
+}
+
+$createClient = new CannedClient($createRefund['partialExample'], 202);
+$createClient->createRefund($refundTransactionId, $refundParams);
+check('createRefund is a POST on the fixture path', listOf($createClient->calls),
+    'POST ' . str_replace('{transactionId}', $refundTransactionId, (string) $createRefund['path']));
+check('createRefund signs the caller key', listOf($createClient->idempotencyKeys), 'refund-credit-note-77');
+
+$refundId = (string) $getRefund['succeededExample']['data']['refundId'];
+$getClient = new CannedClient($getRefund['succeededExample'], 200);
+$getClient->getRefund($refundTransactionId, $refundId);
+check('getRefund is a GET on the fixture path', listOf($getClient->calls),
+    'GET ' . str_replace(['{transactionId}', '{refundId}'], [$refundTransactionId, $refundId], (string) $getRefund['path']));
+check('getRefund signs an empty idempotency key', listOf($getClient->idempotencyKeys), '');
+
+check('a full refund example has no amount', array_key_exists('amount', $createRefund['fullExample']['data']) ? 'present' : 'absent', 'absent');
+check('a failed refund example has no amount', array_key_exists('amount', $getRefund['failedExample']['data']) ? 'present' : 'absent', 'absent');
+check('the failed example carries a known failure code',
+    in_array($getRefund['failedExample']['data']['failureCode'], DominaiteClient::REFUND_FAILURE_CODES, true) ? 'known' : 'unknown', 'known');
+
+// Every error example is a RefundException keeping status, code, message and envelope.
+foreach (['createRefund' => $createRefund, 'getRefund' => $getRefund] as $route => $endpoint) {
+    foreach ($endpoint['errorExamples'] as $example) {
+        $label = "$route error example " . $example['httpStatus'] . ' ' . $example['code'];
+        check("$label names a known code",
+            in_array($example['code'], DominaiteClient::REFUND_ERROR_CODES, true) ? 'known' : 'unknown', 'known');
+        check("$label carries its code at error.code", (string) $example['body']['error']['code'], (string) $example['code']);
+        $thrown = null;
+        try {
+            $client = new CannedClient($example['body'], (int) $example['httpStatus']);
+            $route === 'createRefund'
+                ? $client->createRefund($refundTransactionId, $refundParams)
+                : $client->getRefund($refundTransactionId, $refundId);
+        } catch (RefundException $e) {
+            $thrown = $e;
+        }
+        check("$label throws RefundException", $thrown === null ? 'no exception' : get_class($thrown), RefundException::class);
+        if ($thrown === null) {
+            continue;
+        }
+        check("$label keeps the HTTP status", (string) $thrown->getHttpStatus(), (string) $example['httpStatus']);
+        check("$label keeps error.code", (string) $thrown->getErrorCode(), (string) $example['code']);
+        check("$label keeps error.message", $thrown->getMessage(), (string) $example['body']['error']['message']);
+        check("$label keeps the whole envelope", keysOf($thrown->getResult()), keysOf($example['body']));
+        check("$label retry classification", var_export($thrown->isRetryable(), true),
+            $example['code'] === 'REFUND_NOT_FOUND' ? 'true' : 'false');
+    }
+}
 
 exit($failures === 0 ? 0 : 1);

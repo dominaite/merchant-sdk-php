@@ -16,6 +16,7 @@ require __DIR__ . '/../src/Exception/ApiException.php';
 require __DIR__ . '/../src/Exception/AuthenticationException.php';
 require __DIR__ . '/../src/Exception/CheckoutRefusedException.php';
 require __DIR__ . '/../src/Exception/RateLimitException.php';
+require __DIR__ . '/../src/Exception/RefundException.php';
 require __DIR__ . '/../src/Exception/StorefrontException.php';
 require __DIR__ . '/../src/Exception/TransportException.php';
 
@@ -240,6 +241,26 @@ try {
 }
 check('an unknown payment method is an ApiException', $missing === null ? 'no exception' : get_class($missing), ApiException::class);
 check('the unknown payment method keeps its 404', (string) ($missing === null ? 0 : $missing->getHttpStatus()), '404');
+
+// --- refunds on the wire ----------------------------------------------------------------
+// The key goes out twice: in the Idempotency-Key header and inside the signature. A full
+// refund sends {} with no amount key.
+$refund = $client->createRefund('1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d', ['idempotencyKey' => 'refund-credit-note-77']);
+check('a live refund answers with the unwrapped 202 body', (string) ($refund['refundId'] ?? ''), 're_7c1e9a2b4d6f48a0b3c5d7e9f1a2b3c4');
+check('a live full refund reads the omitted amount as null, present',
+    array_key_exists('amount', $refund) ? var_export($refund['amount'], true) : 'absent', 'NULL');
+$seen = lastRequest($recordFile);
+check('the refund went out as POST on the canonical path', $seen['method'] . ' ' . $seen['path'],
+    'POST /merchant-api/payments/1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d/refunds');
+check('the full refund body on the wire is an empty object', $seen['body'], '{}');
+check('the refund carries the Idempotency-Key header', $seen['headers']['idempotency-key'] ?? '', 'refund-credit-note-77');
+check('the refund signature covers method, path, key and body bytes', $seen['headers']['x-signature'] ?? '',
+    DominaiteClient::signRequest(SECRET, $seen['headers']['x-timestamp'] ?? '', 'POST', $seen['path'],
+        'refund-credit-note-77', $seen['body']));
+check('the refund signature does not verify under an empty key', ($seen['headers']['x-signature'] ?? '') ===
+    DominaiteClient::signRequest(SECRET, $seen['headers']['x-timestamp'] ?? '', 'POST', $seen['path'], '', $seen['body'])
+        ? 'verifies' : 'refused', 'refused');
+unlink($recordFile);
 
 // --- storefront refusals on the wire ---------------------------------------------------
 // A mint for a storefront the provider has not whitelisted answers 409 with the code in

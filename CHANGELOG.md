@@ -11,6 +11,19 @@ Added:
   `agreement.*` and `charge.*` events, and ordering them by `data.sequence` per object.
   Additive on the wire: `verifyWebhook()` is unchanged and the canonical signature vector
   still verifies. Events recorded before these fields existed arrive without them.
+- Refunds: `createRefund()` (POST, 202, required signed `idempotencyKey`, optional `amount`
+  in minor units and `reason`; no amount refunds everything still refundable) and
+  `getRefund()`. Both return `{refundId, transactionId, status, amount, currency,
+  failureCode, failureMessage, completedAt}` with omitted nulls read as null.
+  `REFUND_STATUS_VOCABULARY`, `REFUND_ERROR_CODES`, `REFUND_FAILURE_CODES` and named
+  constants for the new codes, pinned against the contract fixture. The refund error codes
+  raise `RefundException` (extends `ApiException`), whose `isRetryable()` is true for
+  `REFUND_NOT_FOUND` and `DUPLICATE_REQUEST`. `REFUND_FAILED` is a `failureCode`, never an
+  HTTP error. A failed refund fires no webhook: poll `getRefund()`.
+- `data.storedPaymentMethod` on `payment.succeeded` and `payment.requires_capture`
+  webhooks, documented: the same object as `storedPaymentMethod` on `getStatus()`, null on
+  every other `payment.*` event. It can be null even when a card was saved; the
+  status read is the source of truth.
 
 ## 0.3.0
 
