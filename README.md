@@ -635,8 +635,9 @@ $refund = $client->getRefund($transactionId, $refundId);
 - `status` is `pending` (queued), `processing` (with the payment provider), `succeeded` or
   `failed`. `succeeded` and `failed` are final. A failed refund is final for its key: a new
   attempt needs a new key.
-- `amount` is the amount requested until the refund succeeds (null for a full refund), the
-  amount actually refunded once it has, and always null on a failed refund.
+- `amount` is the amount requested while `pending` (null for a full refund), the amount being
+  refunded while `processing` (null until a full refund has been sized), the amount actually
+  refunded once it has succeeded, and always null on a failed refund.
 - `failureCode` is set on a failed refund only: `REFUND_FAILED`, `REFUND_AMOUNT_EXCEEDED` or
   `PAYMENT_NOT_REFUNDABLE` (`DominaiteClient::REFUND_FAILURE_CODES`). Treat a code you do not
   know as `REFUND_FAILED`. `REFUND_FAILED` is never an HTTP error.

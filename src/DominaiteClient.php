@@ -875,8 +875,9 @@ class DominaiteClient
      * failureCode, failureMessage, completedAt}.
      *
      * status is one of REFUND_STATUS_VOCABULARY; succeeded and failed are final. amount is
-     * the amount requested before success (null for a full refund), the amount actually
-     * refunded on succeeded, and always null on failed. failureCode and failureMessage are
+     * the amount requested on pending (null for a full refund), the amount being refunded on
+     * processing (null until a full refund has been sized), the amount actually refunded on
+     * succeeded, and always null on failed. failureCode and failureMessage are
      * set on failed only; failureCode is one of REFUND_FAILURE_CODES, and an unknown value
      * means REFUND_FAILED. completedAt is set once the refund is final. The gateway omits
      * null fields on the wire; they read as null here.
