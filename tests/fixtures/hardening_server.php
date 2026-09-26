@@ -9,11 +9,11 @@ declare(strict_types=1);
 
 $path = (string) parse_url((string) ($_SERVER['REQUEST_URI'] ?? '/'), PHP_URL_PATH);
 
-// The stored-payment-method routes record the request exactly as it arrived - method,
-// path, body bytes and the signed headers - so the transport test can recompute the
-// signature over what actually went on the wire. Written to a file because the revoke
+// The stored-payment-method and refund routes record the request exactly as it arrived -
+// method, path, body bytes and the signed headers - so the transport test can recompute
+// the signature over what actually went on the wire. Written to a file because the revoke
 // answer is a 204 with no body to echo into.
-if (strpos($path, '/merchant-api/payment-methods/') === 0) {
+if (strpos($path, '/merchant-api/payment-methods/') === 0 || strpos($path, '/merchant-api/payments/') === 0) {
     $headers = [];
     foreach ($_SERVER as $name => $value) {
         if (strpos($name, 'HTTP_') === 0) {
@@ -49,6 +49,24 @@ if (strpos($path, '/merchant-api/payment-methods/') === 0) {
     }
     if (($_SERVER['REQUEST_METHOD'] ?? '') === 'DELETE' && $path === $known) {
         http_response_code(204);
+        return true;
+    }
+
+    // A refund answers 202 with the refund queued; a full refund has no amount on the wire.
+    $payment = '/merchant-api/payments/1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d/refunds';
+    if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST' && $path === $payment) {
+        http_response_code(202);
+        header('Content-Type: application/json');
+        echo json_encode([
+            'success' => true,
+            'data' => [
+                'refundId' => 're_7c1e9a2b4d6f48a0b3c5d7e9f1a2b3c4',
+                'transactionId' => '1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d',
+                'status' => 'pending',
+                'currency' => 'HUF',
+            ],
+            'metadata' => ['requestId' => 'live', 'timestamp' => '2026-09-26T10:04:12Z', 'apiVersion' => '1.0', 'processingTimeMs' => 1],
+        ]);
         return true;
     }
 }
