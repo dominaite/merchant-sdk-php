@@ -52,7 +52,7 @@ class DominaiteClient
      */
     public const PAYMENTS_PATH = '/merchant-api/payments';
     public const PING_PATH = '/merchant-api/ping';
-    private const USER_AGENT = 'dominaite-php/0.3.0 (php ' . PHP_VERSION . ')';
+    private const USER_AGENT = 'dominaite-php/0.3.1 (php ' . PHP_VERSION . ')';
     private const TIMEOUT_SECONDS = 15;
 
     /**
