@@ -628,8 +628,9 @@ class DominaiteClient
      * gateway's string category of how the payer paid ('card', 'wallet', ...) and
      * passes through untouched.
      *
-     * payment.* webhooks carry the same object as data.storedPaymentMethod, null or absent
-     * when no card was saved. It can also be null when a card WAS saved: on a
+     * payment.succeeded and payment.requires_capture webhooks carry the same object as
+     * data.storedPaymentMethod, null when no card was saved (and on every other payment.*
+     * event); an event recorded before the field existed does not carry it at all. It can also be null when a card WAS saved: on a
      * server-to-server sale approved synchronously, on a sale whose outcome the platform
      * confirmed later, and whenever the card was stored after the approval was announced.
      * This status read is the source of truth: on a saveCard session whose webhook has no

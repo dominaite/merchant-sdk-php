@@ -20,8 +20,9 @@ Added:
   raise `RefundException` (extends `ApiException`), whose `isRetryable()` is true for
   `REFUND_NOT_FOUND` and `DUPLICATE_REQUEST`. `REFUND_FAILED` is a `failureCode`, never an
   HTTP error. A failed refund fires no webhook: poll `getRefund()`.
-- `data.storedPaymentMethod` on `payment.*` webhooks, documented: the same object as
-  `storedPaymentMethod` on `getStatus()`. It can be null even when a card was saved; the
+- `data.storedPaymentMethod` on `payment.succeeded` and `payment.requires_capture`
+  webhooks, documented: the same object as `storedPaymentMethod` on `getStatus()`, null on
+  every other `payment.*` event. It can be null even when a card was saved; the
   status read is the source of truth.
 
 ## 0.3.0

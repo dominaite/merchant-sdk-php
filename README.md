@@ -254,9 +254,10 @@ Events: `payment.succeeded`, `payment.failed`, `payment.requires_capture`,
 
 ### Saved card on payment events
 
-`payment.*` events carry `data.storedPaymentMethod` when the payment saved a card
-(`saveCard`): the same object `getStatus()` returns as `storedPaymentMethod`, with the same
-fields and values.
+`payment.succeeded` and `payment.requires_capture` carry `data.storedPaymentMethod` when the
+payment saved a card (`saveCard`): the same object `getStatus()` returns as
+`storedPaymentMethod`, with the same fields and values. On every other `payment.*` event it
+is null.
 
 ```json
 "storedPaymentMethod": {
@@ -271,8 +272,9 @@ fields and values.
 ```
 
 `status` is `active`, `revoked`, `expired` or `retired`; `retiredReason` is `hard_decline`,
-`chargeback`, `source_sale_reversed` or null. The field is null, or missing entirely, when no
-card was saved, so read it as `$event['data']['storedPaymentMethod'] ?? null`.
+`chargeback`, `source_sale_reversed` or null. Webhook nulls arrive as an explicit `null`,
+but events recorded before the field existed do not carry it at all, so read it as
+`$event['data']['storedPaymentMethod'] ?? null`.
 
 > It can also be null when a card WAS saved: on a server-to-server sale approved
 > synchronously, on a sale whose outcome the platform confirmed later, and whenever the card
