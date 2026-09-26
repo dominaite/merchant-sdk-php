@@ -89,20 +89,22 @@ check('the storefront list is exactly the storefront constants',
 check('storefront codes are not HTTP 200 refusals',
     json_encode(array_values(array_intersect(DominaiteClient::STOREFRONT_ERROR_CODES, DominaiteClient::REFUSAL_ERROR_CODES))), '[]');
 
-// The storefront codes are not in the published contract yet. Once the gateway lists
-// them, their HTTP status has to be the one the SDK documents.
+// The gateway publishes the storefront codes as their own group: the SDK's list is that
+// group in order, each at the status the SDK documents, none retryable.
+check('the storefront list is exactly the contract storefront group, in order',
+    json_encode(DominaiteClient::STOREFRONT_ERROR_CODES),
+    json_encode(array_map(static function (array $entry): string {
+        return $entry['code'];
+    }, $wire['errorCodes']['storefront'])));
 $storefrontStatus = [
-    'STOREFRONT_NOT_WHITELISTED' => 409,
-    'STOREFRONT_INACTIVE' => 409,
     'STOREFRONT_MISMATCH' => 400,
+    'STOREFRONT_INACTIVE' => 409,
+    'STOREFRONT_NOT_WHITELISTED' => 409,
 ];
-foreach ($wire['errorCodes'] as $group) {
-    foreach ($group as $entry) {
-        if (isset($storefrontStatus[$entry['code']])) {
-            check("the contract's {$entry['code']} status matches the SDK",
-                (string) $entry['httpStatus'], (string) $storefrontStatus[$entry['code']]);
-        }
-    }
+foreach ($wire['errorCodes']['storefront'] as $entry) {
+    check("the contract's {$entry['code']} status matches the SDK",
+        (string) $entry['httpStatus'], (string) ($storefrontStatus[$entry['code']] ?? 'unknown'));
+    check("the contract's {$entry['code']} is not retryable", var_export($entry['retry'], true), 'false');
 }
 
 check('the contract still lists this SDK', in_array('php', $wire['sdks'], true) ? 'listed' : 'missing', 'listed');

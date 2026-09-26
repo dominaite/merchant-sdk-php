@@ -19,6 +19,7 @@ require __DIR__ . '/../src/Exception/ChargeException.php';
 require __DIR__ . '/../src/Exception/CheckoutRefusedException.php';
 require __DIR__ . '/../src/Exception/RateLimitException.php';
 require __DIR__ . '/../src/Exception/RevokeException.php';
+require __DIR__ . '/../src/Exception/StorefrontException.php';
 require __DIR__ . '/../src/Exception/TransportException.php';
 
 use Dominaite\DominaiteClient;
@@ -26,6 +27,7 @@ use Dominaite\Exception\ApiException;
 use Dominaite\Exception\ChargeException;
 use Dominaite\Exception\CheckoutRefusedException;
 use Dominaite\Exception\RevokeException;
+use Dominaite\Exception\StorefrontException;
 use Dominaite\Exception\TransportException;
 
 $failures = 0;
@@ -342,6 +344,9 @@ foreach (DominaiteClient::STATUS_VOCABULARY as $value) {
 // The vocabularies, in the fixture's order, like STATUS_VOCABULARY above.
 check('stored payment method status vocabulary matches the fixture',
     listOf(DominaiteClient::STORED_PAYMENT_METHOD_STATUS_VOCABULARY), listOf($fixture['storedPaymentMethodStatusVocabulary']));
+check('stored payment method retired reason vocabulary matches the fixture',
+    listOf(DominaiteClient::STORED_PAYMENT_METHOD_RETIRED_REASON_VOCABULARY),
+    listOf($fixture['storedPaymentMethodRetiredReasonVocabulary']));
 check('charge status vocabulary matches the fixture',
     listOf(DominaiteClient::CHARGE_STATUS_VOCABULARY), listOf($fixture['chargeStatusVocabulary']));
 check('decline class vocabulary matches the fixture',
@@ -376,6 +381,7 @@ check('storedPaymentMethod status is in the vocabulary',
 check('storedPaymentMethod id is pm_ plus 32 hex characters',
     preg_match('/^pm_[0-9a-f]{32}$/', (string) $saved['storedPaymentMethod']['id']) === 1 ? 'well-formed' : (string) $saved['storedPaymentMethod']['id'], 'well-formed');
 check('storedPaymentMethod expiry stays an int', var_export($saved['storedPaymentMethod']['expiryYear'], true), '2029');
+check('an active card has no retiredReason', var_export($saved['storedPaymentMethod']['retiredReason'], true), 'NULL');
 $paymentMethodId = (string) $saved['storedPaymentMethod']['id'];
 
 // The card's own nullable fields: absent on the wire when the provider did not report
@@ -398,6 +404,56 @@ foreach (DominaiteClient::STORED_PAYMENT_METHOD_STATUS_VOCABULARY as $value) {
     $example['storedPaymentMethod']['status'] = $value;
     $read = (new CannedClient($example))->getStatus($example['transactionId']);
     check("getStatus accepts storedPaymentMethod status: $value", (string) $read['storedPaymentMethod']['status'], $value);
+}
+
+// A card the platform retired because the payment that saved it was refunded: it reads
+// as retired with its reason, as spelled and with the wire's null members omitted.
+$retiredExample = $status['retiredCardExample'];
+check('retired-card example field set matches the fixture', keysOf($retiredExample), sortedList($status['fields']));
+foreach (['fixture' => $retiredExample, 'wire' => withoutNulls($retiredExample)] as $form => $body) {
+    $retired = (new CannedClient($body))->getStatus($retiredExample['transactionId']);
+    check("retired-card example ($form) is refunded", (string) $retired['status'], 'refunded');
+    check("retired-card example ($form) card has every field",
+        keysOf($retired['storedPaymentMethod']), sortedList($status['storedPaymentMethodFields']));
+    check("retired-card example ($form) card is retired", (string) $retired['storedPaymentMethod']['status'], 'retired');
+    check("retired-card example ($form) carries its reason",
+        (string) $retired['storedPaymentMethod']['retiredReason'], 'source_sale_reversed');
+    check("retired-card example ($form) reason is in the vocabulary",
+        in_array($retired['storedPaymentMethod']['retiredReason'], DominaiteClient::STORED_PAYMENT_METHOD_RETIRED_REASON_VOCABULARY, true)
+            ? 'in vocabulary' : 'not in vocabulary',
+        'in vocabulary');
+}
+
+// --- storefront codes -------------------------------------------------------------------
+// Real HTTP errors, never the success=false refusal shape: exactly the fixture's list, in
+// its order, and none of them a session refusal.
+check('storefront codes match the fixture',
+    listOf(DominaiteClient::STOREFRONT_ERROR_CODES), listOf($fixture['storefrontErrorCodes']));
+check('storefront codes are not session refusals',
+    listOf(array_values(array_intersect($fixture['storefrontErrorCodes'], $fixture['sessionRefusalErrorCodes']))), '');
+check('the SDK keeps storefront codes out of its refusal list',
+    listOf(array_values(array_intersect(DominaiteClient::STOREFRONT_ERROR_CODES, DominaiteClient::REFUSAL_ERROR_CODES))), '');
+
+// Each code at the HTTP status the wire contract publishes for it raises a
+// StorefrontException carrying that code and status.
+$wireRaw = file_get_contents(__DIR__ . '/merchant-api-wire-contract.json');
+$wireContract = json_decode((string) $wireRaw, true);
+foreach ($wireContract['errorCodes']['storefront'] as $entry) {
+    $code = (string) $entry['code'];
+    $httpStatus = (int) $entry['httpStatus'];
+    check("$code is not retryable in the wire contract", var_export($entry['retry'], true), 'false');
+    $client = new CannedClient(['success' => false, 'data' => null,
+        'error' => ['code' => $code, 'message' => 'Refused.', 'statusCode' => $httpStatus]], $httpStatus);
+    $thrown = null;
+    try {
+        $client->createCheckoutSession(['amount' => 8440, 'currency' => 'EUR', 'orderReference' => 'order-1042',
+            'idempotencyKey' => 'order-1042']);
+    } catch (\Throwable $e) {
+        $thrown = $e;
+    }
+    check("$httpStatus $code is a StorefrontException", $thrown === null ? 'no exception' : get_class($thrown), StorefrontException::class);
+    check("$httpStatus $code keeps its code", $thrown instanceof ApiException ? (string) $thrown->getErrorCode() : '', $code);
+    check("$httpStatus $code keeps its status", $thrown instanceof ApiException ? (string) $thrown->getHttpStatus() : '', (string) $httpStatus);
 }
 
 // The getStatus() docblock is where an integrator reads about the saved card too.

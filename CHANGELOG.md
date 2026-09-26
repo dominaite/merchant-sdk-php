@@ -22,7 +22,9 @@ Added:
 - Named error-code constants: `ALREADY_PROCESSED`, `PRIOR_ATTEMPT_FAILED`,
   `DUPLICATE_REQUEST`, `PAYMENT_PROCESSING_UNAVAILABLE`, `IDEMPOTENCY_KEY_REUSED`,
   `STOREFRONT_NOT_WHITELISTED`, `STOREFRONT_INACTIVE`, `STOREFRONT_MISMATCH`, plus
-  `STOREFRONT_ERROR_CODES`.
+  `STOREFRONT_ERROR_CODES` in the contract's order (`STOREFRONT_MISMATCH` 400,
+  `STOREFRONT_INACTIVE` 409, `STOREFRONT_NOT_WHITELISTED` 409), pinned against its
+  `storefrontErrorCodes`. None is retryable and none is a session refusal.
 - `StorefrontException` (extends `ApiException`) for the 409/400 storefront refusals.
 - `toMinorUnits()` and `minorUnitExponent()`: decimal string to integer minor units by the
   gateway's exponent (HUF is 0, not ISO's 2), no float math. ISK, KRW, OMR, JOD and TND
@@ -30,6 +32,10 @@ Added:
 - `isPaid()`, `isTerminal()` and `TERMINAL_STATUSES`.
 - Stored payment methods (`saveCard`, `chargePaymentMethod()`, `revokePaymentMethod()`),
   which landed after 0.2.0 and were never tagged.
+- Contract refresh (gateway contract 2026-09-16): a stored payment method can be `retired`, and
+  carries `retiredReason` (`hard_decline`, `chargeback` or `source_sale_reversed`, null on every
+  other card), listed in `STORED_PAYMENT_METHOD_RETIRED_REASON_VOCABULARY`. A retired card is
+  not chargeable and never becomes active again.
 
 ## 0.2.0
 
