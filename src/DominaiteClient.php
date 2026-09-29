@@ -187,6 +187,24 @@ class DominaiteClient
         'IDEMPOTENCY_KEY_REQUIRED',
     ];
 
+    /** integration value for the hosted cashier widget, the default when you send none. */
+    public const INTEGRATION_WIDGET = 'widget';
+
+    /**
+     * integration value for card fields rendered in your own page by the checkout.js
+     * drop-in. Enabled per merchant on request.
+     */
+    public const INTEGRATION_FIELDS = 'fields';
+
+    /**
+     * Every value createCheckoutSession() accepts in `integration`, in the API's own order.
+     * The session answers with the one in effect in checkout.integration.
+     */
+    public const INTEGRATION_VOCABULARY = [
+        self::INTEGRATION_WIDGET,
+        self::INTEGRATION_FIELDS,
+    ];
+
     /**
      * Every value a stored payment method's `status` can carry, in the API's own order.
      * Only active methods can be charged; revoked is what revokePaymentMethod() leaves
@@ -511,7 +529,16 @@ class DominaiteClient
      * language (ISO 639-1), theme ('light'|'dark'|'bright'), description,
      * saveCard (bool - keep the card on file once this payment is approved, so you can
      * charge it again with chargePaymentMethod(); the stored method shows up as
-     * storedPaymentMethod on getStatus(), and the card details never reach you).
+     * storedPaymentMethod on getStatus(), and the card details never reach you),
+     * integration (INTEGRATION_WIDGET, the default, or INTEGRATION_FIELDS for card fields
+     * in your own page; card fields are enabled per merchant on request and 'fields' on an
+     * account without them is a 400; part of the idempotency identity, so a replay with a
+     * different integration is refused with IDEMPOTENCY_KEY_REUSED; omitted when null).
+     *
+     * The session always carries integration. clientSecret is set only for a fields
+     * session (absent for a widget session): an opaque string of at most 128 characters,
+     * the same on every replay, that the payer's page hands to checkout.js. Keep it out of
+     * your logs.
      *
      * Re-sending a key the gateway already saw, with the same amount and currency, returns
      * the ORIGINAL session while it is still open and unexpired: same transactionId, same
@@ -521,7 +548,7 @@ class DominaiteClient
      * getStatus().
      *
      * @param array<string,mixed> $params
-     * @return array{transactionId:string,orderId:string,cashierKey:string,cashierToken:string,amount:int,currency:string,expiresAt:string}
+     * @return array{transactionId:string,orderId:string,cashierKey:string,cashierToken:string,amount:int,currency:string,expiresAt:string,integration:string,clientSecret?:?string}
      *
      * @throws AuthenticationException Wrong/revoked credentials or bad signature (fix config; do not retry).
      * @throws CheckoutRefusedException The gateway refused the session (inspect getErrorCode()).
@@ -541,6 +568,15 @@ class DominaiteClient
         self::validateMoneyParams($params);
         if (array_key_exists('saveCard', $params) && !is_bool($params['saveCard'])) {
             throw new \InvalidArgumentException('saveCard must be a bool');
+        }
+        if (array_key_exists('integration', $params)) {
+            if ($params['integration'] === null) {
+                // Not set means the widget: leave the key out so the signed body of an
+                // existing integration does not change.
+                unset($params['integration']);
+            } elseif (!is_string($params['integration'])) {
+                throw new \InvalidArgumentException('integration must be a string');
+            }
         }
 
         $idempotencyKey = self::normalizeIdempotencyKey($params['idempotencyKey'] ?? null);
