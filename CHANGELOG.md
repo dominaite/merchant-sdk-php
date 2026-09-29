@@ -3,7 +3,7 @@
 Versions follow semver. The package installs from git tags, so a version exists once its
 `v` tag does.
 
-## 0.3.2 (unreleased)
+## 0.4.0 (unreleased)
 
 Added:
 
