@@ -3,6 +3,18 @@
 Versions follow semver. The package installs from git tags, so a version exists once its
 `v` tag does.
 
+## 0.4.0 (unreleased)
+
+Added:
+
+- Card fields: `integration` on `createCheckoutSession()` (`INTEGRATION_WIDGET` or
+  `INTEGRATION_FIELDS`, left out of the body when null or not set), and `integration` and
+  `clientSecret` on the returned session. `clientSecret` is set only for fields sessions.
+  `INTEGRATION_VOCABULARY` lists both values. Card fields are enabled per merchant on request;
+  see the README.
+- Contract fixture: `integrationVocabulary`, the two new checkout fields and a fields session
+  example.
+
 ## 0.3.1
 
 Added:

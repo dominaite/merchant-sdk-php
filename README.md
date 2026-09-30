@@ -458,6 +458,53 @@ re-POST with the same order-derived idempotency key, not a fresh one: from a few
 past expiry the same key answers with a fresh session (see "Recovering from a replay
 refusal").
 
+## Card fields
+
+Instead of the hosted widget, you can render card fields inside your own checkout page. Card
+fields are enabled per merchant on request: ask Dominaite support to switch them on. Until then a
+session with `'integration' => 'fields'` is rejected with a 400 (`INVALID_SELECTION` on
+`integration`).
+
+Pass `'integration' => DominaiteClient::INTEGRATION_FIELDS` when you create the session. Leave it
+out (or pass `INTEGRATION_WIDGET`) for the hosted widget. It is part of the idempotency identity,
+so a replay of the same key with a different `integration` is refused with
+`IDEMPOTENCY_KEY_REUSED`.
+
+```php
+$session = $client->createCheckoutSession([
+    'amount' => 8440,
+    'currency' => 'EUR',
+    'orderReference' => 'order-1042',
+    'integration' => DominaiteClient::INTEGRATION_FIELDS,
+    'idempotencyKey' => DominaiteClient::orderIdempotencyKey('checkout', 'order-1042', 8440, 'EUR'),
+]);
+// $session['integration'] === 'fields', $session['clientSecret'] is set
+
+$checkoutConfig = [
+    'transactionId' => $session['transactionId'],
+    'integration' => $session['integration'],
+    'cashierKey' => $session['cashierKey'],
+    'cashierToken' => $session['cashierToken'],
+    'clientSecret' => $session['clientSecret'],
+];
+?>
+<div id="checkout"></div>
+<script src="https://pay.dominaite.com/v1/checkout.js"></script>
+<script>
+  const checkout = Dominaite.checkout(<?= json_encode($checkoutConfig, JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT) ?>)
+  checkout.on('success', () => { /* show a "thank you, confirming" state */ })
+  checkout.mount('#checkout')
+</script>
+```
+
+Hand those five values (`transactionId`, `integration`, `cashierKey`, `cashierToken`,
+`clientSecret`) to the payer's page and nothing else. `clientSecret` is what lets the browser
+charge this one session: keep it out of your logs. A widget session has no `clientSecret` key, so
+read it with `$session['clientSecret'] ?? null`.
+
+The page saying "success" is not proof of payment. Mark the order paid only from the
+`payment.succeeded` webhook or a `getStatus()` read, exactly as with the widget.
+
 ## Stored payment methods (recurring)
 
 Pass `'saveCard' => true` when you create a session and, once that payment is approved, the

@@ -123,6 +123,9 @@ final class CannedClient extends DominaiteClient
     /** @var list<string> The idempotency key the SDK signed, per call. */
     public array $idempotencyKeys = [];
 
+    /** @var list<?array<string,mixed>> The body the SDK signed, per call. */
+    public array $bodies = [];
+
     /** @param array<string,mixed> $canned */
     public function __construct(array $canned, int $status = 200)
     {
@@ -138,6 +141,7 @@ final class CannedClient extends DominaiteClient
     {
         $this->calls[] = $method . ' ' . $path;
         $this->idempotencyKeys[] = $idempotencyKey;
+        $this->bodies[] = $body;
         $raw = $this->status === 204 ? '' : (string) json_encode($this->canned);
         return $this->readResponse($this->status, $raw, []);
     }
@@ -232,13 +236,67 @@ $checkout = $successClient->createCheckoutSession([
 ]);
 check('createCheckoutSession accepts the fixture success example',
     keysOf($checkout), keysOf($session['successExample']['checkout']));
-check('checkout field set matches the fixture', keysOf($checkout), sortedList($session['checkoutFields']));
+// A widget session's clientSecret is null, so it is absent on the wire.
+check('widget checkout field set is the fixture minus clientSecret', keysOf($checkout),
+    sortedList(array_values(array_diff($session['checkoutFields'], ['clientSecret']))));
+check('widget checkout carries integration widget', (string) $checkout['integration'], DominaiteClient::INTEGRATION_WIDGET);
+check('widget checkout has no clientSecret', var_export($checkout['clientSecret'] ?? null, true), 'NULL');
 check('createCheckoutSession is a POST on the fixture path', listOf($successClient->calls),
     'POST ' . $session['path']);
 check('checkout carries the transaction id', (string) $checkout['transactionId'],
     (string) $session['successExample']['checkout']['transactionId']);
 check('checkout amount stays an int in minor units',
     var_export($checkout['amount'], true), '8440');
+
+// --- createCheckoutSession, card fields -------------------------------------------------
+check('integration vocabulary is exactly the fixture, in order',
+    listOf(DominaiteClient::INTEGRATION_VOCABULARY), listOf($fixture['integrationVocabulary']));
+check('fields example carries exactly the envelope fields',
+    keysOf($session['fieldsSuccessExample']), sortedList($session['fields']));
+
+$fieldsClient = new CannedClient($session['fieldsSuccessExample']);
+$fieldsCheckout = $fieldsClient->createCheckoutSession([
+    'amount' => 8440,
+    'currency' => 'EUR',
+    'orderReference' => 'order-1042',
+    'integration' => DominaiteClient::INTEGRATION_FIELDS,
+    'idempotencyKey' => 'order-1042',
+]);
+check('fields checkout field set matches the fixture', keysOf($fieldsCheckout), sortedList($session['checkoutFields']));
+check('fields checkout carries integration fields', (string) $fieldsCheckout['integration'], DominaiteClient::INTEGRATION_FIELDS);
+check('fields checkout carries the clientSecret', (string) $fieldsCheckout['clientSecret'],
+    (string) $session['fieldsSuccessExample']['checkout']['clientSecret']);
+check('clientSecret is at most 128 characters',
+    strlen((string) $fieldsCheckout['clientSecret']) <= 128 ? 'within' : 'too long', 'within');
+check('integration is sent in the session body', (string) ($fieldsClient->bodies[0]['integration'] ?? 'absent'), 'fields');
+
+$widgetClient = new CannedClient($session['successExample']);
+$widgetClient->createCheckoutSession([
+    'amount' => 8440, 'currency' => 'EUR', 'orderReference' => 'order-1042',
+    'integration' => DominaiteClient::INTEGRATION_WIDGET, 'idempotencyKey' => 'order-1042',
+]);
+check('an explicit widget integration is sent', (string) ($widgetClient->bodies[0]['integration'] ?? 'absent'), 'widget');
+
+foreach (['not passed' => [], 'null' => ['integration' => null]] as $label => $extra) {
+    $omitClient = new CannedClient($session['successExample']);
+    $omitClient->createCheckoutSession([
+        'amount' => 8440, 'currency' => 'EUR', 'orderReference' => 'order-1042',
+        'idempotencyKey' => 'order-1042',
+    ] + $extra);
+    check("integration is left out of the body when $label",
+        array_key_exists('integration', (array) $omitClient->bodies[0]) ? 'sent' : 'absent', 'absent');
+}
+
+$outcome = 'accepted';
+try {
+    (new CannedClient($session['successExample']))->createCheckoutSession([
+        'amount' => 8440, 'currency' => 'EUR', 'orderReference' => 'order-1042',
+        'integration' => ['fields'], 'idempotencyKey' => 'order-1042',
+    ]);
+} catch (\InvalidArgumentException $e) {
+    $outcome = 'rejected locally';
+}
+check('a non-string integration is rejected before the call', $outcome, 'rejected locally');
 
 // IDEMPOTENCY_KEY_REQUIRED is a gateway 400 this SDK must never provoke: a POST without
 // a key is refused locally, before anything is signed, and a GET signs the empty key by
