@@ -85,4 +85,17 @@ $bare = new CheckoutRefusedException('PAYMENT_PROCESSING_UNAVAILABLE', 'Card pay
 check('refusal without id stays null', $bare->getTransactionId() === null ? 'null' : 'set', 'null');
 check('refusal without id has empty result', (string) count($bare->getResult()), '0');
 
+// Every suite in tests/ must run in both places a contributor or CI runs them: `composer test`
+// and the CI workflow. A suite missing from one of them passes there without being run.
+$suites = array_map(static fn (string $path): string => basename($path, '.php'), glob(__DIR__ . '/*.php'));
+sort($suites);
+$composer = json_decode((string) file_get_contents(__DIR__ . '/../composer.json'), true);
+$composerSuites = array_map(static fn (string $cmd): string => basename($cmd, '.php'), $composer['scripts']['test']);
+sort($composerSuites);
+check('composer test runs every suite in tests/', json_encode($composerSuites), json_encode($suites));
+preg_match('/for suite in (.*?); do/s', (string) file_get_contents(__DIR__ . '/../.github/workflows/tests.yml'), $m);
+$ciSuites = preg_split('/[\s\\\\]+/', trim($m[1] ?? ''), -1, PREG_SPLIT_NO_EMPTY);
+sort($ciSuites);
+check('CI runs every suite in tests/', json_encode($ciSuites), json_encode($suites));
+
 exit($failures === 0 ? 0 : 1);
