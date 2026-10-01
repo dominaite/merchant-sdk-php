@@ -476,7 +476,9 @@ $nullPsp = $status['example'];
 $nullPsp['pspReference'] = null;
 $nullRead = (new CannedClient($nullPsp))->getStatus($nullPsp['transactionId']);
 check('getStatus reads a null pspReference as null', var_export(array_key_exists('pspReference', $nullRead) ? $nullRead['pspReference'] : 'missing', true), 'NULL');
-$oldRead = (new CannedClient(withoutNulls($status['example'])))->getStatus($status['example']['transactionId']);
+$oldBody = $status['example'];
+unset($oldBody['pspReference']);
+$oldRead = (new CannedClient($oldBody))->getStatus($status['example']['transactionId']);
 check('getStatus from a gateway without pspReference still parses', var_export($oldRead['pspReference'] ?? null, true), 'NULL');
 check('and the field is not invented', var_export(array_key_exists('pspReference', $oldRead), true), 'false');
 
