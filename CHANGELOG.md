@@ -12,6 +12,8 @@ Added:
   `clientSecret` on the returned session. `clientSecret` is set only for fields sessions.
   `INTEGRATION_VOCABULARY` lists both values. Card fields are enabled per merchant on request;
   see the README.
+- `pspReference` on `getStatus()` and on `payment.*` webhook `data`: the processor's
+  reference for the transaction, null until known, absent on older gateways. Not on `charge.*`.
 - Contract fixture: `integrationVocabulary`, the two new checkout fields and a fields session
   example.
 

@@ -466,6 +466,20 @@ foreach (DominaiteClient::STORED_PAYMENT_METHOD_STATUS_VOCABULARY as $value) {
     check("getStatus accepts storedPaymentMethod status: $value", (string) $read['storedPaymentMethod']['status'], $value);
 }
 
+// pspReference: the processor's reference, passed through. A gateway that predates it
+// omits the key, one that has it but does not know it yet sends null.
+$withPsp = $status['example'];
+$withPsp['pspReference'] = 'psp-order-8841';
+check('getStatus returns pspReference when the gateway sends it',
+    (string) (new CannedClient($withPsp))->getStatus($withPsp['transactionId'])['pspReference'], 'psp-order-8841');
+$nullPsp = $status['example'];
+$nullPsp['pspReference'] = null;
+$nullRead = (new CannedClient($nullPsp))->getStatus($nullPsp['transactionId']);
+check('getStatus reads a null pspReference as null', var_export(array_key_exists('pspReference', $nullRead) ? $nullRead['pspReference'] : 'missing', true), 'NULL');
+$oldRead = (new CannedClient(withoutNulls($status['example'])))->getStatus($status['example']['transactionId']);
+check('getStatus from a gateway without pspReference still parses', var_export($oldRead['pspReference'] ?? null, true), 'NULL');
+check('and the field is not invented', var_export(array_key_exists('pspReference', $oldRead), true), 'false');
+
 // A card the platform retired because the payment that saved it was refunded: it reads
 // as retired with its reason, as spelled and with the wire's null members omitted.
 $retiredExample = $status['retiredCardExample'];
