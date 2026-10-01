@@ -12,6 +12,11 @@ Added:
   `clientSecret` on the returned session. `clientSecret` is set only for fields sessions.
   `INTEGRATION_VOCABULARY` lists both values. Card fields are enabled per merchant on request;
   see the README.
+- Processor reference: `pspReference` on `getStatus()` and on `payment.*` webhook `data`. The
+  payment processor's reference for the transaction, null until known and on a sale settled by
+  reconciliation without a processor webhook. Refund and cancel events carry the original sale's
+  reference. Not on `charge.*` events.
+- Contract fixture: `pspReference` in the status read fields and examples.
 - Contract fixture: `integrationVocabulary`, the two new checkout fields and a fields session
   example.
 

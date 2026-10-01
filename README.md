@@ -252,6 +252,15 @@ Events: `payment.succeeded`, `payment.failed`, `payment.requires_capture`,
 `payment.succeeded` is the only one that means money in hand. In-flight states (`pending`,
 `processing`) are not webhooked, so drive that part of your UX from the session status.
 
+### Processor reference on payment events
+
+`payment.*` events carry `data.pspReference`, the payment processor's reference for the
+transaction, and `getStatus()` returns the same value as `pspReference`. It is null until
+the reference is known, and a sale settled by reconciliation without a processor webhook can
+keep it null. Refund and cancel events carry the original sale's reference. `charge.*`
+events do not have it. Older gateways leave the key out, so read it as
+`$event['data']['pspReference'] ?? null`.
+
 ### Saved card on payment events
 
 `payment.succeeded` and `payment.requires_capture` carry `data.storedPaymentMethod` when the

@@ -672,8 +672,13 @@ class DominaiteClient
      * This status read is the source of truth: on a saveCard session whose webhook has no
      * card, read it here.
      *
+     * pspReference is the payment processor's reference for the transaction, null until it
+     * is known. A sale settled by reconciliation without a processor webhook can have it
+     * null for good; refunds and cancellations carry the original sale's reference. Older
+     * gateways do not send the key at all, so read it as $status['pspReference'] ?? null.
+     *
      * @param string $transactionId The transactionId returned by createCheckoutSession().
-     * @return array{transactionId:string,orderId:string,orderReference:?string,status:string,amount:int,currency:string,refundedAmount:?int,createdAt:string,updatedAt:?string,expiresAt:?string,storedPaymentMethod?:?array{id:string,brand:?string,last4:?string,expiryMonth:?int,expiryYear:?int,status:string,retiredReason:?string}}
+     * @return array{transactionId:string,orderId:string,orderReference:?string,pspReference?:?string,status:string,amount:int,currency:string,refundedAmount:?int,createdAt:string,updatedAt:?string,expiresAt:?string,storedPaymentMethod?:?array{id:string,brand:?string,last4:?string,expiryMonth:?int,expiryYear:?int,status:string,retiredReason:?string}}
      *
      * @throws AuthenticationException Wrong/revoked credentials or bad signature (fix config; do not retry).
      * @throws ApiException            Unknown transaction id (HTTP 404) or unexpected response.
