@@ -223,6 +223,10 @@ checked against a 300 second window, so a captured delivery cannot be replayed l
   "createdAt": "2026-08-20T14:00:00Z",
   "data": {
     "transactionId": "...",
+    "orderReference": "order-123",
+    "orderId": "dom_9a8b7c6d5e4f",
+    "pspReference": "psp_8f3a21c4",
+    "description": "Pro plan",
     "status": "succeeded",
     "previousStatus": "pending",
     "kind": "sale",
@@ -230,6 +234,10 @@ checked against a 300 second window, so a captured delivery cannot be replayed l
     "grossAmount": 8701,
     "surchargeAmount": 261,
     "currency": "EUR",
+    "paymentMethod": "card",
+    "walletType": null,
+    "paymentMethodBrand": "visa",
+    "paymentMethodLast4": "4242",
     "originalTransactionId": null,
     "idempotencyKey": "order-123"
   }
@@ -239,6 +247,19 @@ checked against a 300 second window, so a captured delivery cannot be replayed l
 Flat envelope, no `success` wrapper to branch on. Amounts are minor units: `amount` is what
 you get paid, `grossAmount` is what moved on the card, `surchargeAmount` is the difference
 when a surcharge applies.
+
+`orderReference` is your own order reference from create session and the field to match
+events to your orders on. It is null when the payment did not start through the API or the
+session had none, and refund and cancel events carry the original payment's value. `orderId` is
+the hosted checkout order id, the same as on `getStatus()`, null on refunds, cancellations and
+payments taken outside hosted checkout. `description` is what you sent on create session, null
+when you sent none and on refund and cancel events. `paymentMethodBrand` (lower-cased, `visa`,
+`mastercard`, ...) and `paymentMethodLast4` are set once a card payment was attempted and null
+otherwise. `idempotencyKey` is the key you sent on create session, null on refund and dispute
+events. `originalTransactionId` points at the earlier transaction: the refunded payment on
+`payment.refunded`, the authorization on the `payment.succeeded` of a capture. The event is a
+plain array, so read any of these with `?? null`: an event recorded before a field existed
+arrives without it.
 
 `apiVersion` is the date of the payload shape the event was rendered in, currently
 `2026-09-25`. Fields are only ever added under a version, never renamed or removed, so
