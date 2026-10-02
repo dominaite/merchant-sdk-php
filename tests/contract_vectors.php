@@ -93,6 +93,39 @@ function withoutNulls(array $value): array
     return $out;
 }
 
+/**
+ * The top-level keys of the array shape in getStatus()'s @return docblock, as
+ * key => 'key:type' or 'key?:type' for an optional key. That docblock is the status
+ * type: it is what an integrator's IDE and static analyser read.
+ *
+ * @return array<string, string>
+ */
+function statusShape(): array
+{
+    $doc = (string) (new ReflectionMethod(DominaiteClient::class, 'getStatus'))->getDocComment();
+    if (preg_match('/@return array\{(.*)\}\s*$/m', $doc, $match) !== 1) {
+        return [];
+    }
+    $entries = [];
+    $depth = 0;
+    $current = '';
+    foreach (str_split($match[1]) as $char) {
+        if ($char === ',' && $depth === 0) {
+            $entries[] = $current;
+            $current = '';
+            continue;
+        }
+        $depth += $char === '{' ? 1 : ($char === '}' ? -1 : 0);
+        $current .= $char;
+    }
+    $entries[] = $current;
+    $shape = [];
+    foreach ($entries as $entry) {
+        $shape[(string) preg_replace('/\??:.*$/s', '', $entry)] = $entry;
+    }
+    return $shape;
+}
+
 /** @return string The class name of the thrown exception, or 'no exception'. */
 function thrownBy(callable $fn): string
 {
@@ -481,6 +514,36 @@ unset($oldBody['pspReference']);
 $oldRead = (new CannedClient($oldBody))->getStatus($status['example']['transactionId']);
 check('getStatus from a gateway without pspReference still parses', var_export($oldRead['pspReference'] ?? null, true), 'NULL');
 check('and the field is not invented', var_export(array_key_exists('pspReference', $oldRead), true), 'false');
+
+// The documented status type names exactly the fixture's fields, so a field the gateway
+// adds cannot reach callers undocumented.
+check('getStatus() @return shape names exactly the fixture fields',
+    sortedList(array_keys(statusShape())), sortedList($status['fields']));
+
+// paymentMethod and walletType: reporting data, passed through. Every status example
+// uses a known category and, when set, a known wallet.
+foreach (['example', 'savedCardExample', 'retiredCardExample'] as $name) {
+    $example = $status[$name];
+    check("$name paymentMethod is a known category",
+        in_array($example['paymentMethod'], DominaiteClient::PAYMENT_METHOD_CATEGORIES, true) ? 'known' : 'unknown', 'known');
+    check("$name walletType is null or a known wallet",
+        $example['walletType'] === null || in_array($example['walletType'], DominaiteClient::WALLET_TYPES, true) ? 'ok' : 'unknown', 'ok');
+}
+check('getStatus returns paymentMethod as sent', (string) $result['paymentMethod'], (string) $status['example']['paymentMethod']);
+check('getStatus returns walletType as sent', (string) $result['walletType'], (string) $status['example']['walletType']);
+// A wallet the gateway learned about after this SDK released is a valid wallet, not an error.
+$newWallet = $status['example'];
+$newWallet['walletType'] = 'some_new_wallet';
+check('getStatus passes an unknown walletType through',
+    (string) (new CannedClient($newWallet))->getStatus($newWallet['transactionId'])['walletType'], 'some_new_wallet');
+$cardRead = (new CannedClient($status['savedCardExample']))->getStatus($status['savedCardExample']['transactionId']);
+check('getStatus keeps a null walletType present on a card payment',
+    var_export(array_key_exists('walletType', $cardRead) ? $cardRead['walletType'] : 'missing', true), 'NULL');
+$preWallet = $status['example'];
+unset($preWallet['paymentMethod'], $preWallet['walletType']);
+$preRead = (new CannedClient($preWallet))->getStatus($preWallet['transactionId']);
+check('getStatus from a gateway without the wallet fields does not invent them',
+    var_export(array_key_exists('paymentMethod', $preRead) || array_key_exists('walletType', $preRead), true), 'false');
 
 // A card the platform retired because the payment that saved it was refunded: it reads
 // as retired with its reason, as spelled and with the wire's null members omitted.

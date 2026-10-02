@@ -119,6 +119,30 @@ class DominaiteClient
         'partially_refunded',
     ];
 
+    /**
+     * Every payment method category getStatus() reports in `paymentMethod`, in the gateway's
+     * own order. Reporting data, not a money-flow switch: a wallet payment refunds, captures
+     * and disputes exactly like a plain card payment.
+     */
+    public const PAYMENT_METHOD_CATEGORIES = [
+        'card',
+        'wallet',
+        'bank_transfer',
+        'sepa',
+    ];
+
+    /**
+     * The wallets the gateway names in `walletType` today, pinned against the gateway
+     * contract (tests/merchant-api-wire-contract.json). The field can carry a lower-cased
+     * identifier not in this list yet: treat an unknown value as a valid wallet, not an
+     * error, and never branch payment handling on it.
+     */
+    public const WALLET_TYPES = [
+        'apple_pay',
+        'google_pay',
+        'samsung_pay',
+    ];
+
     /** Card payments are off right now; retry later with the same key. HTTP 200 refusal on a session, 503 on a charge. */
     public const PAYMENT_PROCESSING_UNAVAILABLE = 'PAYMENT_PROCESSING_UNAVAILABLE';
 
@@ -677,8 +701,17 @@ class DominaiteClient
      * null for good; refunds and cancellations carry the original sale's reference. Older
      * gateways do not send the key at all, so read it as $status['pspReference'] ?? null.
      *
+     * paymentMethod says how the payer paid ('card', 'wallet', 'bank_transfer' or 'sepa',
+     * see PAYMENT_METHOD_CATEGORIES); it is null while the payment is still open and on
+     * older transactions. When it is 'wallet', walletType names the wallet ('apple_pay',
+     * 'google_pay', 'samsung_pay', or a lower-cased identifier not in WALLET_TYPES yet:
+     * treat an unknown value as a valid wallet, not an error); it is null for non-wallet
+     * payments. Both are reporting data, never a money-flow switch: a wallet payment
+     * refunds, captures and disputes exactly like a card payment. Older gateways do not
+     * send the keys, so read them with ?? null.
+     *
      * @param string $transactionId The transactionId returned by createCheckoutSession().
-     * @return array{transactionId:string,orderId:string,orderReference:?string,pspReference?:?string,status:string,amount:int,currency:string,refundedAmount:?int,createdAt:string,updatedAt:?string,expiresAt:?string,storedPaymentMethod?:?array{id:string,brand:?string,last4:?string,expiryMonth:?int,expiryYear:?int,status:string,retiredReason:?string}}
+     * @return array{transactionId:string,orderId:string,orderReference:?string,pspReference?:?string,status:string,amount:int,currency:string,refundedAmount:?int,paymentMethod?:?string,walletType?:?string,createdAt:string,updatedAt:?string,expiresAt:?string,storedPaymentMethod?:?array{id:string,brand:?string,last4:?string,expiryMonth:?int,expiryYear:?int,status:string,retiredReason:?string}}
      *
      * @throws AuthenticationException Wrong/revoked credentials or bad signature (fix config; do not retry).
      * @throws ApiException            Unknown transaction id (HTTP 404) or unexpected response.
