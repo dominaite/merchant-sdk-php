@@ -3,6 +3,18 @@
 Versions follow semver. The package installs from git tags, so a version exists once its
 `v` tag does.
 
+## Unreleased
+
+Added:
+
+- Wallet reporting: `paymentMethod` and `walletType` on `getStatus()`, both optional and
+  nullable strings. `paymentMethod` is `card`, `wallet`, `bank_transfer` or `sepa`;
+  `walletType` names the wallet when `paymentMethod` is `wallet`, and an unknown value is a
+  valid wallet, not an error. Reporting data only: a wallet payment refunds, captures and
+  disputes like a card. `PAYMENT_METHOD_CATEGORIES` and `WALLET_TYPES` list the known values.
+- Contract fixtures: the two wallet fields in the status read fields and examples, and the
+  gateway's `wallets` section in the wire contract.
+
 ## 0.4.0
 
 Added:

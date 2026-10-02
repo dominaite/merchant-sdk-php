@@ -44,6 +44,39 @@ function codesWithStatus(int $httpStatus, array ...$groups): array
     return $codes;
 }
 
+/**
+ * The top-level keys of the array shape in getStatus()'s @return docblock, as
+ * key => 'key:type' or 'key?:type' for an optional key. That docblock is the status
+ * type: it is what an integrator's IDE and static analyser read.
+ *
+ * @return array<string, string>
+ */
+function statusShape(): array
+{
+    $doc = (string) (new ReflectionMethod(DominaiteClient::class, 'getStatus'))->getDocComment();
+    if (preg_match('/@return array\{(.*)\}\s*$/m', $doc, $match) !== 1) {
+        return [];
+    }
+    $entries = [];
+    $depth = 0;
+    $current = '';
+    foreach (str_split($match[1]) as $char) {
+        if ($char === ',' && $depth === 0) {
+            $entries[] = $current;
+            $current = '';
+            continue;
+        }
+        $depth += $char === '{' ? 1 : ($char === '}' ? -1 : 0);
+        $current .= $char;
+    }
+    $entries[] = $current;
+    $shape = [];
+    foreach ($entries as $entry) {
+        $shape[(string) preg_replace('/\??:.*$/s', '', $entry)] = $entry;
+    }
+    return $shape;
+}
+
 $wire = json_decode(file_get_contents(__DIR__ . '/merchant-api-wire-contract.json'), true);
 
 check(
@@ -108,6 +141,24 @@ foreach ($wire['errorCodes']['storefront'] as $entry) {
 }
 
 check('the contract still lists this SDK', in_array('php', $wire['sdks'], true) ? 'listed' : 'missing', 'listed');
+
+check(
+    'wallet types match the gateway, in order',
+    json_encode(DominaiteClient::WALLET_TYPES),
+    json_encode($wire['wallets']['walletTypes'] ?? null)
+);
+
+// Each wallet reporting field is on the status type, optional and nullable exactly as the
+// gateway declares it.
+$shape = statusShape();
+check('the gateway still names the wallet reporting fields',
+    (string) count($wire['wallets']['reportingFields'] ?? []), '2');
+foreach ($wire['wallets']['reportingFields'] ?? [] as $field) {
+    $path = (string) $field['path'];
+    check("the status type carries $path as the gateway declares it",
+        $shape[$path] ?? 'missing',
+        $path . ($field['required'] ? ':' : '?:') . '?' . $field['type']);
+}
 
 if ($failures > 0) {
     echo "\n$failures wire-contract check(s) failed\n";
