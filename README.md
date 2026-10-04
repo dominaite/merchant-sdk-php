@@ -733,6 +733,13 @@ awaiting capture. Never treat it as an abandoned order.
 Treat any status you do not recognise as still-open as well: a value the API adds later should
 make you keep polling, never silently close an order that is still live.
 
+`paymentMethod` says how the payer paid (`card`, `wallet`, `bank_transfer` or `sepa`) and
+`walletType` names the wallet when it is `wallet` (`apple_pay`, `google_pay`, `samsung_pay`).
+Both are null while the payment is still open and on older transactions, `walletType` is null
+for non-wallet payments, and older gateways leave the keys out, so read them with `?? null`. This is reporting data, not a money-flow switch: a wallet payment refunds, captures
+and disputes like a card. A `walletType` not in `DominaiteClient::WALLET_TYPES` is still a
+valid wallet, not an error.
+
 Two helpers encode those rules so you do not have to:
 
 ```php
