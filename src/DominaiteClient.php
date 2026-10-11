@@ -785,8 +785,12 @@ class DominaiteClient
      * Reads the payment status of one of your checkout sessions.
      *
      * Status values: pending, processing, succeeded, failed, refunded, partially_refunded,
-     * cancelled, disputed, requires_capture, abandoned. While a session is still payable the
-     * response carries expiresAt; amounts are integers in MINOR units.
+     * cancelled, disputed, requires_capture, abandoned. While a session is still payable,
+     * expiresAt says until when; amounts are integers in MINOR units.
+     *
+     * orderReference, refundedAmount, updatedAt and expiresAt are always in the array, and
+     * null when they have no value. The API leaves a null field out; the SDK reads it back
+     * as null.
      *
      * succeeded is the only value that means the payment is complete. Keep polling on
      * pending, processing and requires_capture - none of them is terminal.
@@ -866,10 +870,14 @@ class DominaiteClient
 
         $status = $this->request('GET', self::SESSIONS_PATH . '/' . $normalized, null, '');
 
-        // Passed through as sent, except the card on file and the agreement: the gateway
-        // omits their null fields on the wire, and the caller gets one shape for each, not
-        // two. When the gateway sent no storedPaymentMethod or agreement at all there is
-        // no key here either.
+        // Passed through as sent, except where the gateway omits a null field on the wire.
+        // The four keys the shape always has read as null when absent: no order reference
+        // recorded, nothing refunded, never updated, or the payer's part is over.
+        foreach (['orderReference', 'refundedAmount', 'updatedAt', 'expiresAt'] as $nullable) {
+            $status[$nullable] = $status[$nullable] ?? null;
+        }
+        // The card on file and the agreement get one shape each, not two. When the gateway
+        // sent no storedPaymentMethod or agreement at all there is no key here either.
         if (is_array($status['storedPaymentMethod'] ?? null)) {
             $status['storedPaymentMethod'] = self::storedPaymentMethod($status['storedPaymentMethod']);
         }

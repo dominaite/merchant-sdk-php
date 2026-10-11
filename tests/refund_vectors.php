@@ -229,6 +229,12 @@ check('a failed refund carries its message', (string) $refund['failureMessage'],
 check('a failure code is one the SDK knows',
     in_array($refund['failureCode'], DominaiteClient::REFUND_FAILURE_CODES, true) ? 'known' : 'unknown', 'known');
 
+// A pending full refund has no amount yet, and the API leaves the key out. The read still
+// has every field, with amount null.
+$refund = (new RecordingClient($pendingFull, 200))->getRefund(TRANSACTION_ID, REFUND_ID);
+check('a pending full refund read has every field', keysOf($refund), REFUND_FIELDS);
+check('a pending full refund read gives amount as null', var_export($refund['amount'], true), 'NULL');
+
 foreach (['', ' ', 're_1/x', 're_1?x=1', 're 1', str_repeat('r', 101)] as $bad) {
     $client = new RecordingClient($succeeded, 200);
     check('getRefund refuses refund id ' . var_export($bad, true),

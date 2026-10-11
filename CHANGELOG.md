@@ -65,6 +65,14 @@ Changed:
 - The README documents key scopes, verify-only sessions, subscriptions, the refund list, webhook
   endpoints, transactions and the integration contract.
 
+Fixed:
+
+- `getStatus()` reads an omitted `orderReference`, `refundedAmount`, `updatedAt` or `expiresAt`
+  as null. The API leaves a null field out, so a paid session with no refund had no
+  `refundedAmount` key. Reading it raised a PHP notice or warning, which some frameworks turn
+  into an exception. The other reads already gave null for an omitted key that their shape
+  always has, for example `amount` on a pending full refund.
+
 ## 0.4.0
 
 Added:

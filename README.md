@@ -955,9 +955,11 @@ $status = $client->getStatus($session['transactionId']);
 
 `status` is one of: `pending`, `processing`, `succeeded`, `failed`, `refunded`,
 `partially_refunded`, `cancelled`, `disputed`, `requires_capture`, `abandoned`. While the
-session is still payable the response also carries `expiresAt`; after that instant a `pending`
-session can only become `abandoned`. An unknown transaction id throws an `ApiException` with
-HTTP 404.
+session is still payable, `expiresAt` says until when; after that instant a `pending` session
+can only become `abandoned`. An unknown transaction id throws an `ApiException` with HTTP 404.
+
+`orderReference`, `refundedAmount`, `updatedAt` and `expiresAt` are always in the array, and
+null when they have no value.
 
 `succeeded` is the only value that means the payment is complete. Keep polling on `pending`,
 `processing` and `requires_capture` - none of them is terminal.
