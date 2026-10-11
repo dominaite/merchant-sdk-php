@@ -47,8 +47,8 @@ class DominaiteClient
     public const PAYMENT_METHODS_PATH = '/merchant-api/payment-methods';
     /**
      * Canonical path of payments. POST {transactionId}/refunds refunds one, GET
-     * {transactionId}/refunds/{refundId} reads a refund back - both signed on this path
-     * with the lowercase transaction id.
+     * {transactionId}/refunds lists its refunds, GET {transactionId}/refunds/{refundId}
+     * reads a refund back - all signed on this path with the lowercase transaction id.
      */
     public const PAYMENTS_PATH = '/merchant-api/payments';
     public const PING_PATH = '/merchant-api/ping';
@@ -1096,8 +1096,55 @@ class DominaiteClient
     }
 
     /**
-     * The reading shared by both refund routes: the refund on a 2xx, a RefundException for
-     * a code in REFUND_ERROR_CODES, the generic exceptions for everything else.
+     * Lists the refunds on one payment: {transactionId, currency, refundedAmount,
+     * refundableAmount, refunds}. Every amount is in minor units of currency.
+     *
+     * refunds holds the refunds created through this API, each in getRefund()'s shape, and
+     * is empty when there are none. The order is pending first, then processing, then
+     * succeeded and failed by completedAt, newest first within each group. A refund made
+     * in the dashboard or at the provider is not in the list, but refundedAmount counts it.
+     * refundableAmount is what a new refund could take right now: what is not refunded yet,
+     * minus refunds still in progress. It is 0 when the payment cannot be refunded.
+     *
+     * A refund shows up here at the same moment getRefund() stops answering
+     * REFUND_NOT_FOUND.
+     *
+     * @param string $transactionId The id createCheckoutSession() or chargePaymentMethod() returned.
+     * @return array{transactionId:string,currency:string,refundedAmount:int,refundableAmount:int,refunds:list<array{refundId:string,transactionId:string,status:string,amount:?int,currency:string,failureCode:?string,failureMessage:?string,completedAt:?string}>}
+     *
+     * @throws RefundException         PAYMENT_NOT_FOUND (HTTP 404): branch on getErrorCode().
+     * @throws AuthenticationException Wrong/revoked credentials or bad signature (fix config; do not retry).
+     * @throws ApiException            Unexpected response.
+     * @throws RateLimitException     HTTP 429 - back off (getRetryAfterSeconds()).
+     * @throws TransportException      Network-level failure or a 5xx (safe to retry). A 503 means the
+     *                                 refunds changed while the API read them: retry after a second.
+     */
+    public function listRefunds(string $transactionId): array
+    {
+        $id = self::normalizeTransactionId($transactionId);
+
+        // GET signs an EMPTY idempotency key and an EMPTY body, like getRefund().
+        $reply = $this->send('GET', self::PAYMENTS_PATH . '/' . $id . '/refunds', null, '');
+
+        $data = $reply['envelope']['data'] ?? null;
+        if ($reply['status'] < 400 && is_array($data) && is_array($data['refunds'] ?? null)) {
+            $data['transactionId'] = (string) ($data['transactionId'] ?? '');
+            $data['currency'] = (string) ($data['currency'] ?? '');
+            $data['refundedAmount'] = (int) ($data['refundedAmount'] ?? 0);
+            $data['refundableAmount'] = (int) ($data['refundableAmount'] ?? 0);
+            $data['refunds'] = array_map(static function (array $refund): array {
+                return self::refund($refund);
+            }, array_values($data['refunds']));
+
+            return $data;
+        }
+
+        throw self::refundRejection($reply, 'The API answered without a refund list');
+    }
+
+    /**
+     * The reading shared by both single-refund routes: the refund on a 2xx, the refund
+     * failure otherwise.
      *
      * @param array{status:int,envelope:array<string,mixed>,payload:array<string,mixed>,error:array<string,mixed>} $reply
      * @return array<string,mixed>
@@ -1109,10 +1156,21 @@ class DominaiteClient
             return self::refund($data);
         }
 
+        throw self::refundRejection($reply, 'The API answered without a refund body');
+    }
+
+    /**
+     * A refund route's failure: a RefundException for a code in REFUND_ERROR_CODES, the
+     * generic exceptions for everything else, and $unexpected for a 2xx without the body.
+     *
+     * @param array{status:int,envelope:array<string,mixed>,payload:array<string,mixed>,error:array<string,mixed>} $reply
+     */
+    private static function refundRejection(array $reply, string $unexpected): \RuntimeException
+    {
         $errorCode = $reply['error']['code'] ?? null;
         if ($reply['status'] >= 400 && $reply['status'] < 500
             && is_string($errorCode) && in_array($errorCode, self::REFUND_ERROR_CODES, true)) {
-            throw new RefundException(
+            return new RefundException(
                 $reply['status'],
                 (string) ($reply['error']['message'] ?? 'The refund was refused.'),
                 $errorCode,
@@ -1120,9 +1178,10 @@ class DominaiteClient
             );
         }
         if ($reply['status'] >= 400) {
-            throw self::rejection($reply);
+            return self::rejection($reply);
         }
-        throw new ApiException($reply['status'], 'The API answered without a refund body', 'UNEXPECTED_RESPONSE');
+
+        return new ApiException($reply['status'], $unexpected, 'UNEXPECTED_RESPONSE');
     }
 
     /**

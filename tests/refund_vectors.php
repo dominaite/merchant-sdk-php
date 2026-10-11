@@ -1,7 +1,7 @@
 <?php
 // Dependency-free tests for refunds: the signed body of a partial and a full refund, the
-// key handling, the refund as one shape whatever the wire omits, and every refund error
-// code as a RefundException with its retry classification.
+// key handling, the refund as one shape whatever the wire omits, the refund list, and
+// every refund error code as a RefundException with its retry classification.
 // Run: php tests/refund_vectors.php - exits non-zero on any mismatch.
 //
 // tests/transport_vectors.php sends a refund end to end through real curl, including the
@@ -236,6 +236,65 @@ foreach (['', ' ', 're_1/x', 're_1?x=1', 're 1', str_repeat('r', 101)] as $bad) 
             $client->getRefund(TRANSACTION_ID, $bad);
         }), \InvalidArgumentException::class);
     check('the bad refund id ' . var_export($bad, true) . ' never reached the transport', (string) count($client->calls), '0');
+}
+
+// --- listRefunds ----------------------------------------------------------------------
+// As the gateway sends it: the totals, then each refund in the status read's shape with
+// its null fields omitted. A field the API adds later rides through.
+$listed = envelope(['transactionId' => TRANSACTION_ID, 'currency' => 'EUR', 'refundedAmount' => 2500,
+    'refundableAmount' => 7500, 'refunds' => [
+        ['refundId' => 're_00000000000000000000000000000002', 'transactionId' => TRANSACTION_ID, 'status' => 'pending',
+            'currency' => 'EUR'],
+        ['refundId' => REFUND_ID, 'transactionId' => TRANSACTION_ID, 'status' => 'succeeded', 'amount' => 2500,
+            'currency' => 'EUR', 'completedAt' => '2026-09-26T10:05:40.1200000Z'],
+    ], 'futureTotal' => 1]);
+$client = new RecordingClient($listed, 200);
+$list = $client->listRefunds(strtoupper(TRANSACTION_ID));
+check('listRefunds is a GET on the payment refunds path', $client->calls[0]['method'] . ' ' . $client->calls[0]['path'],
+    'GET ' . DominaiteClient::PAYMENTS_PATH . '/' . TRANSACTION_ID . '/refunds');
+check('listRefunds signs an empty idempotency key', $client->calls[0]['key'], '');
+check('listRefunds signs an empty body', $client->calls[0]['body'] === null ? 'null' : 'body', 'null');
+check('listRefunds leaves the last idempotency key untouched', $client->getLastIdempotencyKey() === null ? 'null' : 'set', 'null');
+check('the list carries the totals', $list['transactionId'] . ' ' . $list['currency'] . ' ' . $list['refundedAmount']
+    . ' ' . $list['refundableAmount'], TRANSACTION_ID . ' EUR 2500 7500');
+check('the list keeps the API order', implode(',', array_column($list['refunds'], 'status')), 'pending,succeeded');
+check('every listed refund has every refund field', keysOf($list['refunds'][0]) . ' | ' . keysOf($list['refunds'][1]),
+    REFUND_FIELDS . ' | ' . REFUND_FIELDS);
+check('a listed full refund reads the omitted amount as null', var_export($list['refunds'][0]['amount'], true), 'NULL');
+check('a listed refund keeps its completedAt', (string) $list['refunds'][1]['completedAt'], '2026-09-26T10:05:40.1200000Z');
+check('a field the SDK does not model rides through the list', var_export($list['futureTotal'] ?? null, true), '1');
+
+$empty = (new RecordingClient(envelope(['transactionId' => TRANSACTION_ID, 'currency' => 'HUF', 'refundedAmount' => 0,
+    'refundableAmount' => 0, 'refunds' => []]), 200))->listRefunds(TRANSACTION_ID);
+check('a payment without refunds lists an empty array', (string) json_encode($empty['refunds']), '[]');
+check('a payment that cannot be refunded has nothing refundable', var_export($empty['refundableAmount'], true), '0');
+
+$thrown = null;
+try {
+    (new RecordingClient(['success' => false, 'error' => ['message' => 'Refused.', 'code' => 'PAYMENT_NOT_FOUND',
+        'statusCode' => 404]], 404))->listRefunds(TRANSACTION_ID);
+} catch (\Throwable $e) {
+    $thrown = $e;
+}
+check('listRefunds 404 PAYMENT_NOT_FOUND is a RefundException',
+    $thrown instanceof RefundException ? $thrown->getHttpStatus() . ' ' . $thrown->getErrorCode() : 'no RefundException',
+    '404 PAYMENT_NOT_FOUND');
+check('a 503 on listRefunds is a retryable transport error',
+    thrownBy(static function (): void {
+        (new RecordingClient(['success' => false, 'error' => ['message' => 'Changed while read.',
+            'code' => 'MERCHANT_API_UNAVAILABLE', 'statusCode' => 503]], 503))->listRefunds(TRANSACTION_ID);
+    }), TransportException::class);
+check('a 200 without a refund list is an ApiException',
+    thrownBy(static function (): void {
+        (new RecordingClient(envelope(['refundId' => REFUND_ID]), 200))->listRefunds(TRANSACTION_ID);
+    }), ApiException::class);
+foreach (['', 'order-1042', TRANSACTION_ID . '/refunds'] as $bad) {
+    $client = new RecordingClient($listed, 200);
+    check('listRefunds refuses transaction id ' . var_export($bad, true),
+        thrownBy(static function () use ($client, $bad): void {
+            $client->listRefunds($bad);
+        }), \InvalidArgumentException::class);
+    check('the bad list id ' . var_export($bad, true) . ' never reached the transport', (string) count($client->calls), '0');
 }
 
 // --- refund errors --------------------------------------------------------------------
