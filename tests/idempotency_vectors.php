@@ -263,4 +263,103 @@ foreach ($badKeyIds as $label => $badKeyId) {
     check("key id with header-breaking bytes rejected: $label", $outcome, 'rejected locally');
 }
 
+// 7. The routes that read or delete never touch the key. After any of them the accessor
+// still reads the key of the last create, so the catch block that retries it finds it.
+final class RouteClient extends DominaiteClient
+{
+    /** @var list<string> The idempotency key each read or delete signed. */
+    public array $readKeys = [];
+
+    public function __construct()
+    {
+        parent::__construct(
+            'dmk_0123456789abcdef',
+            'dms_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'
+        );
+    }
+
+    protected function send(string $method, string $path, ?array $body, string $idempotencyKey): array
+    {
+        if ($method !== 'POST') {
+            $this->readKeys[] = $idempotencyKey;
+        }
+        if ($method === 'DELETE') {
+            return $this->readResponse(204, '', []);
+        }
+        // listPlans() and listWebhookEndpoints() read a bare list. Every other route
+        // gets one object that each of their parsers accepts.
+        $data = $method === 'GET' && in_array($path, ['/merchant-api/plans', '/merchant-api/webhooks'], true) ? [] : [
+            'id' => 'plan_0123456789abcdef', 'refundId' => 're_1', 'transactionId' => '0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0',
+            'currency' => 'EUR', 'refundedAmount' => 0, 'refundableAmount' => 0, 'refunds' => [], 'items' => [],
+            'nextCursor' => null,
+        ];
+
+        return $this->readResponse($method === 'POST' ? 201 : 200, (string) json_encode(['success' => true, 'data' => $data]), []);
+    }
+}
+
+$routes = new RouteClient();
+$transactionId = '0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0';
+$readsAndDeletes = [
+    'ping()' => static function () use ($routes): void {
+        $routes->ping();
+    },
+    'getIntegrationContract()' => static function () use ($routes): void {
+        $routes->getIntegrationContract();
+    },
+    'getStatus()' => static function () use ($routes, $transactionId): void {
+        $routes->getStatus($transactionId);
+    },
+    'getRefund()' => static function () use ($routes, $transactionId): void {
+        $routes->getRefund($transactionId, 're_1');
+    },
+    'listRefunds()' => static function () use ($routes, $transactionId): void {
+        $routes->listRefunds($transactionId);
+    },
+    'listTransactions()' => static function () use ($routes): void {
+        $routes->listTransactions(['from' => '2026-10-01T00:00:00Z', 'to' => '2026-10-02T00:00:00Z']);
+    },
+    'revokePaymentMethod()' => static function () use ($routes): void {
+        $routes->revokePaymentMethod('pm_0123456789abcdef');
+    },
+    'listPlans()' => static function () use ($routes): void {
+        $routes->listPlans();
+    },
+    'getPlan()' => static function () use ($routes): void {
+        $routes->getPlan('plan_0123456789abcdef');
+    },
+    'updatePlan() without a key' => static function () use ($routes): void {
+        $routes->updatePlan('plan_0123456789abcdef', ['trialDays' => 14]);
+    },
+    'deletePlan()' => static function () use ($routes): void {
+        $routes->deletePlan('plan_0123456789abcdef');
+    },
+    'getAgreement()' => static function () use ($routes): void {
+        $routes->getAgreement('agr_0123456789abcdef');
+    },
+    'cancelAgreement()' => static function () use ($routes): void {
+        $routes->cancelAgreement('agr_0123456789abcdef');
+    },
+    'listWebhookEndpoints()' => static function () use ($routes): void {
+        $routes->listWebhookEndpoints();
+    },
+    'deleteWebhookEndpoint()' => static function () use ($routes): void {
+        $routes->deleteWebhookEndpoint('3f2c9a1e-0b7d-4c55-9a8e-1d2f3a4b5c6d');
+    },
+];
+foreach ($readsAndDeletes as $label => $call) {
+    $routes->createPlan(['name' => 'Gold', 'amount' => 2500, 'currency' => 'EUR', 'intervalUnit' => 'month',
+        'intervalCount' => 1, 'idempotencyKey' => 'plan-gold']);
+    try {
+        $call();
+        $outcome = 'returned';
+    } catch (\Throwable $e) {
+        $outcome = get_class($e) . ': ' . $e->getMessage();
+    }
+    check("$label leaves the key of the last create", $outcome . ', key ' . (string) $routes->getLastIdempotencyKey(),
+        'returned, key plan-gold');
+}
+check('every read and delete signed an empty key',
+    count($routes->readKeys) . ' ' . json_encode(array_values(array_unique($routes->readKeys))), '15 [""]');
+
 exit($failures === 0 ? 0 : 1);

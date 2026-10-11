@@ -22,6 +22,13 @@ namespace Dominaite\Exception;
  * the HTTP-date form, which this SDK does not convert - fall back to your own backoff
  * (a few seconds, growing) when it is null rather than treating null as "retry now".
  *
+ * getErrorCode() says which limit you hit, when the API sent a code: RATE_LIMIT_EXCEEDED
+ * for the request limits, and on chargePaymentMethod() also CHARGE_VELOCITY_EXCEEDED
+ * (too many charges on the card, or too much money in the currency, in the window) or
+ * CHARGE_DECLINE_RATE_EXCEEDED (the key collected too many declines; its charge route is
+ * locked for a while). Nothing was charged under any of them. It is null when the 429
+ * came from an edge in front of the API, as HTML. Treat an unknown code as a rate limit.
+ *
  * Extends ApiException, so existing `catch (ApiException $e)` blocks keep catching a
  * 429 as they did before. Catch RateLimitException FIRST when you want to branch on it.
  */
@@ -29,9 +36,10 @@ class RateLimitException extends ApiException
 {
     private ?int $retryAfterSeconds;
 
-    public function __construct(string $message, ?int $retryAfterSeconds = null)
+    /** @param array<string,mixed> $result The full envelope, when the API sent one. */
+    public function __construct(string $message, ?int $retryAfterSeconds = null, ?string $errorCode = null, array $result = [])
     {
-        parent::__construct(429, $message);
+        parent::__construct(429, $message, $errorCode, $result);
         $this->retryAfterSeconds = $retryAfterSeconds;
     }
 

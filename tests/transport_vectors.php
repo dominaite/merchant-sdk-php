@@ -242,6 +242,38 @@ try {
 check('an unknown payment method is an ApiException', $missing === null ? 'no exception' : get_class($missing), ApiException::class);
 check('the unknown payment method keeps its 404', (string) ($missing === null ? 0 : $missing->getHttpStatus()), '404');
 
+// --- the integration contract on the wire -----------------------------------------------
+// A public read, signed like ping: GET, an empty key, an empty body, no Idempotency-Key.
+$contract = $client->getIntegrationContract();
+check('the contract read answers with the unwrapped data', (string) json_encode($contract['sdks'] ?? null),
+    '["node","python","php","go","dotnet","rust"]');
+$seen = lastRequest($recordFile);
+check('the contract read went out as GET on its path', $seen['method'] . ' ' . $seen['path'],
+    'GET ' . DominaiteClient::INTEGRATION_CONTRACT_PATH);
+check('the contract path is the published one', DominaiteClient::INTEGRATION_CONTRACT_PATH, '/merchant-api/integration/contract');
+check('the contract read sent no body', $seen['body'], '');
+check('the contract read sent no Idempotency-Key header', array_key_exists('idempotency-key', $seen['headers']) ? 'sent' : 'absent', 'absent');
+check('the contract read is signed like ping', $seen['headers']['x-signature'] ?? '',
+    DominaiteClient::signRequest(SECRET, $seen['headers']['x-timestamp'] ?? '', 'GET', $seen['path'], '', ''));
+unlink($recordFile);
+
+// --- the transaction list on the wire ---------------------------------------------------
+// The query goes out in the URL, RFC 3986 encoded, and the signature covers the path alone.
+$transactions = $client->listTransactions(['from' => '2026-10-01T02:00:00+02:00', 'to' => '2026-10-08T00:00:00Z', 'limit' => 10]);
+check('a live transaction list answers the page', (string) json_encode($transactions), '{"items":[],"nextCursor":null}');
+$seen = lastRequest($recordFile);
+check('the list went out as GET on the transactions path', $seen['method'] . ' ' . $seen['path'], 'GET /merchant-api/transactions');
+check('the query arrived as sent, the + encoded', $seen['query'] ?? '',
+    'from=2026-10-01T02%3A00%3A00%2B02%3A00&to=2026-10-08T00%3A00%3A00Z&limit=10');
+check('the list sent no body and no Idempotency-Key header',
+    $seen['body'] . (array_key_exists('idempotency-key', $seen['headers']) ? 'sent' : 'absent'), 'absent');
+check('the list signature covers the path without the query', $seen['headers']['x-signature'] ?? '',
+    DominaiteClient::signRequest(SECRET, $seen['headers']['x-timestamp'] ?? '', 'GET', '/merchant-api/transactions', '', ''));
+check('the list signature does not cover the query', ($seen['headers']['x-signature'] ?? '') ===
+    DominaiteClient::signRequest(SECRET, $seen['headers']['x-timestamp'] ?? '', 'GET',
+        '/merchant-api/transactions?' . ($seen['query'] ?? ''), '', '') ? 'covers it' : 'path only', 'path only');
+unlink($recordFile);
+
 // --- refunds on the wire ----------------------------------------------------------------
 // The key goes out twice: in the Idempotency-Key header and inside the signature. A full
 // refund sends {} with no amount key.

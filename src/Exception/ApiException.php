@@ -11,17 +11,26 @@ namespace Dominaite\Exception;
  * validation codes on a 400 (IDEMPOTENCY_KEY_REQUIRED) and PAYMENT_METHOD_NOT_FOUND on
  * a charge against an id that is not yours. It is null when the response had no code
  * to give, so check before branching on it.
+ *
+ * getResult() is the whole envelope the API sent, for fields not modelled here, such as
+ * error.params (WEBHOOK_ALREADY_REGISTERED names the existing endpoint there) and
+ * validationErrors. It is [] when the response was not the API's JSON.
  */
 class ApiException extends \RuntimeException
 {
     private int $httpStatus;
     private ?string $errorCode;
 
-    public function __construct(int $httpStatus, string $message, ?string $errorCode = null)
+    /** @var array<string,mixed> */
+    private array $result;
+
+    /** @param array<string,mixed> $result The full envelope, when the API sent one. */
+    public function __construct(int $httpStatus, string $message, ?string $errorCode = null, array $result = [])
     {
         parent::__construct($message);
         $this->httpStatus = $httpStatus;
         $this->errorCode = $errorCode;
+        $this->result = $result;
     }
 
     public function getHttpStatus(): int
@@ -33,5 +42,15 @@ class ApiException extends \RuntimeException
     public function getErrorCode(): ?string
     {
         return $this->errorCode;
+    }
+
+    /**
+     * The full envelope the API sent, or [] when there was none.
+     *
+     * @return array<string,mixed>
+     */
+    public function getResult(): array
+    {
+        return $this->result;
     }
 }

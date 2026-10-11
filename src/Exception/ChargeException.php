@@ -22,7 +22,7 @@ namespace Dominaite\Exception;
  *   charged; retry later with the SAME key.
  *
  * A decline (HTTP 402) is deliberately NOT this exception: chargePaymentMethod() returns
- * it as a charge with status 'failed' and a declineClass.
+ * it as a charge with status 'failed'.
  *
  * getResult() is the whole envelope the gateway sent, for fields not modelled above.
  */
@@ -62,7 +62,8 @@ class ChargeException extends \RuntimeException
 
     /**
      * The charge row the gateway attached to its answer: {chargeId, status, declineClass,
-     * declineCode, transactionId}. Null when it attached none.
+     * declineCode, transactionId, agreementId}, and sequence when the API sent it. Null
+     * when it attached none.
      *
      * @return array<string,mixed>|null
      */

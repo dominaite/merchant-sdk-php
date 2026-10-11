@@ -1,7 +1,8 @@
 <?php
-// Dependency-free tests for stored payment methods: saveCard on a session, the charge
-// body and key handling, declines as results, refusals as exceptions, and the id guard
-// that keeps a payment method id a single path segment of the signed canonical path.
+// Dependency-free tests for stored payment methods: saveCard and verifyOnly on a
+// session, the charge body and key handling, declines as results, refusals as
+// exceptions, and the id guard that keeps a payment method id a single path segment of
+// the signed canonical path.
 // Run: php tests/payment_method_vectors.php - exits non-zero on any mismatch.
 //
 // tests/transport_vectors.php covers the same two routes end to end through real curl,
@@ -18,6 +19,7 @@ require __DIR__ . '/../src/Exception/TransportException.php';
 
 use Dominaite\DominaiteClient;
 use Dominaite\Exception\ApiException;
+use Dominaite\Exception\AuthenticationException;
 use Dominaite\Exception\ChargeException;
 use Dominaite\Exception\RevokeException;
 use Dominaite\Exception\TransportException;
@@ -45,6 +47,7 @@ const SECRET = 'dms_0123456789abcdef0123456789abcdef0123456789abcdef0123456789ab
 const PAYMENT_METHOD_ID = 'pm_0123456789abcdef0123456789abcdef';
 const CHARGE_BODY = '{"amount":2500,"currency":"EUR","orderReference":"order-1043"}';
 const CHARGE_KEY = '00000000-0000-4000-8000-000000000003';
+const AGREEMENT_ID = 'agr_0123456789abcdef0123456789abcdef';
 
 /**
  * Records what reached the transport and answers with a canned gateway body under a
@@ -141,6 +144,94 @@ check('a non-bool saveCard is rejected before the call',
         (new RecordingClient($checkout))->createCheckoutSession($sessionParams + ['saveCard' => 'yes']);
     }), \InvalidArgumentException::class);
 
+// --- verifyOnly ------------------------------------------------------------------------
+// A verify-only session saves the card without a payment. The amount is 0 or left out,
+// because the API sets the verification hold. Every other session keeps the positive
+// amount check.
+$verifyCheckout = $checkout;
+$verifyCheckout['checkout']['amount'] = 30;
+$verifyCheckout['checkout']['verifyOnly'] = true;
+$verifyParams = ['currency' => 'EUR', 'orderReference' => 'verify-customer-7', 'verifyOnly' => true,
+    'idempotencyKey' => 'verify-customer-7'];
+
+$client = new RecordingClient($verifyCheckout);
+$verified = $client->createCheckoutSession($verifyParams);
+check('a verifyOnly session without an amount goes out without one', encode($client->calls[0]['body']),
+    '{"currency":"EUR","orderReference":"verify-customer-7","verifyOnly":true}');
+check('a verifyOnly session signs the caller key', $client->calls[0]['key'], 'verify-customer-7');
+check('a verifyOnly session records the key it sent', (string) $client->getLastIdempotencyKey(), 'verify-customer-7');
+check('the session reads verifyOnly true', var_export($verified['verifyOnly'] ?? null, true), 'true');
+check('the session reads the hold the API set', var_export($verified['amount'], true), '30');
+
+$client = new RecordingClient($verifyCheckout);
+$client->createCheckoutSession($verifyParams + ['amount' => 0]);
+check('a verifyOnly session with amount 0 sends it', encode($client->calls[0]['body']),
+    '{"currency":"EUR","orderReference":"verify-customer-7","verifyOnly":true,"amount":0}');
+
+// The other verify-only rules (saveCard not false, the widget only, no agreementId) are
+// the API's to refuse with a 400. The SDK sends them as they are.
+$client = new RecordingClient($verifyCheckout);
+$client->createCheckoutSession($verifyParams + ['saveCard' => false]);
+check('a verifyOnly session leaves the other rules to the API',
+    var_export($client->calls[0]['body']['saveCard'] ?? 'absent', true), 'false');
+
+// A null verifyOnly is left out, so the signed body of a payment session does not move.
+$client = new RecordingClient($checkout);
+$client->createCheckoutSession($sessionParams + ['verifyOnly' => null]);
+check('a null verifyOnly is left out of the body', encode($client->calls[0]['body']),
+    '{"amount":2500,"currency":"EUR","orderReference":"order-1042"}');
+
+$verifyRefusals = [
+    'a positive amount with verifyOnly' => $verifyParams + ['amount' => 2500],
+    'a string amount with verifyOnly' => $verifyParams + ['amount' => '0'],
+    'a null amount with verifyOnly' => $verifyParams + ['amount' => null],
+    'a non-bool verifyOnly' => ['verifyOnly' => 'yes'] + $verifyParams + ['amount' => 0],
+    'verifyOnly without a currency' => array_diff_key($verifyParams, ['currency' => true]),
+    'verifyOnly without an orderReference' => array_diff_key($verifyParams, ['orderReference' => true]),
+    'verifyOnly without a key' => array_diff_key($verifyParams, ['idempotencyKey' => true]),
+    'amount 0 without verifyOnly' => ['amount' => 0] + $sessionParams,
+    'amount 0 with verifyOnly false' => ['amount' => 0, 'verifyOnly' => false] + $sessionParams,
+    'no amount without verifyOnly' => array_diff_key($sessionParams, ['amount' => true]),
+];
+foreach ($verifyRefusals as $label => $params) {
+    $client = new RecordingClient($verifyCheckout);
+    $thrown = thrownBy(static function () use ($client, $params): void {
+        $client->createCheckoutSession($params);
+    });
+    check("$label is refused before the call", $thrown . ' after ' . count($client->calls) . ' calls',
+        \InvalidArgumentException::class . ' after 0 calls');
+}
+
+// The status read of a verify-only session: verifyOnly true, the raw status, the card.
+// A one-off payment's read has no verifyOnly key at all, so ?? false reads it.
+$verifyStatus = ['transactionId' => '1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d', 'orderId' => 'ord_1',
+    'orderReference' => 'verify-customer-7', 'status' => 'requires_capture', 'amount' => 30, 'currency' => 'EUR',
+    'createdAt' => '2026-10-01T08:00:00Z', 'isRecurring' => false, 'verifyOnly' => true, 'sequence' => 0,
+    'storedPaymentMethod' => ['id' => PAYMENT_METHOD_ID, 'status' => 'active']];
+$read = (new RecordingClient(['success' => true, 'data' => $verifyStatus]))->getStatus('1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d');
+check('a verify-only status read carries verifyOnly true', var_export($read['verifyOnly'] ?? null, true), 'true');
+check('a verify-only status read keeps the raw status', (string) $read['status'], 'requires_capture');
+check('a verify-only status read carries the saved card', (string) ($read['storedPaymentMethod']['id'] ?? ''), PAYMENT_METHOD_ID);
+unset($verifyStatus['verifyOnly']);
+$read = (new RecordingClient(['success' => true, 'data' => $verifyStatus]))->getStatus('1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d');
+check('a status read without verifyOnly does not invent it', array_key_exists('verifyOnly', $read) ? 'invented' : 'absent', 'absent');
+check('and reads as false with ?? false', var_export($read['verifyOnly'] ?? false, true), 'false');
+check('a status read without declineClass does not invent it', array_key_exists('declineClass', $read) ? 'invented' : 'absent', 'absent');
+
+// Off until we switch it on for the account: a 403 with its own message.
+$client = new RecordingClient(['success' => false, 'error' => [
+    'code' => 'VERIFY_ONLY_NOT_ENABLED', 'message' => 'Verify-only sessions are not enabled for this account.',
+]], 403);
+$notEnabled = null;
+try {
+    $client->createCheckoutSession($verifyParams);
+} catch (AuthenticationException $e) {
+    $notEnabled = $e;
+}
+check('a verifyOnly session on an account without it is a 403 VERIFY_ONLY_NOT_ENABLED',
+    $notEnabled === null ? 'no exception' : $notEnabled->getHttpStatus() . ' ' . $notEnabled->getErrorCode(),
+    '403 ' . DominaiteClient::VERIFY_ONLY_NOT_ENABLED);
+
 // --- chargePaymentMethod: the signed body ------------------------------------------------
 $client = new RecordingClient($charge, 201);
 $result = $client->chargePaymentMethod(PAYMENT_METHOD_ID, $chargeParams);
@@ -155,16 +246,35 @@ check('charge body is the vector body byte for byte', encode($client->calls[0]['
 check('charge sends the caller idempotency key', $client->calls[0]['key'], CHARGE_KEY);
 check('charge idempotency key is readable afterwards', (string) $client->getLastIdempotencyKey(), CHARGE_KEY);
 
-// Only the contract's fields reach the body, in the contract's order, description last.
+// The contract's fields go first, in the contract's order. Any other key follows as the
+// caller sent it, so a field the API adds later needs no SDK update.
 $client = new RecordingClient($charge);
 $client->chargePaymentMethod(PAYMENT_METHOD_ID, [
-    'orderReference' => 'order-1043', 'description' => 'Monthly plan', 'currency' => 'EUR', 'amount' => 2500,
-    'customer' => ['email' => 'not-on-this-route'], 'idempotencyKey' => CHARGE_KEY,
+    'futureField' => ['nested' => true], 'orderReference' => 'order-1043', 'agreementId' => AGREEMENT_ID,
+    'description' => 'Monthly plan', 'currency' => 'EUR', 'amount' => 2500, 'idempotencyKey' => CHARGE_KEY,
+    'anotherField' => 'x',
 ]);
-check('charge body is built field by field in contract order', encode($client->calls[0]['body']),
-    '{"amount":2500,"currency":"EUR","orderReference":"order-1043","description":"Monthly plan"}');
+check('charge body is the known fields in contract order, then the rest as sent', encode($client->calls[0]['body']),
+    '{"amount":2500,"currency":"EUR","orderReference":"order-1043","description":"Monthly plan","agreementId":"'
+    . AGREEMENT_ID . '","futureField":{"nested":true},"anotherField":"x"}');
 check('the idempotency key rides the header, never the charge body',
     array_key_exists('idempotencyKey', $client->calls[0]['body']) ? 'leaked' : 'absent', 'absent');
+
+// A charge under an agreement says so, with the outcome counter. The API leaves agreementId
+// out on a charge that named no agreement, and the SDK reads it as null.
+$agreementCharge = $charge;
+$agreementCharge['data']['agreementId'] = AGREEMENT_ID;
+$agreementCharge['data']['sequence'] = 2;
+$client = new RecordingClient($agreementCharge, 201);
+$result = $client->chargePaymentMethod(PAYMENT_METHOD_ID, $chargeParams + ['agreementId' => AGREEMENT_ID]);
+check('charge reads the agreementId it was made under', (string) ($result['agreementId'] ?? 'absent'), AGREEMENT_ID);
+check('charge reads the outcome counter', var_export($result['sequence'] ?? 'absent', true), '2');
+$client = new RecordingClient($charge, 201);
+$result = $client->chargePaymentMethod(PAYMENT_METHOD_ID, $chargeParams);
+check('a charge without agreementId on the wire reads it as null',
+    array_key_exists('agreementId', $result) ? var_export($result['agreementId'], true) : 'absent', 'NULL');
+check('a charge from a gateway without sequence does not invent it',
+    var_export(array_key_exists('sequence', $result), true), 'false');
 
 // --- chargePaymentMethod: declines are results, refusals are typed exceptions ----------
 // A 402 says success=false and CHARGE_DECLINED, but the charge is right there with its
@@ -276,6 +386,8 @@ $cases = [
     'empty orderReference' => ['orderReference' => ''],
     'orderReference too long' => ['orderReference' => str_repeat('x', 101)],
     'non-string description' => ['description' => 7],
+    'non-string agreementId' => ['agreementId' => 7],
+    'null agreementId' => ['agreementId' => null],
     'empty idempotencyKey' => ['idempotencyKey' => ''],
     'idempotencyKey too long' => ['idempotencyKey' => str_repeat('k', 101)],
     'idempotencyKey with CRLF' => ['idempotencyKey' => "order-1\r\nX-Forwarded-For: 1.2.3.4"],

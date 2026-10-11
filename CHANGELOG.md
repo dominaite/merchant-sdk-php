@@ -3,10 +3,47 @@
 Versions follow semver. The package installs from git tags, so a version exists once its
 `v` tag does.
 
-## Unreleased
+## 0.5.0
 
 Added:
 
+- Verify-only sessions: `'verifyOnly' => true` on `createCheckoutSession()` saves the payer's
+  card with no payment. Send `'amount' => 0` or leave the amount out; any other amount throws
+  `InvalidArgumentException` before anything is sent. The API refuses the session with 403
+  `VERIFY_ONLY_NOT_ENABLED` until we switch it on for your account. The session sends
+  `verification.succeeded` or `verification.failed`, never a `payment.*` event.
+- Subscription sessions: `createCheckoutSession()` documents `agreementId`, `consent` and
+  `locationId`.
+- Subscriptions: `createPlan()`, `listPlans()`, `getPlan()`, `updatePlan()` (PATCH) and
+  `deletePlan()`, and `createAgreement()`, `getAgreement()` and `cancelAgreement()`.
+  `createPlan()` and `createAgreement()` need an idempotency key. `updatePlan()` sends one only
+  when you give one, because the API does not need it to update a plan.
+- `listRefunds($transactionId)`: the refunds of one payment that you created through the API,
+  and the `refundedAmount` and `refundableAmount` totals.
+- Webhook endpoints from your code, with a `webhooks:manage` key: `createWebhookEndpoint()`,
+  `listWebhookEndpoints()` and `deleteWebhookEndpoint()`. The create answers the `whsec_` secret
+  one time only; a repeat with the same key answers `'secret' => null`. The SDK does not check
+  event types.
+- `listTransactions($params)` (`from`, `to`, `status`, `limit`, `cursor`), with a
+  `transactions:read` key: one page of your payments, oldest first, and the `nextCursor` of the
+  next page. The SDK signs the path without the query.
+- `getIntegrationContract()`: the contract that the API publishes about itself, as sent.
+- Response fields: `verifyOnly`, `declineClass`, `isRecurring`, `agreement` and `sequence` in
+  the `getStatus()` shape, which reads an omitted `agreement.nextChargeAt` as null. `verifyOnly`
+  and `agreementId` on the checkout session. `agreementId` and `sequence` on the charge, which
+  reads an omitted `agreementId` as null. Every status, class and reason stays a plain string,
+  so a value the SDK does not know never throws.
+- `agreementId` on `chargePaymentMethod()`.
+- Errors: `ApiException::getResult()` on every API error, the whole JSON answer, for example
+  `error.params.webhookId` on 409 `WEBHOOK_ALREADY_REGISTERED`. `RateLimitException` carries the
+  error code, so `getErrorCode()` names the limit you hit.
+- Constants: `INSUFFICIENT_SCOPE`, `VERIFY_ONLY_NOT_ENABLED`, `RATE_LIMIT_EXCEEDED`,
+  `CHARGE_VELOCITY_EXCEEDED` and `CHARGE_DECLINE_RATE_EXCEEDED`. `AUTHORIZATION_ERROR_CODES`
+  lists the 403 authorization group, pinned against the wire contract. `PLANS_PATH`,
+  `AGREEMENTS_PATH`, `WEBHOOKS_PATH`, `TRANSACTIONS_PATH` and `INTEGRATION_CONTRACT_PATH` name the
+  new routes.
+- Contract fixture: the new status read, checkout session and charge fields, with examples.
+  Wire contract fixture: refreshed from the API, with the authorization error group.
 - Wallet reporting: `paymentMethod` and `walletType` on `getStatus()`, both optional and
   nullable strings. `paymentMethod` is `card`, `wallet`, `bank_transfer` or `sepa`;
   `walletType` names the wallet when `paymentMethod` is `wallet`, and an unknown value is a
@@ -14,6 +51,27 @@ Added:
   disputes like a card. `PAYMENT_METHOD_CATEGORIES` and `WALLET_TYPES` list the known values.
 - Contract fixtures: the two wallet fields in the status read fields and examples, and the
   gateway's `wallets` section in the wire contract.
+
+Changed:
+
+- A 403 no longer tells you to check your key id, secret and server clock. That hint is for 401
+  only. 403 `INSUFFICIENT_SCOPE` says that the key does not hold the scope and repeats the API
+  message, and 403 `VERIFY_ONLY_NOT_ENABLED` says that verify-only is not on for your account.
+- `chargePaymentMethod()` and `createRefund()` send every field you give, not only the fields
+  that the SDK models, so a new API field needs no SDK release. The idempotency key stays a
+  header, and the amount and reason checks stay.
+- `declineClass` can be null, for example when nobody declined the payment. The docs no longer
+  promise a class on every decline.
+- The README documents key scopes, verify-only sessions, subscriptions, the refund list, webhook
+  endpoints, transactions and the integration contract.
+
+Fixed:
+
+- `getStatus()` reads an omitted `orderReference`, `refundedAmount`, `updatedAt` or `expiresAt`
+  as null. The API leaves a null field out, so a paid session with no refund had no
+  `refundedAmount` key. Reading it raised a PHP notice or warning, which some frameworks turn
+  into an exception. The other reads already gave null for an omitted key that their shape
+  always has, for example `amount` on a pending full refund.
 
 ## 0.4.0
 

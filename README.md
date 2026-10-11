@@ -60,6 +60,25 @@ Without it, a stack trace records the arguments each frame was called with, so a
 thrown anywhere below `new DominaiteClient(...)` carries your plaintext secret into whatever
 renders or ships that trace.
 
+### Scopes: a payments key and a reporting key
+
+Each key holds scopes. The scopes decide which routes the key can call:
+
+- `payments`: sessions and their status, charges and revokes, refunds, plans and agreements.
+  A key issued before scopes existed holds this scope.
+- `transactions:read`: `listTransactions()`.
+- `webhooks:manage`: `createWebhookEndpoint()`, `listWebhookEndpoints()` and
+  `deleteWebhookEndpoint()`.
+
+A `payments` key never holds the other two scopes. Use a separate reporting key for them, in
+a second client. A reporting key covers your whole account, not one storefront. The scopes of
+a key never change: for other scopes you need a new key. Every key can call `ping()` and
+`getIntegrationContract()`.
+
+A key without the scope of a route gets HTTP 403 `INSUFFICIENT_SCOPE`, and the SDK throws
+`AuthenticationException`. Its message says that the scope is the problem. The signature was
+valid, so your key id, secret and clock are not the cause. Only a 401 points at those three.
+
 ## Ping before your first session
 
 One signed GET that creates nothing, so anything that fails here is your credentials, your
@@ -79,6 +98,20 @@ print_r($client->ping());
 
 Watch `clockSkewSeconds`: the gateway rejects requests once it passes 300, so a number that
 keeps growing is your cue to fix NTP before payments start failing.
+
+## Read the integration contract
+
+`getIntegrationContract()` returns the public integration contract of the API: the routes,
+the fields, the status values and the error codes as the API uses them now. Every key can
+read it, and it creates nothing.
+
+```php
+$contract = $client->getIntegrationContract();
+echo $contract['version'];
+```
+
+The SDK itself never reads the contract at runtime. Use it to check your own integration, for
+example in a test that fails when a value you depend on changes.
 
 ## Create a session (your `create_session.php`)
 
@@ -172,6 +205,40 @@ the payment happened.
 Register an endpoint in the dashboard (Developers, Webhooks): an HTTPS URL, the events you
 want, and you get a signing secret `whsec_...` shown exactly once. Store it like the API
 secret. Regenerating it kills the old one.
+
+### Manage endpoints from your server
+
+You can also manage endpoints through the API. These calls need a reporting key with the
+`webhooks:manage` scope (see "Scopes" above).
+
+```php
+$reporting = new DominaiteClient(getenv('DOMINAITE_REPORTING_KEY_ID'), getenv('DOMINAITE_REPORTING_SECRET'));
+
+$endpoint = $reporting->createWebhookEndpoint([
+    'url'            => 'https://shop.example/webhook.php',
+    'events'         => ['payment.succeeded', 'payment.failed'],
+    'idempotencyKey' => 'endpoint-shop-main',
+]);
+$vault->store('whsec', $endpoint['secret']); // in this first answer only
+
+foreach ($reporting->listWebhookEndpoints() as $item) {
+    // id, url, events, status (active or inactive), createdAt. Never the secret.
+}
+
+$reporting->deleteWebhookEndpoint($endpoint['id']);
+```
+
+- The secret is in the first answer only. On a replay of the same key `secret` is `null`, and
+  the list never has it. If you lose it, delete the endpoint and create it again.
+- After a timeout or a 503, retry with the same key. The retry can answer a new id and a new
+  secret, and one key never holds two endpoints.
+- The SDK does not check event types. The API refuses an unknown type with
+  `VALIDATION_ERROR`.
+- A key used again more than a day later, while its endpoint still exists, answers 409
+  `WEBHOOK_ALREADY_REGISTERED`. `$e->getResult()['error']['params']['webhookId']` is that
+  endpoint. Use a fresh key for a new endpoint.
+- Deleting an unknown or deleted endpoint answers 404 `WEBHOOK_NOT_FOUND`. When the answer to
+  a delete was lost, treat that 404 as done.
 
 ### Receiving a delivery (your `webhook.php`)
 
@@ -471,6 +538,19 @@ do retry, reuse the idempotency key.
 `RateLimitException` extends `ApiException`, so code written before it existed still catches
 a 429. Catch `RateLimitException` first if you want to branch on it.
 
+`getErrorCode()` names the limit you hit:
+
+- `RATE_LIMIT_EXCEEDED`: the request limits above. After too many failed authentication
+  attempts from one IP, the API also blocks that IP for a while with this code. That 429 has
+  no `Retry-After`.
+- `CHARGE_VELOCITY_EXCEEDED` (`chargePaymentMethod()` only): too many charges on the card, or
+  too much money in the currency, in the window.
+- `CHARGE_DECLINE_RATE_EXCEEDED` (`chargePaymentMethod()` only): the key collected too many
+  declines, so its charges are locked for a while.
+
+Nothing was charged under any of them. The code is `null` when the 429 did not come from the
+API itself. Treat a code you do not know as a rate limit.
+
 The polling loop in "Fallback: status polling" is the usual way to hit this. Poll one
 transaction every few seconds, not every transaction every second.
 
@@ -586,6 +666,7 @@ try {
             // soft_sca_required - the issuer wants the customer present: send them through a
             //                     hosted session with saveCard and charge the new method
             // soft_other        - transient, one retry later is reasonable
+            // null              - no class, for example nobody declined: handle it like soft_other
             handleDecline($charge['declineClass'], $charge['declineCode']);
             break;
         case 'cancelled':
@@ -632,14 +713,15 @@ A charge is signed exactly like a session and carries a required `Idempotency-Ke
 retry after a timeout with the **same** key never charges the card twice: the gateway replays
 its first answer, HTTP status included. `getLastIdempotencyKey()` reads the key back the same
 way it does for a session. The HTTP status is the contract on this route: 201 (or 200 on a replay) returns
-the charge, 402 returns the charge too (`status` `failed` plus `declineClass`), and 409, 422,
+the charge, 402 returns the charge too (`status` `failed`), and 409, 422,
 502 and 503 throw `ChargeException` with `getErrorCode()`, `getHttpStatus()`, the gateway's
 message and, when the gateway attached the charge row, `getCharge()` and `getTransactionId()`.
 Only authentication (401/403), an id that is not yours (404, `ApiException` with
 `getErrorCode()` `PAYMENT_METHOD_NOT_FOUND`), validation (400, `ApiException`), rate limiting
 (429) and network failures keep their generic exceptions. `declineClass` and `declineCode` are
 `null` unless the charge was declined; the gateway omits them on the wire and the SDK reads
-absent as null.
+absent as null. `declineClass` can be null, for example when nobody declined the payment.
+Handle a null class on a 402 like `soft_other`.
 
 Revoking signs an empty key and an empty body, like `getStatus()`. A revoke that fails with
 `RevokeException` changed nothing: `MERCHANT_API_UNAVAILABLE` (503) is retryable,
@@ -653,6 +735,90 @@ The platform can also retire a card on its own: `status` `retired`, with `retire
 (`DominaiteClient::STORED_PAYMENT_METHOD_RETIRED_REASON_VOCABULARY`). A retired card is refused
 with `PAYMENT_METHOD_NOT_ACTIVE` too and never becomes active again, so ask the customer to save
 a card again. `retiredReason` is `null` on every other card.
+
+### Save a card without a payment (verify-only)
+
+Send `'verifyOnly' => true` to save a card with no payment, and leave `amount` out or send 0.
+The checkout places a small hold to check the card and saves the card. Then the platform
+releases the hold. You and the payer are never charged.
+
+```php
+$session = $client->createCheckoutSession([
+    'currency'       => 'EUR',
+    'orderReference' => 'card-check-' . $customerId,
+    // orderIdempotencyKey() needs a positive amount, so build this key yourself.
+    'idempotencyKey' => 'verify-' . $customerId,
+    'verifyOnly'     => true,
+]);
+```
+
+- Verify-only is off by default. We switch it on for your account. Before that, the API
+  answers HTTP 403 `VERIFY_ONLY_NOT_ENABLED` and the SDK throws `AuthenticationException`.
+- The API refuses `'saveCard' => false`, the card fields integration and `agreementId` on a
+  verify-only session.
+- The status read has `verifyOnly` set to `true`. Its `status` stays the raw status:
+  `requires_capture`, then `cancelled` when the hold is released. A non-null
+  `storedPaymentMethod` tells you that the card is verified.
+- A verify-only session fires `verification.succeeded` or `verification.failed`, never a
+  `payment.*` event.
+
+## Subscriptions: plans and agreements
+
+A plan is a price that repeats: an amount, a currency and an interval. An agreement puts one
+customer on one plan. The platform then charges the saved card once per period, so you do not
+call `chargePaymentMethod()` for these charges.
+
+1. Create the plan once.
+2. Create an agreement for each customer. It starts `pending` and charges nothing.
+3. Send the customer through a subscription session: `createCheckoutSession()` with the
+   `agreementId`. The session takes the first payment, saves the card and activates the
+   agreement.
+
+```php
+$plan = $client->createPlan([
+    'name'           => 'Pro monthly',
+    'amount'         => 2500,    // minor units
+    'currency'       => 'EUR',
+    'intervalUnit'   => 'month', // day, week, month or year
+    'intervalCount'  => 1,
+    'idempotencyKey' => 'plan-pro-monthly',
+]);
+
+$agreement = $client->createAgreement([
+    'planId'            => $plan['id'], // plan_...
+    'customerReference' => 'customer-8817',
+    'idempotencyKey'    => 'agreement-customer-8817-pro',
+]);
+
+$session = $client->createCheckoutSession([
+    'amount'         => 2500,
+    'currency'       => 'EUR',
+    'orderReference' => 'customer-8817-pro-first',
+    'idempotencyKey' => 'subscribe-' . $agreement['id'],
+    'agreementId'    => $agreement['id'], // agr_...
+    'consent'        => [
+        'textVersion' => 'recurring-2026-09', // a version from the contract's recurring.consentTextVersions
+        'acceptedAt'  => $acceptedAt,         // when the customer accepted, ISO 8601 UTC
+        'ip'          => $customerIp,
+    ],
+]);
+```
+
+- `listPlans()` returns at most 200 plans, active first, with no pages. `getPlan()` reads one.
+- `updatePlan()` changes only `name`, `trialDays` and `cancelUrl`. The amount, the currency and
+  the interval never change: create a new plan instead.
+- `deletePlan()` archives the plan. Agreements on it continue on their own copy of it.
+- `getAgreement()` reads an agreement. `cancelAgreement()` cancels it: no further charge is
+  scheduled, and a charge already placed is not reversed. Cancelling twice is safe.
+- `createPlan()` and `createAgreement()` need an `idempotencyKey`. The same key with the same
+  body answers the first object again. Derive the key from your own record, never at random.
+- A refusal is an `ApiException`. Branch on `getErrorCode()`, for example `PLAN_NOT_FOUND` or
+  `AGREEMENT_CONSENT_REQUIRED`.
+
+The status read of the subscription session has `agreement`: its `id`, `status` and
+`nextChargeAt`. The `status` turns `active` when the first payment is approved. After a decline
+or an abandoned session it stays `pending`. To follow the agreement after that, use the
+`agreement.*` and `charge.*` events (see "Agreement and charge events: order by sequence").
 
 ## Refunds
 
@@ -728,6 +894,54 @@ A completed refund fires `payment.refunded`, once per refund, partial or full. O
 amount and `data.originalTransactionId` is the payment you refunded. **A failed refund fires
 no webhook**: poll `getRefund()` if you need to know about failures.
 
+### List the refunds of a payment
+
+`listRefunds()` returns the refunds of one payment, with its totals:
+
+```php
+$list = $client->listRefunds($transactionId);
+// ['transactionId' => ..., 'currency' => 'HUF', 'refundedAmount' => 1500,
+//  'refundableAmount' => 6940, 'refunds' => [[... the shape of getRefund() ...]]]
+```
+
+- `refunds` has the refunds created through this API, and is empty when there are none.
+  Pending refunds come first, then processing ones, then the final ones. Each group is newest
+  first.
+- `refundedAmount` also counts refunds made in the dashboard. `refundableAmount` is what a new
+  refund can take now.
+- An unknown payment is a `RefundException` with `PAYMENT_NOT_FOUND`.
+
+## List your transactions
+
+`listTransactions()` lists your card-not-present payments in a time window, page by page. It
+needs a reporting key with the `transactions:read` scope (see "Scopes" above).
+
+```php
+$reporting = new DominaiteClient(getenv('DOMINAITE_REPORTING_KEY_ID'), getenv('DOMINAITE_REPORTING_SECRET'));
+
+$params = ['from' => '2026-10-01T00:00:00Z', 'to' => '2026-10-08T00:00:00Z', 'limit' => 100];
+do {
+    $page = $reporting->listTransactions($params);
+    foreach ($page['items'] as $item) {
+        // transactionId, orderReference, type, status, amount, currency, createdAt,
+        // completedAt, storedPaymentMethodId, refundedAmount
+    }
+    $params['cursor'] = $page['nextCursor'];
+} while ($page['nextCursor'] !== null);
+```
+
+- `from` is inclusive and `to` is exclusive, on `createdAt`. Both are required, at most 31 days
+  apart. Use the `Z` form, for example `gmdate('Y-m-d\TH:i:s\Z', $time)`.
+- `status` is optional and keeps the payments that have that status now. `limit` is 1 to 100,
+  50 when you leave it out.
+- Rows come oldest first. Send `nextCursor` back as `cursor`, with the same `from`, `to` and
+  `status`, until it is `null`. Paging never repeats or skips a row.
+- `type` is `payment`, `charge` or `verification`. A `verification` is not a purchase, so leave
+  it out of revenue.
+- A refund is not a row of its own. It shows on its payment as `refundedAmount` and `status`.
+  Fees are not in this read.
+- The SDK sends the parameters in the query string. The signature covers the path only.
+
 ## Fallback: status polling
 
 Use this when you have not registered a webhook endpoint yet, inside your reconciliation
@@ -741,9 +955,11 @@ $status = $client->getStatus($session['transactionId']);
 
 `status` is one of: `pending`, `processing`, `succeeded`, `failed`, `refunded`,
 `partially_refunded`, `cancelled`, `disputed`, `requires_capture`, `abandoned`. While the
-session is still payable the response also carries `expiresAt`; after that instant a `pending`
-session can only become `abandoned`. An unknown transaction id throws an `ApiException` with
-HTTP 404.
+session is still payable, `expiresAt` says until when; after that instant a `pending` session
+can only become `abandoned`. An unknown transaction id throws an `ApiException` with HTTP 404.
+
+`orderReference`, `refundedAmount`, `updatedAt` and `expiresAt` are always in the array, and
+null when they have no value.
 
 `succeeded` is the only value that means the payment is complete. Keep polling on `pending`,
 `processing` and `requires_capture` - none of them is terminal.
@@ -760,6 +976,18 @@ Both are null while the payment is still open and on older transactions, `wallet
 for non-wallet payments, and older gateways leave the keys out, so read them with `?? null`. This is reporting data, not a money-flow switch: a wallet payment refunds, captures
 and disputes like a card. A `walletType` not in `DominaiteClient::WALLET_TYPES` is still a
 valid wallet, not an error.
+
+The status read also has these fields. The API leaves some of them out when they have no
+value, so read each one with `??`:
+
+- `declineClass`: why a failed payment was declined (`DominaiteClient::DECLINE_CLASS_VOCABULARY`).
+  It is null on every status other than `failed`. It can be null on `failed` too, for example
+  when nobody declined the payment.
+- `isRecurring`: `true` for a charge on a saved card, `false` for a checkout session.
+- `verifyOnly`: `true` for a verify-only session. Other sessions do not have it.
+- `agreement`: the `id`, `status` and `nextChargeAt` of the subscription agreement, or null.
+- `sequence`: the `data.sequence` of the latest `charge.*` event about this payment, 0 before
+  the first one.
 
 Two helpers encode those rules so you do not have to:
 

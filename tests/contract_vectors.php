@@ -423,6 +423,26 @@ foreach (['refundedAmount', 'expiresAt'] as $nullable) {
         var_export($result[$nullable], true), 'NULL');
 }
 
+// The wire leaves every null field out. A paid session with no order reference, no
+// refund, no update time and a closed window has none of these 4 keys, and each one still
+// reads as null.
+$paidBody = withoutNulls($status['example']);
+foreach (['orderReference', 'refundedAmount', 'updatedAt', 'expiresAt'] as $omitted) {
+    unset($paidBody[$omitted]);
+}
+$paid = (new CannedClient($paidBody))->getStatus($status['example']['transactionId']);
+check('the paid-session body is a succeeded session', (string) $paid['status'], 'succeeded');
+foreach (['orderReference', 'refundedAmount', 'updatedAt', 'expiresAt'] as $omitted) {
+    check("a paid session without $omitted on the wire reads it as null",
+        array_key_exists($omitted, $paid) ? var_export($paid[$omitted], true) : 'absent', 'NULL');
+}
+// Every key that the @return names without "?" is there, whatever the wire left out.
+$alwaysPresent = array_keys(array_filter(statusShape(), static function (string $entry): bool {
+    return preg_match('/^\w+:/', $entry) === 1;
+}));
+check('a paid session without its null fields has every key the shape always has',
+    sortedList(array_values(array_intersect($alwaysPresent, array_keys($paid)))), sortedList($alwaysPresent));
+
 // Every status in the vocabulary deserializes the same way - the example with its status
 // swapped is still a well-formed response, so no value is special-cased.
 foreach (DominaiteClient::STATUS_VOCABULARY as $value) {

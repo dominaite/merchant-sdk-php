@@ -47,12 +47,34 @@ class DominaiteClient
     public const PAYMENT_METHODS_PATH = '/merchant-api/payment-methods';
     /**
      * Canonical path of payments. POST {transactionId}/refunds refunds one, GET
-     * {transactionId}/refunds/{refundId} reads a refund back - both signed on this path
-     * with the lowercase transaction id.
+     * {transactionId}/refunds lists its refunds, GET {transactionId}/refunds/{refundId}
+     * reads a refund back - all signed on this path with the lowercase transaction id.
      */
     public const PAYMENTS_PATH = '/merchant-api/payments';
     public const PING_PATH = '/merchant-api/ping';
-    private const USER_AGENT = 'dominaite-php/0.4.0 (php ' . PHP_VERSION . ')';
+    /**
+     * Canonical path of subscription plans. POST creates one, GET lists them; GET, PATCH
+     * and DELETE {id} read, change and archive one - all signed with the plan_ id verbatim.
+     */
+    public const PLANS_PATH = '/merchant-api/plans';
+    /**
+     * Canonical path of subscription agreements. POST creates one; GET and DELETE {id}
+     * read and cancel one - signed with the agr_ id verbatim.
+     */
+    public const AGREEMENTS_PATH = '/merchant-api/agreements';
+    /**
+     * Canonical path of webhook endpoints. POST registers one, GET lists them, DELETE {id}
+     * removes one - signed with the lowercase hyphenated id. Needs the webhooks:manage scope.
+     */
+    public const WEBHOOKS_PATH = '/merchant-api/webhooks';
+    /**
+     * Canonical path of the transaction list. GET only. The query string is sent in the URL
+     * and is never part of the signature. Needs the transactions:read scope.
+     */
+    public const TRANSACTIONS_PATH = '/merchant-api/transactions';
+    /** The public integration contract. It needs no key; the SDK signs it like ping. */
+    public const INTEGRATION_CONTRACT_PATH = '/merchant-api/integration/contract';
+    private const USER_AGENT = 'dominaite-php/0.5.0 (php ' . PHP_VERSION . ')';
     private const TIMEOUT_SECONDS = 15;
 
     /**
@@ -82,6 +104,10 @@ class DominaiteClient
      * else would sign one path and request another.
      */
     private const PAYMENT_METHOD_ID_PATTERN = '/^[A-Za-z0-9_-]{1,100}$/';
+
+    /** What a missing key on a create route that is not a payment should be derived from. */
+    private const RECORD_KEY_HINT = 'derive it from your own record of what you create (for example its id in your database), '
+        . 'so a retry sends the same key';
 
     /**
      * Every value getStatus() can return in `status`, in the API's own order.
@@ -211,6 +237,45 @@ class DominaiteClient
         'IDEMPOTENCY_KEY_REQUIRED',
     ];
 
+    /**
+     * HTTP 403: the API key does not hold the scope this route needs. A key holds either
+     * payments, or one or both of transactions:read and webhooks:manage, never both kinds.
+     * Not retryable: call the route with a key issued with that scope.
+     */
+    public const INSUFFICIENT_SCOPE = 'INSUFFICIENT_SCOPE';
+
+    /**
+     * HTTP 403 on createCheckoutSession() with verifyOnly: verify-only sessions are not
+     * switched on for your account. We switch it on for your account. Nothing was
+     * created. Arrives as an AuthenticationException.
+     */
+    public const VERIFY_ONLY_NOT_ENABLED = 'VERIFY_ONLY_NOT_ENABLED';
+
+    /** HTTP 429: a request limit. Arrives as a RateLimitException; read Retry-After. */
+    public const RATE_LIMIT_EXCEEDED = 'RATE_LIMIT_EXCEEDED';
+
+    /**
+     * HTTP 429 on chargePaymentMethod(): the card has the most charges allowed in 24
+     * hours, or the charge would pass your hourly ceiling in its currency. Nothing was
+     * charged. Arrives as a RateLimitException; retry with the same key after Retry-After.
+     */
+    public const CHARGE_VELOCITY_EXCEEDED = 'CHARGE_VELOCITY_EXCEEDED';
+
+    /**
+     * HTTP 429 on chargePaymentMethod(): the key collected too many declined charges in a
+     * short window, so its charge route is locked. Nothing was charged. Arrives as a
+     * RateLimitException; retry after Retry-After.
+     */
+    public const CHARGE_DECLINE_RATE_EXCEEDED = 'CHARGE_DECLINE_RATE_EXCEEDED';
+
+    /**
+     * The authorization codes the gateway publishes, in the contract's order. Each is an
+     * HTTP 403 and arrives as an AuthenticationException.
+     */
+    public const AUTHORIZATION_ERROR_CODES = [
+        self::INSUFFICIENT_SCOPE,
+    ];
+
     /** integration value for the hosted cashier widget, the default when you send none. */
     public const INTEGRATION_WIDGET = 'widget';
 
@@ -260,8 +325,8 @@ class DominaiteClient
 
     /**
      * Every value chargePaymentMethod() can return in `status`, in the API's own order.
-     * succeeded: the money moved. failed: it did not, and on a 402 declineClass says
-     * why. pending is not terminal: poll getStatus() with the charge's transactionId.
+     * succeeded: the money moved. failed: it did not, and declineClass says why when it
+     * is set. pending is not terminal: poll getStatus() with the charge's transactionId.
      * cancelled: an authorization voided before capture, no money moved. Treat an
      * unknown value as still open.
      */
@@ -277,7 +342,8 @@ class DominaiteClient
      * hard = do not retry this card; soft_funds = insufficient funds, retry later;
      * soft_sca_required = the issuer wants the customer present, send them through a
      * hosted session with saveCard; soft_other = transient, one retry later is
-     * reasonable.
+     * reasonable. A declined charge can have no class yet (null): read getStatus() a
+     * moment later. A value not in this list is a new class, not an error.
      */
     public const DECLINE_CLASS_VOCABULARY = [
         'hard',
@@ -542,6 +608,25 @@ class DominaiteClient
     }
 
     /**
+     * Reads the public integration contract: the SDKs, the signing recipes, the request
+     * fields, the statuses, the error codes, the scopes and the webhook event catalog.
+     *
+     * The API does not check a key on this route, so any key can read it, whatever its
+     * scopes. The SDK signs it like ping() all the same. The SDK itself never reads the
+     * contract at runtime: it is data for your tools, your tests and your docs.
+     *
+     * @return array<string,mixed> The contract as the API sent it.
+     *
+     * @throws ApiException       Unexpected API response.
+     * @throws RateLimitException HTTP 429 - back off (getRetryAfterSeconds()).
+     * @throws TransportException Network-level failure or a 5xx (safe to retry).
+     */
+    public function getIntegrationContract(): array
+    {
+        return $this->request('GET', self::INTEGRATION_CONTRACT_PATH, null, '');
+    }
+
+    /**
      * Creates a hosted checkout session for one payment.
      *
      * Required params: amount (int, MINOR units - cents), currency (ISO 4217),
@@ -557,7 +642,25 @@ class DominaiteClient
      * integration (INTEGRATION_WIDGET, the default, or INTEGRATION_FIELDS for card fields
      * in your own page; card fields are enabled per merchant on request and 'fields' on an
      * account without them is a 400; part of the idempotency identity, so a replay with a
-     * different integration is refused with IDEMPOTENCY_KEY_REUSED; omitted when null).
+     * different integration is refused with IDEMPOTENCY_KEY_REUSED; omitted when null),
+     * locationId (the id of the storefront the payment belongs to),
+     * agreementId (the agr_ handle of a pending agreement from createAgreement(): the
+     * session takes the agreement's first payment, saves the card and activates the
+     * agreement; amount and currency must be the agreement's own, and on a plan with a
+     * trial only the currency is held), consent{textVersion,acceptedAt,ip} (only with
+     * agreementId: the platform consent text version the customer accepted, when and
+     * from which IP; required unless the agreement already carries it), verifyOnly (bool,
+     * see below). Any other key is sent as it is, so a field the API adds later needs no
+     * SDK update.
+     *
+     * verifyOnly true saves the card without a payment. Leave amount out or send 0: the
+     * API places its own small verification hold and releases it once the card is saved.
+     * saveCard is implied, integration must be the widget, and agreementId is refused.
+     * Verify-only sessions are off until we switch them on for your account; before that
+     * the API answers 403 VERIFY_ONLY_NOT_ENABLED (an AuthenticationException).
+     * orderIdempotencyKey() needs a positive amount, so build this key yourself, for
+     * example 'verify-' . $customerId. The session comes back with verifyOnly true and
+     * amount set to the hold.
      *
      * The session always carries integration. clientSecret is set only for a fields
      * session (absent for a widget session): an opaque string of at most 128 characters,
@@ -572,9 +675,10 @@ class DominaiteClient
      * getStatus().
      *
      * @param array<string,mixed> $params
-     * @return array{transactionId:string,orderId:string,cashierKey:string,cashierToken:string,amount:int,currency:string,expiresAt:string,integration:string,clientSecret?:?string}
+     * @return array{transactionId:string,orderId:string,cashierKey:string,cashierToken:string,amount:int,currency:string,expiresAt:string,agreementId?:?string,integration:string,clientSecret?:?string,verifyOnly?:bool}
      *
-     * @throws AuthenticationException Wrong/revoked credentials or bad signature (fix config; do not retry).
+     * @throws AuthenticationException Wrong/revoked credentials or bad signature (fix config; do not retry),
+     *                                 or HTTP 403 VERIFY_ONLY_NOT_ENABLED.
      * @throws CheckoutRefusedException The gateway refused the session (inspect getErrorCode()).
      * @throws StorefrontException     The storefront cannot take payments (STOREFRONT_ERROR_CODES, HTTP 409 or 400).
      * @throws ApiException            Unexpected API response.
@@ -589,7 +693,18 @@ class DominaiteClient
         // with it collides with that earlier payment instead.
         $this->lastIdempotencyKey = null;
 
-        self::validateMoneyParams($params);
+        if (array_key_exists('verifyOnly', $params)) {
+            if ($params['verifyOnly'] === null) {
+                unset($params['verifyOnly']);
+            } elseif (!is_bool($params['verifyOnly'])) {
+                throw new \InvalidArgumentException('verifyOnly must be a bool');
+            }
+        }
+        if (($params['verifyOnly'] ?? false) === true) {
+            self::validateVerifyOnlyParams($params);
+        } else {
+            self::validateMoneyParams($params);
+        }
         if (array_key_exists('saveCard', $params) && !is_bool($params['saveCard'])) {
             throw new \InvalidArgumentException('saveCard must be a bool');
         }
@@ -631,8 +746,10 @@ class DominaiteClient
     }
 
     /**
-     * The idempotency key the last createCheckoutSession(), chargePaymentMethod() or
-     * createRefund() call sent. Always the one you passed: the SDK no longer generates keys.
+     * The idempotency key the last call that carries one sent: createCheckoutSession(),
+     * chargePaymentMethod(), createRefund(), createPlan(), createAgreement(),
+     * createWebhookEndpoint(), or updatePlan() with a key.
+     * Always the one you passed: the SDK no longer generates keys.
      *
      * Handy in a generic catch block that did not keep the params around. On a timeout
      * you cannot know whether the gateway created the session, and retrying with a NEW key
@@ -649,11 +766,15 @@ class DominaiteClient
      * recent attempt that went out", never an older order's.
      *
      * It is a single slot on a client you can reuse, so the next createCheckoutSession(),
-     * chargePaymentMethod() or createRefund() overwrites it. On a long-lived worker that means reading it
-     * in the catch block and storing it against your order, not going back for it later.
+     * chargePaymentMethod(), createRefund(), createPlan(), createAgreement(),
+     * createWebhookEndpoint(), or updatePlan() with a key overwrites it. On a long-lived
+     * worker that means reading it in the catch block and storing it against your order,
+     * not going back for it later.
      *
-     * ping(), getStatus(), getRefund() and revokePaymentMethod() sign an empty key by design
-     * and leave this untouched.
+     * The routes that read or delete (ping(), getIntegrationContract(), getStatus(),
+     * getRefund(), listRefunds(), listTransactions(), revokePaymentMethod(), the plan,
+     * agreement and webhook endpoint reads, deletePlan(), cancelAgreement() and
+     * deleteWebhookEndpoint()) sign an empty key by design and leave this untouched.
      */
     public function getLastIdempotencyKey(): ?string
     {
@@ -664,8 +785,12 @@ class DominaiteClient
      * Reads the payment status of one of your checkout sessions.
      *
      * Status values: pending, processing, succeeded, failed, refunded, partially_refunded,
-     * cancelled, disputed, requires_capture, abandoned. While a session is still payable the
-     * response carries expiresAt; amounts are integers in MINOR units.
+     * cancelled, disputed, requires_capture, abandoned. While a session is still payable,
+     * expiresAt says until when; amounts are integers in MINOR units.
+     *
+     * orderReference, refundedAmount, updatedAt and expiresAt are always in the array, and
+     * null when they have no value. The API leaves a null field out; the SDK reads it back
+     * as null.
      *
      * succeeded is the only value that means the payment is complete. Keep polling on
      * pending, processing and requires_capture - none of them is terminal.
@@ -710,8 +835,29 @@ class DominaiteClient
      * refunds, captures and disputes exactly like a card payment. Older gateways do not
      * send the keys, so read them with ?? null.
      *
+     * The API also sends these fields. It leaves some of them out when they have no value,
+     * so read each one with ?? as shown:
+     * - declineClass ($status['declineClass'] ?? null): why a failed payment was declined,
+     *   a value of DECLINE_CLASS_VOCABULARY. Null on every status other than failed.
+     *   declineClass can be null on a failed payment too, for example when nobody declined
+     *   the payment. A value not in the list is a new class, not an error.
+     * - isRecurring ($status['isRecurring'] ?? false): true for a merchant-initiated charge
+     *   on a stored card (a recurring charge), false for a checkout session.
+     * - verifyOnly ($status['verifyOnly'] ?? false): true for a session created with
+     *   verifyOnly. Its status stays the raw status: requires_capture, then cancelled once
+     *   the hold is released. A non-null storedPaymentMethod is what says the card is
+     *   verified.
+     * - agreement ($status['agreement'] ?? null): {id, status, nextChargeAt} of the
+     *   subscription agreement this payment is for; null on a one-off payment. After a
+     *   subscription session it says whether the subscription started: status turns active
+     *   when the payment is approved, and stays pending after a decline or an abandoned
+     *   session. nextChargeAt reads as null when the API leaves it out.
+     * - sequence ($status['sequence'] ?? 0): data.sequence of the latest charge.* event about
+     *   this payment, to order this read against those events. 0 on a checkout payment and
+     *   before the first charge.* event.
+     *
      * @param string $transactionId The transactionId returned by createCheckoutSession().
-     * @return array{transactionId:string,orderId:string,orderReference:?string,pspReference?:?string,status:string,amount:int,currency:string,refundedAmount:?int,paymentMethod?:?string,walletType?:?string,createdAt:string,updatedAt:?string,expiresAt:?string,storedPaymentMethod?:?array{id:string,brand:?string,last4:?string,expiryMonth:?int,expiryYear:?int,status:string,retiredReason:?string}}
+     * @return array{transactionId:string,orderId:string,orderReference:?string,pspReference?:?string,status:string,amount:int,currency:string,refundedAmount:?int,paymentMethod?:?string,walletType?:?string,declineClass?:?string,isRecurring?:bool,verifyOnly?:bool,createdAt:string,updatedAt:?string,expiresAt:?string,storedPaymentMethod?:?array{id:string,brand:?string,last4:?string,expiryMonth:?int,expiryYear:?int,status:string,retiredReason:?string},agreement?:?array{id:string,status:string,nextChargeAt:?string},sequence?:int}
      *
      * @throws AuthenticationException Wrong/revoked credentials or bad signature (fix config; do not retry).
      * @throws ApiException            Unknown transaction id (HTTP 404) or unexpected response.
@@ -724,11 +870,19 @@ class DominaiteClient
 
         $status = $this->request('GET', self::SESSIONS_PATH . '/' . $normalized, null, '');
 
-        // Passed through as sent, except the card on file: the gateway omits its null
-        // fields on the wire, and the caller gets one shape for it, not two. When the
-        // gateway sent no storedPaymentMethod at all there is no key here either.
+        // Passed through as sent, except where the gateway omits a null field on the wire.
+        // The four keys the shape always has read as null when absent: no order reference
+        // recorded, nothing refunded, never updated, or the payer's part is over.
+        foreach (['orderReference', 'refundedAmount', 'updatedAt', 'expiresAt'] as $nullable) {
+            $status[$nullable] = $status[$nullable] ?? null;
+        }
+        // The card on file and the agreement get one shape each, not two. When the gateway
+        // sent no storedPaymentMethod or agreement at all there is no key here either.
         if (is_array($status['storedPaymentMethod'] ?? null)) {
             $status['storedPaymentMethod'] = self::storedPaymentMethod($status['storedPaymentMethod']);
+        }
+        if (is_array($status['agreement'] ?? null)) {
+            $status['agreement']['nextChargeAt'] = $status['agreement']['nextChargeAt'] ?? null;
         }
 
         return $status;
@@ -768,19 +922,30 @@ class DominaiteClient
      *
      * Required params: amount (int, MINOR units), currency (ISO 4217), orderReference
      * (<= 100 chars), idempotencyKey (a missing key throws InvalidArgumentException before
-     * anything is sent). Optional: description.
+     * anything is sent). Optional: description, agreementId (the agr_ handle of the
+     * agreement the charge is made under: it must be yours, linked to this payment method
+     * and carry consent, and the amount must fit the agreement). Any other key is sent as
+     * it is, after these.
      *
      * The HTTP status is the contract on this route. 201 (200 on a replay) returns the
      * charge, status 'succeeded', 'pending' or 'cancelled'. 402 returns the charge too:
-     * a decline is not an exception, the charge has status 'failed' plus a declineClass
-     * telling you whether to give up on the card (hard), wait (soft_funds, soft_other)
-     * or bring the customer back for a hosted session (soft_sca_required). 'pending' is
-     * not terminal - poll getStatus() with the charge's transactionId. declineClass and
-     * declineCode are null unless the charge was declined; the gateway omits them on
-     * the wire and the SDK reads absent as null.
+     * a decline is not an exception, the charge has status 'failed'. declineClass tells
+     * you whether to give up on the card (hard), wait (soft_funds, soft_other) or bring
+     * the customer back for a hosted session (soft_sca_required). declineClass can be
+     * null, for example when nobody declined the payment; handle a null class on a 402
+     * like soft_other. 'pending' is not terminal - poll getStatus() with the charge's
+     * transactionId. declineClass and declineCode are always null unless the charge was
+     * declined; the gateway omits null fields on the wire and the SDK reads absent as
+     * null.
+     *
+     * agreementId is the agr_ handle the charge was made under, and null when the request
+     * named none. sequence is the charge's outcome counter as of this answer: data.sequence
+     * of its charge.succeeded or charge.failed event, 0 while pending. A replay answers the
+     * first response as it was, so for the current state read getStatus(). Older gateways
+     * do not send sequence, so read it with ?? 0.
      *
      * @param array<string,mixed> $params
-     * @return array{chargeId:string,status:string,declineClass:?string,declineCode:?string,transactionId:string}
+     * @return array{chargeId:string,status:string,declineClass:?string,declineCode:?string,transactionId:string,agreementId:?string,sequence?:int}
      *
      * @throws ChargeException         409, 422, 502 or 503 with a code (CHARGE_ERROR_CODES): branch on
      *                                 getErrorCode(). CHARGE_OUTCOME_UNKNOWN carries the charge row
@@ -799,21 +964,28 @@ class DominaiteClient
 
         $id = self::normalizePaymentMethodId($paymentMethodId);
         self::validateMoneyParams($params);
-        if (array_key_exists('description', $params) && !is_string($params['description'])) {
-            throw new \InvalidArgumentException('description must be a string');
+        foreach (['description', 'agreementId'] as $optional) {
+            if (array_key_exists($optional, $params) && !is_string($params[$optional])) {
+                throw new \InvalidArgumentException("{$optional} must be a string");
+            }
         }
         $idempotencyKey = self::normalizeIdempotencyKey($params['idempotencyKey'] ?? null);
+        unset($params['idempotencyKey']);
 
-        // Built field by field, not passed through: the body is what gets signed, and the
-        // contract for this route is exactly these fields in this order.
+        // The contract's fields first, in the contract's order, then any other key as the
+        // caller sent it, so a field the API adds later needs no SDK update. The body is
+        // what gets signed, so this code fixes the order of the known fields.
         $body = [
             'amount' => $params['amount'],
             'currency' => $params['currency'],
             'orderReference' => $params['orderReference'],
         ];
-        if (array_key_exists('description', $params)) {
-            $body['description'] = $params['description'];
+        foreach (['description', 'agreementId'] as $optional) {
+            if (array_key_exists($optional, $params)) {
+                $body[$optional] = $params[$optional];
+            }
         }
+        $body += $params;
 
         $this->lastIdempotencyKey = $idempotencyKey;
 
@@ -826,7 +998,7 @@ class DominaiteClient
 
         // 201 (200 on a durable replay): the charge was placed, whatever its status. 402:
         // the provider declined; the envelope says success=false but the charge is right
-        // there, status failed with its decline class, so it is a result, not an exception.
+        // there, status failed, so it is a result, not an exception.
         if ($charge !== null && (($reply['envelope']['success'] ?? null) === true || $reply['status'] === 402)) {
             return $charge;
         }
@@ -895,7 +1067,8 @@ class DominaiteClient
      * A missing key throws InvalidArgumentException before anything is sent. Optional:
      * amount (int, MINOR units of the payment's currency, see toMinorUnits()); omit it (or
      * pass null) to refund everything still refundable, and no amount key is sent. reason
-     * (string, at most 500 characters, stored with the refund).
+     * (string, at most 500 characters, stored with the refund). Any other key is sent as
+     * it is, after these.
      *
      * Returns the refund: {refundId, transactionId, status, amount, currency, failureCode,
      * failureMessage, completedAt}, the same shape getRefund() reads. status is pending or
@@ -927,8 +1100,9 @@ class DominaiteClient
         }
         $idempotencyKey = self::normalizeIdempotencyKey($params['idempotencyKey'] ?? null);
 
-        // Built field by field: the body is what gets signed. A full refund sends no
-        // amount key at all, which is what the gateway reads as "everything left".
+        // The known fields first, in the contract's order, then any other key as the caller
+        // sent it, so a field the API adds later needs no SDK update. A full refund sends
+        // no amount key at all, which is what the gateway reads as "everything left".
         $body = [];
         if (isset($params['amount'])) {
             $body['amount'] = $params['amount'];
@@ -936,6 +1110,8 @@ class DominaiteClient
         if (isset($params['reason'])) {
             $body['reason'] = $params['reason'];
         }
+        unset($params['amount'], $params['reason'], $params['idempotencyKey']);
+        $body += $params;
 
         $this->lastIdempotencyKey = $idempotencyKey;
 
@@ -982,8 +1158,55 @@ class DominaiteClient
     }
 
     /**
-     * The reading shared by both refund routes: the refund on a 2xx, a RefundException for
-     * a code in REFUND_ERROR_CODES, the generic exceptions for everything else.
+     * Lists the refunds on one payment: {transactionId, currency, refundedAmount,
+     * refundableAmount, refunds}. Every amount is in minor units of currency.
+     *
+     * refunds holds the refunds created through this API, each in getRefund()'s shape, and
+     * is empty when there are none. The order is pending first, then processing, then
+     * succeeded and failed by completedAt, newest first within each group. A refund made
+     * in the dashboard or at the provider is not in the list, but refundedAmount counts it.
+     * refundableAmount is what a new refund could take right now: what is not refunded yet,
+     * minus refunds still in progress. It is 0 when the payment cannot be refunded.
+     *
+     * A refund shows up here at the same moment getRefund() stops answering
+     * REFUND_NOT_FOUND.
+     *
+     * @param string $transactionId The id createCheckoutSession() or chargePaymentMethod() returned.
+     * @return array{transactionId:string,currency:string,refundedAmount:int,refundableAmount:int,refunds:list<array{refundId:string,transactionId:string,status:string,amount:?int,currency:string,failureCode:?string,failureMessage:?string,completedAt:?string}>}
+     *
+     * @throws RefundException         PAYMENT_NOT_FOUND (HTTP 404): branch on getErrorCode().
+     * @throws AuthenticationException Wrong/revoked credentials or bad signature (fix config; do not retry).
+     * @throws ApiException            Unexpected response.
+     * @throws RateLimitException     HTTP 429 - back off (getRetryAfterSeconds()).
+     * @throws TransportException      Network-level failure or a 5xx (safe to retry). A 503 means the
+     *                                 refunds changed while the API read them: retry after a second.
+     */
+    public function listRefunds(string $transactionId): array
+    {
+        $id = self::normalizeTransactionId($transactionId);
+
+        // GET signs an EMPTY idempotency key and an EMPTY body, like getRefund().
+        $reply = $this->send('GET', self::PAYMENTS_PATH . '/' . $id . '/refunds', null, '');
+
+        $data = $reply['envelope']['data'] ?? null;
+        if ($reply['status'] < 400 && is_array($data) && is_array($data['refunds'] ?? null)) {
+            $data['transactionId'] = (string) ($data['transactionId'] ?? '');
+            $data['currency'] = (string) ($data['currency'] ?? '');
+            $data['refundedAmount'] = (int) ($data['refundedAmount'] ?? 0);
+            $data['refundableAmount'] = (int) ($data['refundableAmount'] ?? 0);
+            $data['refunds'] = array_map(static function (array $refund): array {
+                return self::refund($refund);
+            }, array_values($data['refunds']));
+
+            return $data;
+        }
+
+        throw self::refundRejection($reply, 'The API answered without a refund list');
+    }
+
+    /**
+     * The reading shared by both single-refund routes: the refund on a 2xx, the refund
+     * failure otherwise.
      *
      * @param array{status:int,envelope:array<string,mixed>,payload:array<string,mixed>,error:array<string,mixed>} $reply
      * @return array<string,mixed>
@@ -995,10 +1218,21 @@ class DominaiteClient
             return self::refund($data);
         }
 
+        throw self::refundRejection($reply, 'The API answered without a refund body');
+    }
+
+    /**
+     * A refund route's failure: a RefundException for a code in REFUND_ERROR_CODES, the
+     * generic exceptions for everything else, and $unexpected for a 2xx without the body.
+     *
+     * @param array{status:int,envelope:array<string,mixed>,payload:array<string,mixed>,error:array<string,mixed>} $reply
+     */
+    private static function refundRejection(array $reply, string $unexpected): \RuntimeException
+    {
         $errorCode = $reply['error']['code'] ?? null;
         if ($reply['status'] >= 400 && $reply['status'] < 500
             && is_string($errorCode) && in_array($errorCode, self::REFUND_ERROR_CODES, true)) {
-            throw new RefundException(
+            return new RefundException(
                 $reply['status'],
                 (string) ($reply['error']['message'] ?? 'The refund was refused.'),
                 $errorCode,
@@ -1006,9 +1240,470 @@ class DominaiteClient
             );
         }
         if ($reply['status'] >= 400) {
+            return self::rejection($reply);
+        }
+
+        return new ApiException($reply['status'], $unexpected, 'UNEXPECTED_RESPONSE');
+    }
+
+    /**
+     * Creates a subscription plan: the price and the billing interval that agreements are
+     * made from.
+     *
+     * Required params: name (1-100 characters), amount (int, MINOR units, charged every
+     * period), currency (ISO 4217), intervalUnit (day, week, month or year) and
+     * idempotencyKey. Optional: intervalCount (units per period, default 1; the period is at
+     * most one year), periodCount (agreements complete after this many periods; leave it
+     * out to bill until cancelled), trialDays (0-365) and cancelUrl (your https page where
+     * the customer cancels; the platform prints it on every receipt it emails). Any other
+     * key is sent as it is, so a field the API adds later needs no SDK update. The API
+     * checks the values; the SDK does not.
+     *
+     * amount, currency and the interval never change. For a new price, create a new plan
+     * and archive the old one with deletePlan().
+     *
+     * The same idempotencyKey with the same body answers the first plan again, so a create
+     * whose answer you lost is safe to repeat. The same key with a different body is an
+     * ApiException with IDEMPOTENCY_KEY_REUSED. Keys are not case-sensitive on the API.
+     *
+     * @param array<string,mixed> $params
+     * @return array{id:string,name:string,amount:int,currency:string,intervalUnit:string,intervalCount:int,periodCount:?int,trialDays:int,status:string,cancelUrl:?string,createdAt:string,archivedAt:?string}
+     *
+     * @throws AuthenticationException Bad credentials or signature (401), or a key without the payments scope (403).
+     * @throws ApiException            Validation (HTTP 400) or IDEMPOTENCY_KEY_REUSED (HTTP 422): branch on getErrorCode().
+     * @throws RateLimitException     HTTP 429 - back off (getRetryAfterSeconds()), retry with the same key.
+     * @throws TransportException      Network-level failure or a 5xx: retry WITH the same idempotencyKey.
+     */
+    public function createPlan(array $params): array
+    {
+        $this->lastIdempotencyKey = null;
+        $idempotencyKey = self::normalizeIdempotencyKey($params['idempotencyKey'] ?? null, self::RECORD_KEY_HINT);
+        unset($params['idempotencyKey']);
+        $this->lastIdempotencyKey = $idempotencyKey;
+
+        return self::plan(self::objectReply($this->send('POST', self::PLANS_PATH, $params, $idempotencyKey), 'plan'));
+    }
+
+    /**
+     * Lists your plans: at most 200, active first, newest first within a status. There
+     * are no pages on this route; read one plan with getPlan() when you have more.
+     *
+     * @return list<array{id:string,name:string,amount:int,currency:string,intervalUnit:string,intervalCount:int,periodCount:?int,trialDays:int,status:string,cancelUrl:?string,createdAt:string,archivedAt:?string}>
+     *
+     * @throws AuthenticationException Bad credentials or signature (401), or a key without the payments scope (403).
+     * @throws ApiException            Unexpected response.
+     * @throws RateLimitException     HTTP 429 - back off (getRetryAfterSeconds()).
+     * @throws TransportException      Network-level failure or a 5xx (safe to retry).
+     */
+    public function listPlans(): array
+    {
+        return array_map(static function (array $plan): array {
+            return self::plan($plan);
+        }, self::listReply($this->send('GET', self::PLANS_PATH, null, ''), 'plan'));
+    }
+
+    /**
+     * Reads one plan. status is active or archived; only an active plan takes new
+     * agreements.
+     *
+     * @param string $planId The plan_ id createPlan() returned, exactly as returned: it is case-sensitive.
+     * @return array{id:string,name:string,amount:int,currency:string,intervalUnit:string,intervalCount:int,periodCount:?int,trialDays:int,status:string,cancelUrl:?string,createdAt:string,archivedAt:?string}
+     *
+     * @throws AuthenticationException Bad credentials or signature (401), or a key without the payments scope (403).
+     * @throws ApiException            PLAN_NOT_FOUND (HTTP 404), or an unexpected response.
+     * @throws RateLimitException     HTTP 429 - back off (getRetryAfterSeconds()).
+     * @throws TransportException      Network-level failure or a 5xx (safe to retry).
+     */
+    public function getPlan(string $planId): array
+    {
+        $id = self::normalizeHandle($planId, 'planId', 'createPlan()');
+
+        return self::plan(self::objectReply($this->send('GET', self::PLANS_PATH . '/' . $id, null, ''), 'plan'));
+    }
+
+    /**
+     * Changes a plan's name, trialDays or cancelUrl. Send at least one of them. A field you
+     * leave out stays as it is; an empty cancelUrl removes it. A trialDays change reaches
+     * only agreements created afterwards. Any other key is sent as it is.
+     *
+     * The API does not require an idempotency key here: the same change sent twice gives
+     * the same plan. An idempotencyKey you pass anyway is signed and sent.
+     *
+     * @param string              $planId The plan_ id createPlan() returned.
+     * @param array<string,mixed> $params
+     * @return array{id:string,name:string,amount:int,currency:string,intervalUnit:string,intervalCount:int,periodCount:?int,trialDays:int,status:string,cancelUrl:?string,createdAt:string,archivedAt:?string}
+     *
+     * @throws AuthenticationException Bad credentials or signature (401), or a key without the payments scope (403).
+     * @throws ApiException            Validation (HTTP 400) or PLAN_NOT_FOUND (HTTP 404): branch on getErrorCode().
+     * @throws RateLimitException     HTTP 429 - back off (getRetryAfterSeconds()).
+     * @throws TransportException      Network-level failure or a 5xx (safe to retry).
+     */
+    public function updatePlan(string $planId, array $params): array
+    {
+        $idempotencyKey = '';
+        if (array_key_exists('idempotencyKey', $params)) {
+            $this->lastIdempotencyKey = null;
+            $idempotencyKey = self::normalizeIdempotencyKey($params['idempotencyKey'], self::RECORD_KEY_HINT);
+            unset($params['idempotencyKey']);
+        }
+        $id = self::normalizeHandle($planId, 'planId', 'createPlan()');
+        if ($idempotencyKey !== '') {
+            $this->lastIdempotencyKey = $idempotencyKey;
+        }
+
+        return self::plan(self::objectReply($this->send('PATCH', self::PLANS_PATH . '/' . $id, $params, $idempotencyKey), 'plan'));
+    }
+
+    /**
+     * Archives a plan: it takes no new agreements, and the agreements made from it go on
+     * as they are. A plan that is archived already answers the same, so a retry is safe.
+     *
+     * @param string $planId The plan_ id createPlan() returned.
+     *
+     * @throws AuthenticationException Bad credentials or signature (401), or a key without the payments scope (403).
+     * @throws ApiException            PLAN_NOT_FOUND (HTTP 404), or a malformed id (HTTP 400).
+     * @throws RateLimitException     HTTP 429 - back off (getRetryAfterSeconds()).
+     * @throws TransportException      Network-level failure or a 5xx (safe to retry).
+     */
+    public function deletePlan(string $planId): void
+    {
+        $id = self::normalizeHandle($planId, 'planId', 'createPlan()');
+
+        // DELETE signs an EMPTY idempotency key and an EMPTY body, like GET.
+        self::emptyReply($this->send('DELETE', self::PLANS_PATH . '/' . $id, null, ''));
+    }
+
+    /**
+     * Creates a subscription agreement: one customer on one plan. The agreement starts
+     * pending and nothing is charged. The customer activates it in a subscription session:
+     * createCheckoutSession() with its agreementId.
+     *
+     * Required params: planId (the plan_ id of an active plan), customerReference (your id
+     * for the customer, 1-100 characters) and idempotencyKey. Optional:
+     * storedPaymentMethodId (a pm_ card this customer saved in the plan's currency, to bill
+     * instead of saving a new card in the session), consent{textVersion, acceptedAt, ip}
+     * (all three together; required with storedPaymentMethodId or maxAmountPerPeriod) and
+     * maxAmountPerPeriod (int, MINOR units, for a variable-amount subscription; at least
+     * the plan's amount). Any other key is sent as it is. The API checks the values; the
+     * SDK does not.
+     *
+     * The same idempotencyKey with the same body answers the first agreement again; the
+     * same key with a different body is IDEMPOTENCY_KEY_REUSED.
+     *
+     * A refusal is an ApiException; branch on getErrorCode(). 404: PLAN_NOT_FOUND,
+     * PAYMENT_METHOD_NOT_FOUND. 409: PLAN_NOT_ACTIVE, PAYMENT_METHOD_NOT_ACTIVE. 422:
+     * PAYMENT_METHOD_CURRENCY_MISMATCH, MAX_AMOUNT_BELOW_PLAN_AMOUNT,
+     * AGREEMENT_CONSENT_REQUIRED, PAYMENT_METHOD_CURRENCY_UNKNOWN, IDEMPOTENCY_KEY_REUSED.
+     * Nothing was created, and the same request gets the same answer. getResult() has the
+     * envelope; validationErrors[0].params carries the amounts and currencies in question.
+     *
+     * @param array<string,mixed> $params
+     * @return array{id:string,planId:string,customerReference:string,storedPaymentMethodId:?string,status:string,amount:int,maxAmountPerPeriod:?int,currency:string,intervalUnit:string,intervalCount:int,periodCount:?int,trialDays:int,nextChargeAt:?string,pastDueReason:?string,pastDueAt:?string,consent:?array{textVersion:string,acceptedAt:?string,ip:string,receivedAt:?string,receivedFromIp:?string},version:int,sequence:int,createdAt:string,activatedAt:?string,cancelledAt:?string}
+     *
+     * @throws AuthenticationException Bad credentials or signature (401), or a key without the payments scope (403).
+     * @throws ApiException            A refusal above, or validation (HTTP 400): branch on getErrorCode().
+     * @throws RateLimitException     HTTP 429 - back off (getRetryAfterSeconds()), retry with the same key.
+     * @throws TransportException      Network-level failure or a 5xx: retry WITH the same idempotencyKey.
+     */
+    public function createAgreement(array $params): array
+    {
+        $this->lastIdempotencyKey = null;
+        $idempotencyKey = self::normalizeIdempotencyKey($params['idempotencyKey'] ?? null, self::RECORD_KEY_HINT);
+        unset($params['idempotencyKey']);
+        $this->lastIdempotencyKey = $idempotencyKey;
+
+        return self::agreement(
+            self::objectReply($this->send('POST', self::AGREEMENTS_PATH, $params, $idempotencyKey), 'agreement')
+        );
+    }
+
+    /**
+     * Reads one agreement.
+     *
+     * status is pending, active, past_due, cancelled, completed or failed. A value not in
+     * this list is a new status, not an error. pastDueReason says why an agreement is
+     * past_due: card_expired or card_revoked (a new card fixes it), hard_decline,
+     * dunning_exhausted, sca_required or unprocessable. It is null in every other status.
+     * nextChargeAt is null while pending and once the agreement has ended. sequence counts
+     * the agreement's changes: compare it with data.sequence on the agreement.* webhooks.
+     * amount, currency and the interval are copied from the plan when the agreement is
+     * created; version goes up when the price changes for a future period.
+     *
+     * @param string $agreementId The agr_ id createAgreement() returned, exactly as returned: it is case-sensitive.
+     * @return array{id:string,planId:string,customerReference:string,storedPaymentMethodId:?string,status:string,amount:int,maxAmountPerPeriod:?int,currency:string,intervalUnit:string,intervalCount:int,periodCount:?int,trialDays:int,nextChargeAt:?string,pastDueReason:?string,pastDueAt:?string,consent:?array{textVersion:string,acceptedAt:?string,ip:string,receivedAt:?string,receivedFromIp:?string},version:int,sequence:int,createdAt:string,activatedAt:?string,cancelledAt:?string}
+     *
+     * @throws AuthenticationException Bad credentials or signature (401), or a key without the payments scope (403).
+     * @throws ApiException            AGREEMENT_NOT_FOUND (HTTP 404), or an unexpected response.
+     * @throws RateLimitException     HTTP 429 - back off (getRetryAfterSeconds()).
+     * @throws TransportException      Network-level failure or a 5xx (safe to retry).
+     */
+    public function getAgreement(string $agreementId): array
+    {
+        $id = self::normalizeHandle($agreementId, 'agreementId', 'createAgreement()');
+
+        return self::agreement(
+            self::objectReply($this->send('GET', self::AGREEMENTS_PATH . '/' . $id, null, ''), 'agreement')
+        );
+    }
+
+    /**
+     * Cancels an agreement: no further charge is scheduled. A charge already placed is not
+     * reversed here. Allowed from pending, active and past_due. Cancelling a cancelled
+     * agreement answers the same, so a retry is safe.
+     *
+     * @param string $agreementId The agr_ id createAgreement() returned.
+     *
+     * @throws AuthenticationException Bad credentials or signature (401), or a key without the payments scope (403).
+     * @throws ApiException            AGREEMENT_NOT_FOUND (HTTP 404) or AGREEMENT_ENDED (HTTP 409: it completed
+     *                                 or failed, so there is nothing left to cancel).
+     * @throws RateLimitException     HTTP 429 - back off (getRetryAfterSeconds()).
+     * @throws TransportException      Network-level failure or a 5xx (safe to retry).
+     */
+    public function cancelAgreement(string $agreementId): void
+    {
+        $id = self::normalizeHandle($agreementId, 'agreementId', 'createAgreement()');
+
+        // DELETE signs an EMPTY idempotency key and an EMPTY body, like GET.
+        self::emptyReply($this->send('DELETE', self::AGREEMENTS_PATH . '/' . $id, null, ''));
+    }
+
+    /**
+     * The agreement as one shape: the API omits a null field, so absent reads as null, in
+     * consent too. Everything the API sends is carried through as sent.
+     *
+     * @param array<string,mixed> $data
+     * @return array<string,mixed>
+     */
+    private static function agreement(array $data): array
+    {
+        $nullable = ['storedPaymentMethodId', 'maxAmountPerPeriod', 'periodCount', 'nextChargeAt', 'pastDueReason',
+            'pastDueAt', 'consent', 'activatedAt', 'cancelledAt'];
+        foreach ($nullable as $field) {
+            $data[$field] = $data[$field] ?? null;
+        }
+        if (is_array($data['consent'])) {
+            foreach (['acceptedAt', 'receivedAt', 'receivedFromIp'] as $field) {
+                $data['consent'][$field] = $data['consent'][$field] ?? null;
+            }
+        }
+
+        return $data;
+    }
+
+    /**
+     * Registers a webhook endpoint: the URL that receives the events you name.
+     *
+     * Needs a key with the webhooks:manage scope. A key with the payments scope never holds
+     * it, so use a separate reporting key. Any other key gets an AuthenticationException
+     * (403 INSUFFICIENT_SCOPE).
+     *
+     * Required params: url (https on a public host, at most 500 characters), events (the
+     * event types to deliver, 1-50 of them) and idempotencyKey. Any other key is sent as it
+     * is. The SDK sends events as given and never checks them: the API refuses a type it
+     * does not know (VALIDATION_ERROR), and a type the API adds later needs no SDK update.
+     *
+     * secret (whsec_...) is in the FIRST 201 only. Store it at once: a replay of the same
+     * key, the list and every other answer leave it out, and it reads as null here. Verify
+     * deliveries with verifyWebhook() and that secret. Lost it? Delete the endpoint and
+     * register it again.
+     *
+     * A create with no answer (a timeout or a 503) may still have registered the endpoint.
+     * Retry with the SAME key: the retry replaces that endpoint and answers a fresh 201 with
+     * a new id and secret. A retry with a new key cannot do this.
+     *
+     * A refusal is an ApiException; branch on getErrorCode(). WEBHOOK_URL_REJECTED (400:
+     * not https, does not resolve, or a private host), WEBHOOK_LIMIT_REACHED (409: you have
+     * the most active endpoints allowed; delete one first), WEBHOOK_ALREADY_REGISTERED (409:
+     * this key registered an endpoint more than a day ago that still exists;
+     * getResult()['error']['params']['webhookId'] is its id; use a fresh key for a new
+     * endpoint), DUPLICATE_REQUEST (409: retry with the SAME key after a second) and
+     * IDEMPOTENCY_KEY_REUSED (422: this key was first used for another url or events).
+     *
+     * @param array<string,mixed> $params
+     * @return array{id:string,url:string,events:list<string>,status:string,createdAt:string,secret:?string}
+     *
+     * @throws AuthenticationException Bad credentials or signature (401), or a key without webhooks:manage (403).
+     * @throws ApiException            A refusal above, or validation (HTTP 400): branch on getErrorCode().
+     * @throws RateLimitException     HTTP 429 - back off (getRetryAfterSeconds()), retry with the same key.
+     * @throws TransportException      Network-level failure or a 5xx: retry WITH the same idempotencyKey after
+     *                                 about five seconds, for up to about five minutes.
+     */
+    public function createWebhookEndpoint(array $params): array
+    {
+        $this->lastIdempotencyKey = null;
+        $idempotencyKey = self::normalizeIdempotencyKey($params['idempotencyKey'] ?? null, self::RECORD_KEY_HINT);
+        unset($params['idempotencyKey']);
+        $this->lastIdempotencyKey = $idempotencyKey;
+
+        $endpoint = self::objectReply($this->send('POST', self::WEBHOOKS_PATH, $params, $idempotencyKey), 'webhook endpoint');
+        $endpoint['secret'] = $endpoint['secret'] ?? null;
+
+        return $endpoint;
+    }
+
+    /**
+     * Lists your webhook endpoints, newest first: every active one and your newest 1000
+     * inactive ones. There are no pages, and never a secret. status is active or inactive
+     * (paused in the dashboard or after repeated failed deliveries); a value not in this
+     * list is a new status, not an error. Needs the webhooks:manage scope.
+     *
+     * @return list<array{id:string,url:string,events:list<string>,status:string,createdAt:string}>
+     *
+     * @throws AuthenticationException Bad credentials or signature (401), or a key without webhooks:manage (403).
+     * @throws ApiException            Unexpected response.
+     * @throws RateLimitException     HTTP 429 - back off (getRetryAfterSeconds()).
+     * @throws TransportException      Network-level failure or a 5xx (safe to retry).
+     */
+    public function listWebhookEndpoints(): array
+    {
+        return self::listReply($this->send('GET', self::WEBHOOKS_PATH, null, ''), 'webhook endpoint');
+    }
+
+    /**
+     * Removes a webhook endpoint. Deliveries to it stop. Needs the webhooks:manage scope.
+     *
+     * An id that is unknown, of another account or deleted already is an ApiException with
+     * WEBHOOK_NOT_FOUND (404). A retry after a lost 204 therefore answers 404: treat that
+     * as done.
+     *
+     * @param string $webhookId The id createWebhookEndpoint() or listWebhookEndpoints() returned (a UUID).
+     *
+     * @throws AuthenticationException Bad credentials or signature (401), or a key without webhooks:manage (403).
+     * @throws ApiException            WEBHOOK_NOT_FOUND (HTTP 404).
+     * @throws RateLimitException     HTTP 429 - back off (getRetryAfterSeconds()).
+     * @throws TransportException      Network-level failure or a 5xx (safe to retry).
+     */
+    public function deleteWebhookEndpoint(string $webhookId): void
+    {
+        $id = self::normalizeUuid($webhookId, 'webhookId must be the UUID createWebhookEndpoint() returned');
+
+        // DELETE signs an EMPTY idempotency key and an EMPTY body, like GET.
+        self::emptyReply($this->send('DELETE', self::WEBHOOKS_PATH . '/' . $id, null, ''));
+    }
+
+    /**
+     * Lists your card-not-present payments in a time window, one page at a time:
+     * {items, nextCursor}.
+     *
+     * Needs a key with the transactions:read scope. A key with the payments scope never
+     * holds it, so use a separate reporting key. Any other key gets an
+     * AuthenticationException (403 INSUFFICIENT_SCOPE).
+     *
+     * Required params: from (inclusive) and to (exclusive), ISO 8601 UTC, at most 31 days
+     * apart. Use the Z form, for example gmdate('Y-m-d\TH:i:s\Z', $unixTime). The window is
+     * on createdAt. Optional: status (only payments now in this status, a value of
+     * STATUS_VOCABULARY), limit (1-100, default 50) and cursor (the nextCursor of the
+     * previous page, unchanged). A null value is left out. Any other key is sent as it is.
+     * Every value must be a string or an int: the SDK sends them in the query string, which
+     * is never part of the signature. The API checks the values; the SDK does not.
+     *
+     * Rows come oldest first. To read the whole window, send nextCursor back as cursor with
+     * the same from, to and status until nextCursor is null. Paging never repeats or skips
+     * a row. A refund is not a row of its own: it shows on its payment as refundedAmount
+     * and status. type is payment, charge or verification (a verifyOnly session saved a
+     * card; leave it out of revenue). A type or status not in these lists is a new value,
+     * not an error. The API omits orderReference, completedAt, storedPaymentMethodId and
+     * refundedAmount when it has no value; they read as null here.
+     *
+     * @param array<string,string|int|null> $params
+     * @return array{items:list<array{transactionId:string,orderReference:?string,type:string,status:string,amount:int,currency:string,createdAt:string,completedAt:?string,storedPaymentMethodId:?string,refundedAmount:?int}>,nextCursor:?string}
+     *
+     * @throws AuthenticationException Bad credentials or signature (401), or a key without transactions:read (403).
+     * @throws ApiException            Validation (HTTP 400): a missing or malformed from, to, status, limit or cursor.
+     * @throws RateLimitException     HTTP 429 - back off (getRetryAfterSeconds()).
+     * @throws TransportException      Network-level failure or a 5xx (safe to retry).
+     */
+    public function listTransactions(array $params): array
+    {
+        foreach ($params as $name => $value) {
+            if ($value === null) {
+                unset($params[$name]);
+            } elseif (!is_string($value) && !is_int($value)) {
+                throw new \InvalidArgumentException("{$name} must be a string or an int: it is sent in the query string");
+            }
+        }
+        // RFC 3986 encoding: a + in a time offset goes out as %2B, never as a space.
+        $query = http_build_query($params, '', '&', PHP_QUERY_RFC3986);
+
+        // GET signs an EMPTY idempotency key and an EMPTY body; send() leaves the query out.
+        $reply = $this->send('GET', self::TRANSACTIONS_PATH . ($query === '' ? '' : '?' . $query), null, '');
+        $page = self::settle($reply);
+        if (!is_array($page['items'] ?? null)) {
+            throw new ApiException($reply['status'], 'The API answered without a transaction page', 'UNEXPECTED_RESPONSE');
+        }
+        $page['items'] = array_map(static function (array $item): array {
+            foreach (['orderReference', 'completedAt', 'storedPaymentMethodId', 'refundedAmount'] as $nullable) {
+                $item[$nullable] = $item[$nullable] ?? null;
+            }
+
+            return $item;
+        }, array_values($page['items']));
+        $page['nextCursor'] = $page['nextCursor'] ?? null;
+
+        return $page;
+    }
+
+    /**
+     * The plan as one shape: the API omits periodCount, cancelUrl and archivedAt when they
+     * are null, so absent reads as null. Everything the API sends is carried through as sent.
+     *
+     * @param array<string,mixed> $data
+     * @return array<string,mixed>
+     */
+    private static function plan(array $data): array
+    {
+        foreach (['periodCount', 'cancelUrl', 'archivedAt'] as $nullable) {
+            $data[$nullable] = $data[$nullable] ?? null;
+        }
+
+        return $data;
+    }
+
+    /**
+     * A reply that must carry one object with an id: the object on a 2xx, the generic
+     * failure otherwise.
+     *
+     * @param array{status:int,envelope:array<string,mixed>,payload:array<string,mixed>,error:array<string,mixed>} $reply
+     * @return array<string,mixed>
+     */
+    private static function objectReply(array $reply, string $what): array
+    {
+        $data = self::settle($reply);
+        if (!is_string($data['id'] ?? null)) {
+            throw new ApiException($reply['status'], "The API answered without the {$what}", 'UNEXPECTED_RESPONSE');
+        }
+
+        return $data;
+    }
+
+    /**
+     * A reply that must carry a JSON array of objects: the array on a 2xx, the generic
+     * failure otherwise.
+     *
+     * @param array{status:int,envelope:array<string,mixed>,payload:array<string,mixed>,error:array<string,mixed>} $reply
+     * @return list<array<string,mixed>>
+     */
+    private static function listReply(array $reply, string $what): array
+    {
+        self::settle($reply);
+        $data = $reply['envelope']['data'] ?? null;
+        if (!is_array($data) || $data !== array_values($data) || count(array_filter($data, 'is_array')) !== count($data)) {
+            throw new ApiException($reply['status'], "The API answered without the {$what} list", 'UNEXPECTED_RESPONSE');
+        }
+
+        return $data;
+    }
+
+    /**
+     * A reply that carries no body on success (204): nothing, or the generic failure.
+     *
+     * @param array{status:int,envelope:array<string,mixed>,payload:array<string,mixed>,error:array<string,mixed>} $reply
+     */
+    private static function emptyReply(array $reply): void
+    {
+        if ($reply['status'] >= 400) {
             throw self::rejection($reply);
         }
-        throw new ApiException($reply['status'], 'The API answered without a refund body', 'UNEXPECTED_RESPONSE');
     }
 
     /**
@@ -1025,6 +1720,28 @@ class DominaiteClient
         }
         if (!is_int($params['amount']) || $params['amount'] <= 0) {
             throw new \InvalidArgumentException('amount must be a positive integer in MINOR units (e.g. 2500 for 25.00 EUR)');
+        }
+        if (!is_string($params['orderReference']) || $params['orderReference'] === ''
+            || self::codePoints($params['orderReference']) > 100) {
+            throw new \InvalidArgumentException('orderReference must be a non-empty string of at most 100 characters');
+        }
+    }
+
+    /**
+     * The checks for a verify-only session. Currency and orderReference are required as for
+     * a payment. The amount is 0 or left out, because the API sets the verification hold.
+     *
+     * @param array<string,mixed> $params
+     */
+    private static function validateVerifyOnlyParams(array $params): void
+    {
+        foreach (['currency', 'orderReference'] as $required) {
+            if (!isset($params[$required])) {
+                throw new \InvalidArgumentException("Missing required parameter: {$required}");
+            }
+        }
+        if (array_key_exists('amount', $params) && $params['amount'] !== 0) {
+            throw new \InvalidArgumentException('amount must be 0 or left out with verifyOnly: the API sets the verification hold');
         }
         if (!is_string($params['orderReference']) || $params['orderReference'] === ''
             || self::codePoints($params['orderReference']) > 100) {
@@ -1152,12 +1869,12 @@ class DominaiteClient
      *
      * @param mixed $idempotencyKey
      */
-    private static function normalizeIdempotencyKey($idempotencyKey): string
-    {
+    private static function normalizeIdempotencyKey(
+        $idempotencyKey,
+        string $derive = 'derive it from your order with DominaiteClient::orderIdempotencyKey()'
+    ): string {
         if ($idempotencyKey === null) {
-            throw new \InvalidArgumentException(
-                'idempotencyKey is required; derive it from your order with DominaiteClient::orderIdempotencyKey()'
-            );
+            throw new \InvalidArgumentException('idempotencyKey is required; ' . $derive);
         }
         if (!is_string($idempotencyKey) || $idempotencyKey === '' || self::codePoints($idempotencyKey) > 100) {
             throw new \InvalidArgumentException('idempotencyKey must be a non-empty string of at most 100 characters');
@@ -1189,9 +1906,18 @@ class DominaiteClient
     /** A transaction id goes into the signed path in lowercase hyphenated form. */
     private static function normalizeTransactionId(string $transactionId): string
     {
-        $normalized = strtolower(trim($transactionId));
+        return self::normalizeUuid($transactionId, 'transactionId must be the UUID returned by createCheckoutSession()');
+    }
+
+    /**
+     * A UUID goes into the signed path in lowercase hyphenated form: the API signs the id
+     * it parsed, written that way, whatever case the request used.
+     */
+    private static function normalizeUuid(string $uuid, string $message): string
+    {
+        $normalized = strtolower(trim($uuid));
         if (preg_match('/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/', $normalized) !== 1) {
-            throw new \InvalidArgumentException('transactionId must be the UUID returned by createCheckoutSession()');
+            throw new \InvalidArgumentException($message);
         }
 
         return $normalized;
@@ -1203,6 +1929,20 @@ class DominaiteClient
         $normalized = trim($refundId);
         if (preg_match(self::PAYMENT_METHOD_ID_PATTERN, $normalized) !== 1) {
             throw new \InvalidArgumentException('refundId must be the refundId createRefund() returned');
+        }
+
+        return $normalized;
+    }
+
+    /**
+     * Same guard as a payment method id, for the plan_ and agr_ ids: one segment of the
+     * signed path, sent verbatim, because the API reads them case-sensitively.
+     */
+    private static function normalizeHandle(string $handle, string $name, string $source): string
+    {
+        $normalized = trim($handle);
+        if (preg_match(self::PAYMENT_METHOD_ID_PATTERN, $normalized) !== 1) {
+            throw new \InvalidArgumentException("{$name} must be the id {$source} returned");
         }
 
         return $normalized;
@@ -1370,8 +2110,13 @@ class DominaiteClient
             }
         }
 
+        // The signature covers the route's own path, never a query string: the API signs
+        // its canonical path, not the URL it received. Only listTransactions() sends one.
+        $queryAt = strpos($path, '?');
+        $signedPath = $queryAt === false ? $path : substr($path, 0, $queryAt);
+
         $timestamp = (string) time();
-        $signature = $this->sign($timestamp, $method, $path, $idempotencyKey, $json);
+        $signature = $this->sign($timestamp, $method, $signedPath, $idempotencyKey, $json);
 
         $headers = [
             'Content-Type: application/json',
@@ -1471,9 +2216,16 @@ class DominaiteClient
     protected function readResponse(int $status, string $raw, array $responseHeaders = []): array
     {
         if ($status === 429) {
+            // The code is read when the body is the gateway's envelope, and skipped
+            // otherwise: an edge's HTML 429 is still a rate limit.
+            $limited = json_decode($raw, true);
+            $limited = is_array($limited) ? $limited : [];
+            $limitCode = is_array($limited['error'] ?? null) ? ($limited['error']['code'] ?? null) : null;
             throw new RateLimitException(
                 'Rate limit exceeded (HTTP 429); back off and retry with the same idempotency key.',
-                self::parseRetryAfter($responseHeaders['retry-after'] ?? null)
+                self::parseRetryAfter($responseHeaders['retry-after'] ?? null),
+                is_string($limitCode) && $limitCode !== '' ? $limitCode : null,
+                $limited
             );
         }
 
@@ -1496,13 +2248,40 @@ class DominaiteClient
         $envelopeError = isset($decoded['error']) && is_array($decoded['error']) ? $decoded['error'] : [];
 
         if ($status === 401 || $status === 403) {
+            $errorCode = (string) ($payload['errorCode'] ?? $envelopeError['code'] ?? 'UNAUTHORIZED');
             throw new AuthenticationException(
-                (string) ($payload['errorCode'] ?? $envelopeError['code'] ?? 'UNAUTHORIZED'),
-                'Authentication failed - check your key id, secret, and server clock.'
+                $errorCode,
+                self::refusalMessage($status, $errorCode, $envelopeError['message'] ?? null),
+                $status
             );
         }
 
         return ['status' => $status, 'envelope' => $decoded, 'payload' => $payload, 'error' => $envelopeError];
+    }
+
+    /**
+     * The message for a 401 or 403. Only a 401 is about the key id, secret or clock: a
+     * 403 comes after the signature verified, so that hint would send the caller to
+     * fix the wrong thing.
+     *
+     * @param mixed $gatewayMessage error.message from the envelope, when there is one.
+     */
+    private static function refusalMessage(int $status, string $errorCode, $gatewayMessage): string
+    {
+        if ($status === 401) {
+            return 'Authentication failed - check your key id, secret, and server clock.';
+        }
+        $detail = is_string($gatewayMessage) && $gatewayMessage !== '' ? ' The API said: ' . $gatewayMessage : '';
+        if ($errorCode === self::INSUFFICIENT_SCOPE) {
+            return 'This API key does not hold the scope this route needs. The signature was valid, so the '
+                . 'key id, secret and clock are fine. Use a key issued with that scope.' . $detail;
+        }
+        if ($errorCode === self::VERIFY_ONLY_NOT_ENABLED) {
+            return 'Verify-only sessions are not switched on for this account. We switch it on for your '
+                . 'account. Contact Dominaite to ask for it. Nothing was created.';
+        }
+
+        return "The API refused this call (HTTP 403, {$errorCode})." . $detail;
     }
 
     /**
@@ -1540,10 +2319,10 @@ class DominaiteClient
         $message = (string) ($reply['payload']['errorMessage'] ?? $reply['error']['message'] ?? 'Request rejected');
 
         if ($errorCode !== null && in_array($errorCode, self::STOREFRONT_ERROR_CODES, true)) {
-            return new StorefrontException($reply['status'], $message, $errorCode);
+            return new StorefrontException($reply['status'], $message, $errorCode, $reply['envelope']);
         }
 
-        return new ApiException($reply['status'], $message, $errorCode);
+        return new ApiException($reply['status'], $message, $errorCode, $reply['envelope']);
     }
 
     private static function unavailable(int $status): TransportException
@@ -1553,8 +2332,9 @@ class DominaiteClient
 
     /**
      * The charge body as one shape: the gateway omits declineClass and declineCode when
-     * they are null (every 201, and a 502 CHARGE_FAILED row), so absent reads as null.
-     * Anything else the gateway sends is carried through.
+     * they are null (every 201, and a 502 CHARGE_FAILED row), and agreementId on a charge
+     * that named no agreement, so absent reads as null. Anything else the gateway sends is
+     * carried through.
      *
      * @param array<string,mixed> $data
      * @return array<string,mixed>
@@ -1566,6 +2346,7 @@ class DominaiteClient
         $data['declineClass'] = is_string($data['declineClass'] ?? null) ? $data['declineClass'] : null;
         $data['declineCode'] = is_string($data['declineCode'] ?? null) ? $data['declineCode'] : null;
         $data['transactionId'] = (string) ($data['transactionId'] ?? '');
+        $data['agreementId'] = is_string($data['agreementId'] ?? null) ? $data['agreementId'] : null;
 
         return $data;
     }

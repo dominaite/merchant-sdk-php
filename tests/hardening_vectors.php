@@ -21,6 +21,7 @@ require __DIR__ . '/../src/Exception/TransportException.php';
 
 use Dominaite\DominaiteClient;
 use Dominaite\Exception\ApiException;
+use Dominaite\Exception\AuthenticationException;
 use Dominaite\Exception\RateLimitException;
 use Dominaite\Exception\StorefrontException;
 use Dominaite\Exception\TransportException;
@@ -129,7 +130,7 @@ check('HTML 400 stays a non-retryable API error',
 // --- A11: rate limiting -----------------------------------------------------------------
 $limit = null;
 try {
-    $responseClient->handle(429, '{"error":{"code":"RATE_LIMITED"}}', ['retry-after' => '120']);
+    $responseClient->handle(429, '{"success":false,"error":{"code":"RATE_LIMIT_EXCEEDED","message":"Too many requests"}}', ['retry-after' => '120']);
 } catch (RateLimitException $e) {
     $limit = $e;
 }
@@ -137,11 +138,91 @@ check('429 raises RateLimitException', $limit === null ? 'no exception' : get_cl
     RateLimitException::class);
 check('429 carries Retry-After seconds', var_export($limit === null ? null : $limit->getRetryAfterSeconds(), true), '120');
 check('429 keeps the HTTP status', (string) ($limit === null ? 0 : $limit->getHttpStatus()), '429');
+check('429 carries the code the API sent', var_export($limit === null ? null : $limit->getErrorCode(), true),
+    var_export(DominaiteClient::RATE_LIMIT_EXCEEDED, true));
+
+// The charge route has its own limits. Each is still a RateLimitException, told apart by
+// its code, and a code the SDK has never seen is a rate limit too.
+foreach ([DominaiteClient::CHARGE_VELOCITY_EXCEEDED, DominaiteClient::CHARGE_DECLINE_RATE_EXCEEDED, 'SOME_FUTURE_LIMIT'] as $code) {
+    $seen = 'no exception';
+    try {
+        $responseClient->handle(429, (string) json_encode(['success' => false, 'error' => ['code' => $code]]), ['retry-after' => '30']);
+    } catch (RateLimitException $e) {
+        $seen = (string) $e->getErrorCode() . ' after ' . var_export($e->getRetryAfterSeconds(), true);
+    }
+    check("429 $code is a RateLimitException with its code", $seen, "$code after 30");
+}
+check('the charge limit codes keep their wire spelling',
+    DominaiteClient::CHARGE_VELOCITY_EXCEEDED . ',' . DominaiteClient::CHARGE_DECLINE_RATE_EXCEEDED,
+    'CHARGE_VELOCITY_EXCEEDED,CHARGE_DECLINE_RATE_EXCEEDED');
 
 // An HTML 429 comes from an edge that never reached us; it must classify the same way.
 check('HTML 429 is still a RateLimitException',
     thrownBy(static function () use ($responseClient, $html): void { $responseClient->handle(429, $html); }),
     RateLimitException::class);
+$edgeLimit = null;
+try {
+    $responseClient->handle(429, $html);
+} catch (RateLimitException $e) {
+    $edgeLimit = $e;
+}
+check('an HTML 429 has no code', var_export($edgeLimit === null ? 'no exception' : $edgeLimit->getErrorCode(), true), 'NULL');
+check('an HTML 429 has no envelope', $edgeLimit === null ? 'no exception' : (string) json_encode($edgeLimit->getResult()), '[]');
+check('a JSON 429 keeps the whole envelope', $limit === null ? 'no exception' : implode(',', array_keys($limit->getResult())), 'success,error');
+
+// --- 401 and 403 get different messages -------------------------------------------------
+// A 403 comes after the signature verified. The 401 hint about the key id, secret and
+// clock would send the caller to fix the wrong thing.
+/** @return array{class:string,code:string,status:int,message:string} */
+function refusal(ResponseClient $client, int $status, string $raw): array
+{
+    try {
+        $client->handle($status, $raw);
+    } catch (AuthenticationException $e) {
+        return ['class' => get_class($e), 'code' => $e->getErrorCode(), 'status' => $e->getHttpStatus(), 'message' => $e->getMessage()];
+    }
+
+    return ['class' => 'no exception', 'code' => '', 'status' => 0, 'message' => ''];
+}
+
+$unauthorized = refusal($responseClient, 401,
+    '{"success":false,"error":{"code":"INVALID_SIGNATURE","message":"Request signature does not match"}}');
+check('401 is an AuthenticationException', $unauthorized['class'], AuthenticationException::class);
+check('401 keeps its code', $unauthorized['code'], 'INVALID_SIGNATURE');
+check('401 reports HTTP 401', (string) $unauthorized['status'], '401');
+check('401 points at the key id, secret and clock',
+    strpos($unauthorized['message'], 'check your key id, secret, and server clock') !== false ? 'yes' : $unauthorized['message'], 'yes');
+
+$scope = refusal($responseClient, 403, (string) json_encode(['success' => false, 'error' => [
+    'code' => 'INSUFFICIENT_SCOPE',
+    'message' => "This API key does not have the 'webhooks:manage' scope this route requires",
+]]));
+check('403 INSUFFICIENT_SCOPE is an AuthenticationException', $scope['class'], AuthenticationException::class);
+check('403 INSUFFICIENT_SCOPE keeps its code', $scope['code'], DominaiteClient::INSUFFICIENT_SCOPE);
+check('403 INSUFFICIENT_SCOPE reports HTTP 403', (string) $scope['status'], '403');
+check('403 INSUFFICIENT_SCOPE does not blame the clock',
+    strpos($scope['message'], 'server clock') === false ? 'no clock hint' : $scope['message'], 'no clock hint');
+check('403 INSUFFICIENT_SCOPE says the key lacks the scope',
+    strpos($scope['message'], 'does not hold the scope this route needs') !== false ? 'yes' : $scope['message'], 'yes');
+check('403 INSUFFICIENT_SCOPE names the scope the API named',
+    strpos($scope['message'], "'webhooks:manage'") !== false ? 'yes' : $scope['message'], 'yes');
+
+$verifyOnly = refusal($responseClient, 403, (string) json_encode(['success' => false, 'error' => [
+    'code' => 'VERIFY_ONLY_NOT_ENABLED',
+    'message' => 'Verify-only sessions are not enabled for this account.',
+]]));
+check('403 VERIFY_ONLY_NOT_ENABLED keeps its code', $verifyOnly['code'], DominaiteClient::VERIFY_ONLY_NOT_ENABLED);
+check('403 VERIFY_ONLY_NOT_ENABLED reports HTTP 403', (string) $verifyOnly['status'], '403');
+check('403 VERIFY_ONLY_NOT_ENABLED says how it gets switched on',
+    strpos($verifyOnly['message'], 'We switch it on for your account.') !== false ? 'yes' : $verifyOnly['message'], 'yes');
+check('403 VERIFY_ONLY_NOT_ENABLED does not blame the clock',
+    strpos($verifyOnly['message'], 'server clock') === false ? 'no clock hint' : $verifyOnly['message'], 'no clock hint');
+
+$otherForbidden = refusal($responseClient, 403, '{"success":false,"error":{"code":"SOME_FUTURE_REFUSAL","message":"Not for you"}}');
+check('an unknown 403 keeps its code', $otherForbidden['code'], 'SOME_FUTURE_REFUSAL');
+check('an unknown 403 carries the API message without the clock hint',
+    strpos($otherForbidden['message'], 'Not for you') !== false && strpos($otherForbidden['message'], 'server clock') === false
+        ? 'yes' : $otherForbidden['message'], 'yes');
 
 // Retry-After in the HTTP-date form is not converted: a wrong number is worse than none,
 // because the caller would sleep on it.
@@ -231,6 +312,27 @@ foreach ($storefrontCases as [$status, $code, $message]) {
     check("$status $code carries its status", $thrown instanceof ApiException ? (string) $thrown->getHttpStatus() : '', (string) $status);
     check("$status $code carries the gateway message", $thrown === null ? '' : $thrown->getMessage(), $message);
 }
+// A rejection keeps the whole envelope: error.params is where the API names the record a
+// conflict is about, and the SDK does not model every code's params.
+$conflict = null;
+try {
+    $responseClient->handle(409, '{"success":false,"error":{"code":"WEBHOOK_ALREADY_REGISTERED","message":"x",'
+        . '"statusCode":409,"params":{"webhookId":"3f2c9a1e-0b7d-4c55-9a8e-1d2f3a4b5c6d"}}}');
+} catch (ApiException $e) {
+    $conflict = $e;
+}
+check('a rejection keeps error.params in the envelope',
+    (string) ($conflict === null ? 'no exception' : ($conflict->getResult()['error']['params']['webhookId'] ?? 'missing')),
+    '3f2c9a1e-0b7d-4c55-9a8e-1d2f3a4b5c6d');
+check('a storefront refusal keeps the envelope too',
+    implode(',', array_keys($thrown instanceof ApiException ? $thrown->getResult() : [])), 'success,data,error');
+$nonJson = null;
+try {
+    $responseClient->handle(404, '<html>not found</html>');
+} catch (ApiException $e) {
+    $nonJson = $e;
+}
+check('a non-JSON rejection has an empty envelope', $nonJson === null ? 'no exception' : (string) json_encode($nonJson->getResult()), '[]');
 check('a 409 with another code stays a plain ApiException',
     thrownBy(static function () use ($responseClient): void {
         $responseClient->handle(409, '{"success":false,"error":{"code":"CONFLICT","message":"x"}}');
