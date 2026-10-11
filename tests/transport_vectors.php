@@ -242,6 +242,21 @@ try {
 check('an unknown payment method is an ApiException', $missing === null ? 'no exception' : get_class($missing), ApiException::class);
 check('the unknown payment method keeps its 404', (string) ($missing === null ? 0 : $missing->getHttpStatus()), '404');
 
+// --- the integration contract on the wire -----------------------------------------------
+// A public read, signed like ping: GET, an empty key, an empty body, no Idempotency-Key.
+$contract = $client->getIntegrationContract();
+check('the contract read answers with the unwrapped data', (string) json_encode($contract['sdks'] ?? null),
+    '["node","python","php","go","dotnet","rust"]');
+$seen = lastRequest($recordFile);
+check('the contract read went out as GET on its path', $seen['method'] . ' ' . $seen['path'],
+    'GET ' . DominaiteClient::INTEGRATION_CONTRACT_PATH);
+check('the contract path is the published one', DominaiteClient::INTEGRATION_CONTRACT_PATH, '/merchant-api/integration/contract');
+check('the contract read sent no body', $seen['body'], '');
+check('the contract read sent no Idempotency-Key header', array_key_exists('idempotency-key', $seen['headers']) ? 'sent' : 'absent', 'absent');
+check('the contract read is signed like ping', $seen['headers']['x-signature'] ?? '',
+    DominaiteClient::signRequest(SECRET, $seen['headers']['x-timestamp'] ?? '', 'GET', $seen['path'], '', ''));
+unlink($recordFile);
+
 // --- refunds on the wire ----------------------------------------------------------------
 // The key goes out twice: in the Idempotency-Key header and inside the signature. A full
 // refund sends {} with no amount key.

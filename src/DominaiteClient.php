@@ -52,6 +52,8 @@ class DominaiteClient
      */
     public const PAYMENTS_PATH = '/merchant-api/payments';
     public const PING_PATH = '/merchant-api/ping';
+    /** The public integration contract. It needs no key; the SDK signs it like ping. */
+    public const INTEGRATION_CONTRACT_PATH = '/merchant-api/integration/contract';
     private const USER_AGENT = 'dominaite-php/0.4.0 (php ' . PHP_VERSION . ')';
     private const TIMEOUT_SECONDS = 15;
 
@@ -579,6 +581,25 @@ class DominaiteClient
         // GET signs an EMPTY idempotency key and an EMPTY body, and sends no
         // Idempotency-Key header - the same signed shape getStatus() uses.
         return $this->request('GET', self::PING_PATH, null, '');
+    }
+
+    /**
+     * Reads the public integration contract: the SDKs, the signing recipes, the request
+     * fields, the statuses, the error codes, the scopes and the webhook event catalog.
+     *
+     * The API does not check a key on this route, so any key can read it, whatever its
+     * scopes. The SDK signs it like ping() all the same. The SDK itself never reads the
+     * contract at runtime: it is data for your tools, your tests and your docs.
+     *
+     * @return array<string,mixed> The contract as the API sent it.
+     *
+     * @throws ApiException       Unexpected API response.
+     * @throws RateLimitException HTTP 429 - back off (getRetryAfterSeconds()).
+     * @throws TransportException Network-level failure or a 5xx (safe to retry).
+     */
+    public function getIntegrationContract(): array
+    {
+        return $this->request('GET', self::INTEGRATION_CONTRACT_PATH, null, '');
     }
 
     /**
