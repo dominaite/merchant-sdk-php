@@ -59,9 +59,8 @@ Changed:
 - `chargePaymentMethod()` and `createRefund()` send every field you give, not only the fields
   that the SDK models, so a new API field needs no SDK release. The idempotency key stays a
   header, and the amount and reason checks stay.
-- A declined charge can have a null `declineClass`. The charge answer classifies only SCA
-  declines at once; `getStatus()` carries the class later. The docs no longer promise a class
-  on every decline.
+- `declineClass` can be null, for example when nobody declined the payment. The docs no longer
+  promise a class on every decline.
 - The README documents key scopes, verify-only sessions, subscriptions, the refund list, webhook
   endpoints, transactions and the integration contract.
 

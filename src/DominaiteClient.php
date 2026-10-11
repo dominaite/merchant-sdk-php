@@ -325,8 +325,8 @@ class DominaiteClient
 
     /**
      * Every value chargePaymentMethod() can return in `status`, in the API's own order.
-     * succeeded: the money moved. failed: it did not, and declineClass says why once it
-     * is known. pending is not terminal: poll getStatus() with the charge's transactionId.
+     * succeeded: the money moved. failed: it did not, and declineClass says why when it
+     * is set. pending is not terminal: poll getStatus() with the charge's transactionId.
      * cancelled: an authorization voided before capture, no money moved. Treat an
      * unknown value as still open.
      */
@@ -834,9 +834,9 @@ class DominaiteClient
      * The API also sends these fields. It leaves some of them out when they have no value,
      * so read each one with ?? as shown:
      * - declineClass ($status['declineClass'] ?? null): why a failed payment was declined,
-     *   a value of DECLINE_CLASS_VOCABULARY. Null while the payment is open, on every other
-     *   status, and on a failure that the platform cannot classify yet. A value not in the
-     *   list is a new class, not an error.
+     *   a value of DECLINE_CLASS_VOCABULARY. Null on every status other than failed.
+     *   declineClass can be null on a failed payment too, for example when nobody declined
+     *   the payment. A value not in the list is a new class, not an error.
      * - isRecurring ($status['isRecurring'] ?? false): true for a merchant-initiated charge
      *   on a stored card (a recurring charge), false for a checkout session.
      * - verifyOnly ($status['verifyOnly'] ?? false): true for a session created with
@@ -923,13 +923,12 @@ class DominaiteClient
      * charge, status 'succeeded', 'pending' or 'cancelled'. 402 returns the charge too:
      * a decline is not an exception, the charge has status 'failed'. declineClass tells
      * you whether to give up on the card (hard), wait (soft_funds, soft_other) or bring
-     * the customer back for a hosted session (soft_sca_required), but it can be null on a
-     * decline: the answer carries it only when the decline code alone decides it
-     * (soft_sca_required). For every other decline the class arrives a moment later, and
-     * getStatus() carries it from then on. 'pending' is not terminal - poll getStatus()
-     * with the charge's transactionId. declineClass and declineCode are always null
-     * unless the charge was declined; the gateway omits null fields on the wire and the
-     * SDK reads absent as null.
+     * the customer back for a hosted session (soft_sca_required). declineClass can be
+     * null, for example when nobody declined the payment; handle a null class on a 402
+     * like soft_other. 'pending' is not terminal - poll getStatus() with the charge's
+     * transactionId. declineClass and declineCode are always null unless the charge was
+     * declined; the gateway omits null fields on the wire and the SDK reads absent as
+     * null.
      *
      * agreementId is the agr_ handle the charge was made under, when the request named one.
      * sequence is the charge's outcome counter as of this answer: data.sequence of its

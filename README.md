@@ -666,7 +666,7 @@ try {
             // soft_sca_required - the issuer wants the customer present: send them through a
             //                     hosted session with saveCard and charge the new method
             // soft_other        - transient, one retry later is reasonable
-            // null              - not classified yet: read getStatus() a moment later
+            // null              - no class, for example nobody declined: handle it like soft_other
             handleDecline($charge['declineClass'], $charge['declineCode']);
             break;
         case 'cancelled':
@@ -720,9 +720,8 @@ Only authentication (401/403), an id that is not yours (404, `ApiException` with
 `getErrorCode()` `PAYMENT_METHOD_NOT_FOUND`), validation (400, `ApiException`), rate limiting
 (429) and network failures keep their generic exceptions. `declineClass` and `declineCode` are
 `null` unless the charge was declined; the gateway omits them on the wire and the SDK reads
-absent as null. A declined charge can have a `null` `declineClass` too. The answer carries the
-class only when the decline code alone decides it (`soft_sca_required`). For every other
-decline the class arrives a moment later, and `getStatus()` carries it from then on.
+absent as null. `declineClass` can be null, for example when nobody declined the payment.
+Handle a null class on a 402 like `soft_other`.
 
 Revoking signs an empty key and an empty body, like `getStatus()`. A revoke that fails with
 `RevokeException` changed nothing: `MERCHANT_API_UNAVAILABLE` (503) is retryable,
@@ -980,8 +979,8 @@ The status read also has these fields. The API leaves some of them out when they
 value, so read each one with `??`:
 
 - `declineClass`: why a failed payment was declined (`DominaiteClient::DECLINE_CLASS_VOCABULARY`).
-  It is null while the payment is open, on every other status, and on a decline that is not
-  classified yet.
+  It is null on every status other than `failed`. It can be null on `failed` too, for example
+  when nobody declined the payment.
 - `isRecurring`: `true` for a charge on a saved card, `false` for a checkout session.
 - `verifyOnly`: `true` for a verify-only session. Other sessions do not have it.
 - `agreement`: the `id`, `status` and `nextChargeAt` of the subscription agreement, or null.
