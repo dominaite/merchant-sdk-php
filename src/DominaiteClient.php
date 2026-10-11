@@ -771,10 +771,10 @@ class DominaiteClient
      * worker that means reading it in the catch block and storing it against your order,
      * not going back for it later.
      *
-     * The routes that read or delete (ping(), getStatus(), getRefund(), listRefunds(),
-     * revokePaymentMethod(), the plan, agreement and webhook endpoint reads, deletePlan(),
-     * cancelAgreement() and deleteWebhookEndpoint()) sign an empty key by design and leave
-     * this untouched.
+     * The routes that read or delete (ping(), getIntegrationContract(), getStatus(),
+     * getRefund(), listRefunds(), listTransactions(), revokePaymentMethod(), the plan,
+     * agreement and webhook endpoint reads, deletePlan(), cancelAgreement() and
+     * deleteWebhookEndpoint()) sign an empty key by design and leave this untouched.
      */
     public function getLastIdempotencyKey(): ?string
     {
