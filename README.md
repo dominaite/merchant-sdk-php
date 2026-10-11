@@ -586,6 +586,7 @@ try {
             // soft_sca_required - the issuer wants the customer present: send them through a
             //                     hosted session with saveCard and charge the new method
             // soft_other        - transient, one retry later is reasonable
+            // null              - not classified yet: read getStatus() a moment later
             handleDecline($charge['declineClass'], $charge['declineCode']);
             break;
         case 'cancelled':
@@ -632,14 +633,16 @@ A charge is signed exactly like a session and carries a required `Idempotency-Ke
 retry after a timeout with the **same** key never charges the card twice: the gateway replays
 its first answer, HTTP status included. `getLastIdempotencyKey()` reads the key back the same
 way it does for a session. The HTTP status is the contract on this route: 201 (or 200 on a replay) returns
-the charge, 402 returns the charge too (`status` `failed` plus `declineClass`), and 409, 422,
+the charge, 402 returns the charge too (`status` `failed`), and 409, 422,
 502 and 503 throw `ChargeException` with `getErrorCode()`, `getHttpStatus()`, the gateway's
 message and, when the gateway attached the charge row, `getCharge()` and `getTransactionId()`.
 Only authentication (401/403), an id that is not yours (404, `ApiException` with
 `getErrorCode()` `PAYMENT_METHOD_NOT_FOUND`), validation (400, `ApiException`), rate limiting
 (429) and network failures keep their generic exceptions. `declineClass` and `declineCode` are
 `null` unless the charge was declined; the gateway omits them on the wire and the SDK reads
-absent as null.
+absent as null. A declined charge can have a `null` `declineClass` too. The answer carries the
+class only when the decline code alone decides it (`soft_sca_required`). For every other
+decline the class arrives a moment later, and `getStatus()` carries it from then on.
 
 Revoking signs an empty key and an empty body, like `getStatus()`. A revoke that fails with
 `RevokeException` changed nothing: `MERCHANT_API_UNAVAILABLE` (503) is retryable,
