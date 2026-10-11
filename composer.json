@@ -35,7 +35,8 @@
             "php tests/transport_vectors.php",
             "php tests/helper_vectors.php",
             "php tests/refund_vectors.php",
-        "php tests/recurring_vectors.php"
+        "php tests/recurring_vectors.php",
+        "php tests/reporting_vectors.php"
         ]
     }
 }

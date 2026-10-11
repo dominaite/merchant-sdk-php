@@ -62,6 +62,11 @@ class DominaiteClient
      * read and cancel one - signed with the agr_ id verbatim.
      */
     public const AGREEMENTS_PATH = '/merchant-api/agreements';
+    /**
+     * Canonical path of webhook endpoints. POST registers one, GET lists them, DELETE {id}
+     * removes one - signed with the lowercase hyphenated id. Needs the webhooks:manage scope.
+     */
+    public const WEBHOOKS_PATH = '/merchant-api/webhooks';
     /** The public integration contract. It needs no key; the SDK signs it like ping. */
     public const INTEGRATION_CONTRACT_PATH = '/merchant-api/integration/contract';
     private const USER_AGENT = 'dominaite-php/0.4.0 (php ' . PHP_VERSION . ')';
@@ -737,8 +742,8 @@ class DominaiteClient
 
     /**
      * The idempotency key the last call that carries one sent: createCheckoutSession(),
-     * chargePaymentMethod(), createRefund(), createPlan(), createAgreement(), or
-     * updatePlan() with a key.
+     * chargePaymentMethod(), createRefund(), createPlan(), createAgreement(),
+     * createWebhookEndpoint(), or updatePlan() with a key.
      * Always the one you passed: the SDK no longer generates keys.
      *
      * Handy in a generic catch block that did not keep the params around. On a timeout
@@ -756,13 +761,14 @@ class DominaiteClient
      * recent attempt that went out", never an older order's.
      *
      * It is a single slot on a client you can reuse, so the next createCheckoutSession(),
-     * chargePaymentMethod(), createRefund(), createPlan(), createAgreement(), or
-     * updatePlan() with a key overwrites it. On a long-lived worker that means reading it in the catch block and
+     * chargePaymentMethod(), createRefund(), createPlan(), createAgreement(),
+     * createWebhookEndpoint(), or updatePlan() with a key overwrites it. On a long-lived worker that means reading it in the catch block and
      * storing it against your order, not going back for it later.
      *
      * The routes that read or delete (ping(), getStatus(), getRefund(), listRefunds(),
-     * revokePaymentMethod(), the plan and agreement reads, deletePlan() and
-     * cancelAgreement()) sign an empty key by design and leave this untouched.
+     * revokePaymentMethod(), the plan, agreement and webhook endpoint reads, deletePlan(),
+     * cancelAgreement() and deleteWebhookEndpoint()) sign an empty key by design and leave
+     * this untouched.
      */
     public function getLastIdempotencyKey(): ?string
     {
@@ -1447,6 +1453,97 @@ class DominaiteClient
     }
 
     /**
+     * Registers a webhook endpoint: the URL that receives the events you name.
+     *
+     * Needs a key with the webhooks:manage scope. A key with the payments scope never holds
+     * it, so use a separate reporting key. Any other key gets an AuthenticationException
+     * (403 INSUFFICIENT_SCOPE).
+     *
+     * Required params: url (https on a public host, at most 500 characters), events (the
+     * event types to deliver, 1-50 of them) and idempotencyKey. Any other key is sent as it
+     * is. The SDK sends events as given and never checks them: the API refuses a type it
+     * does not know (VALIDATION_ERROR), and a type the API adds later needs no SDK update.
+     *
+     * secret (whsec_...) is in the FIRST 201 only. Store it at once: a replay of the same
+     * key, the list and every other answer leave it out, and it reads as null here. Verify
+     * deliveries with verifyWebhook() and that secret. Lost it? Delete the endpoint and
+     * register it again.
+     *
+     * A create with no answer (a timeout or a 503) may still have registered the endpoint.
+     * Retry with the SAME key: the retry replaces that endpoint and answers a fresh 201 with
+     * a new id and secret. A retry with a new key cannot do this.
+     *
+     * A refusal is an ApiException; branch on getErrorCode(). WEBHOOK_URL_REJECTED (400:
+     * not https, does not resolve, or a private host), WEBHOOK_LIMIT_REACHED (409: you have
+     * the most active endpoints allowed; delete one first), WEBHOOK_ALREADY_REGISTERED (409:
+     * this key registered an endpoint more than a day ago that still exists;
+     * getResult()['error']['params']['webhookId'] is its id; use a fresh key for a new
+     * endpoint), DUPLICATE_REQUEST (409: retry with the SAME key after a second) and
+     * IDEMPOTENCY_KEY_REUSED (422: this key was first used for another url or events).
+     *
+     * @param array<string,mixed> $params
+     * @return array{id:string,url:string,events:list<string>,status:string,createdAt:string,secret:?string}
+     *
+     * @throws AuthenticationException Bad credentials or signature (401), or a key without webhooks:manage (403).
+     * @throws ApiException            A refusal above, or validation (HTTP 400): branch on getErrorCode().
+     * @throws RateLimitException     HTTP 429 - back off (getRetryAfterSeconds()), retry with the same key.
+     * @throws TransportException      Network-level failure or a 5xx: retry WITH the same idempotencyKey after
+     *                                 about five seconds, for up to about five minutes.
+     */
+    public function createWebhookEndpoint(array $params): array
+    {
+        $this->lastIdempotencyKey = null;
+        $idempotencyKey = self::normalizeIdempotencyKey($params['idempotencyKey'] ?? null, self::RECORD_KEY_HINT);
+        unset($params['idempotencyKey']);
+        $this->lastIdempotencyKey = $idempotencyKey;
+
+        $endpoint = self::objectReply($this->send('POST', self::WEBHOOKS_PATH, $params, $idempotencyKey), 'webhook endpoint');
+        $endpoint['secret'] = $endpoint['secret'] ?? null;
+
+        return $endpoint;
+    }
+
+    /**
+     * Lists your webhook endpoints, newest first: every active one and your newest 1000
+     * inactive ones. There are no pages, and never a secret. status is active or inactive
+     * (paused in the dashboard or after repeated failed deliveries); a value not in this
+     * list is a new status, not an error. Needs the webhooks:manage scope.
+     *
+     * @return list<array{id:string,url:string,events:list<string>,status:string,createdAt:string}>
+     *
+     * @throws AuthenticationException Bad credentials or signature (401), or a key without webhooks:manage (403).
+     * @throws ApiException            Unexpected response.
+     * @throws RateLimitException     HTTP 429 - back off (getRetryAfterSeconds()).
+     * @throws TransportException      Network-level failure or a 5xx (safe to retry).
+     */
+    public function listWebhookEndpoints(): array
+    {
+        return self::listReply($this->send('GET', self::WEBHOOKS_PATH, null, ''), 'webhook endpoint');
+    }
+
+    /**
+     * Removes a webhook endpoint. Deliveries to it stop. Needs the webhooks:manage scope.
+     *
+     * An id that is unknown, of another account or deleted already is an ApiException with
+     * WEBHOOK_NOT_FOUND (404). A retry after a lost 204 therefore answers 404: treat that
+     * as done.
+     *
+     * @param string $webhookId The id createWebhookEndpoint() or listWebhookEndpoints() returned (a UUID).
+     *
+     * @throws AuthenticationException Bad credentials or signature (401), or a key without webhooks:manage (403).
+     * @throws ApiException            WEBHOOK_NOT_FOUND (HTTP 404).
+     * @throws RateLimitException     HTTP 429 - back off (getRetryAfterSeconds()).
+     * @throws TransportException      Network-level failure or a 5xx (safe to retry).
+     */
+    public function deleteWebhookEndpoint(string $webhookId): void
+    {
+        $id = self::normalizeUuid($webhookId, 'webhookId must be the UUID createWebhookEndpoint() returned');
+
+        // DELETE signs an EMPTY idempotency key and an EMPTY body, like GET.
+        self::emptyReply($this->send('DELETE', self::WEBHOOKS_PATH . '/' . $id, null, ''));
+    }
+
+    /**
      * The plan as one shape: the API omits periodCount, cancelUrl and archivedAt when they
      * are null, so absent reads as null. Everything the API sends is carried through as sent.
      *
@@ -1709,9 +1806,18 @@ class DominaiteClient
     /** A transaction id goes into the signed path in lowercase hyphenated form. */
     private static function normalizeTransactionId(string $transactionId): string
     {
-        $normalized = strtolower(trim($transactionId));
+        return self::normalizeUuid($transactionId, 'transactionId must be the UUID returned by createCheckoutSession()');
+    }
+
+    /**
+     * A UUID goes into the signed path in lowercase hyphenated form: the API signs the id
+     * it parsed, written that way, whatever case the request used.
+     */
+    private static function normalizeUuid(string $uuid, string $message): string
+    {
+        $normalized = strtolower(trim($uuid));
         if (preg_match('/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/', $normalized) !== 1) {
-            throw new \InvalidArgumentException('transactionId must be the UUID returned by createCheckoutSession()');
+            throw new \InvalidArgumentException($message);
         }
 
         return $normalized;
