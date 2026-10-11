@@ -1589,11 +1589,13 @@ class DominaiteClient
             // The code is read when the body is the gateway's envelope, and skipped
             // otherwise: an edge's HTML 429 is still a rate limit.
             $limited = json_decode($raw, true);
-            $limitCode = is_array($limited) && is_array($limited['error'] ?? null) ? ($limited['error']['code'] ?? null) : null;
+            $limited = is_array($limited) ? $limited : [];
+            $limitCode = is_array($limited['error'] ?? null) ? ($limited['error']['code'] ?? null) : null;
             throw new RateLimitException(
                 'Rate limit exceeded (HTTP 429); back off and retry with the same idempotency key.',
                 self::parseRetryAfter($responseHeaders['retry-after'] ?? null),
-                is_string($limitCode) && $limitCode !== '' ? $limitCode : null
+                is_string($limitCode) && $limitCode !== '' ? $limitCode : null,
+                $limited
             );
         }
 
@@ -1687,10 +1689,10 @@ class DominaiteClient
         $message = (string) ($reply['payload']['errorMessage'] ?? $reply['error']['message'] ?? 'Request rejected');
 
         if ($errorCode !== null && in_array($errorCode, self::STOREFRONT_ERROR_CODES, true)) {
-            return new StorefrontException($reply['status'], $message, $errorCode);
+            return new StorefrontException($reply['status'], $message, $errorCode, $reply['envelope']);
         }
 
-        return new ApiException($reply['status'], $message, $errorCode);
+        return new ApiException($reply['status'], $message, $errorCode, $reply['envelope']);
     }
 
     private static function unavailable(int $status): TransportException

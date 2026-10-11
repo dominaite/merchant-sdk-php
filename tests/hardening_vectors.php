@@ -167,6 +167,8 @@ try {
     $edgeLimit = $e;
 }
 check('an HTML 429 has no code', var_export($edgeLimit === null ? 'no exception' : $edgeLimit->getErrorCode(), true), 'NULL');
+check('an HTML 429 has no envelope', $edgeLimit === null ? 'no exception' : (string) json_encode($edgeLimit->getResult()), '[]');
+check('a JSON 429 keeps the whole envelope', $limit === null ? 'no exception' : implode(',', array_keys($limit->getResult())), 'success,error');
 
 // --- 401 and 403 get different messages -------------------------------------------------
 // A 403 comes after the signature verified. The 401 hint about the key id, secret and
@@ -310,6 +312,27 @@ foreach ($storefrontCases as [$status, $code, $message]) {
     check("$status $code carries its status", $thrown instanceof ApiException ? (string) $thrown->getHttpStatus() : '', (string) $status);
     check("$status $code carries the gateway message", $thrown === null ? '' : $thrown->getMessage(), $message);
 }
+// A rejection keeps the whole envelope: error.params is where the API names the record a
+// conflict is about, and the SDK does not model every code's params.
+$conflict = null;
+try {
+    $responseClient->handle(409, '{"success":false,"error":{"code":"WEBHOOK_ALREADY_REGISTERED","message":"x",'
+        . '"statusCode":409,"params":{"webhookId":"3f2c9a1e-0b7d-4c55-9a8e-1d2f3a4b5c6d"}}}');
+} catch (ApiException $e) {
+    $conflict = $e;
+}
+check('a rejection keeps error.params in the envelope',
+    (string) ($conflict === null ? 'no exception' : ($conflict->getResult()['error']['params']['webhookId'] ?? 'missing')),
+    '3f2c9a1e-0b7d-4c55-9a8e-1d2f3a4b5c6d');
+check('a storefront refusal keeps the envelope too',
+    implode(',', array_keys($thrown instanceof ApiException ? $thrown->getResult() : [])), 'success,data,error');
+$nonJson = null;
+try {
+    $responseClient->handle(404, '<html>not found</html>');
+} catch (ApiException $e) {
+    $nonJson = $e;
+}
+check('a non-JSON rejection has an empty envelope', $nonJson === null ? 'no exception' : (string) json_encode($nonJson->getResult()), '[]');
 check('a 409 with another code stays a plain ApiException',
     thrownBy(static function () use ($responseClient): void {
         $responseClient->handle(409, '{"success":false,"error":{"code":"CONFLICT","message":"x"}}');

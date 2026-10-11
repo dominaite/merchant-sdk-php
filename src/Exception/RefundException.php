@@ -31,14 +31,10 @@ class RefundException extends ApiException
     /** The codes a retry of the same request can resolve: poll or resend the SAME key. */
     private const RETRYABLE_CODES = ['REFUND_NOT_FOUND', 'DUPLICATE_REQUEST'];
 
-    /** @var array<string,mixed> */
-    private array $result;
-
     /** @param array<string,mixed> $result The full envelope. */
     public function __construct(int $httpStatus, string $message, string $errorCode, array $result = [])
     {
-        parent::__construct($httpStatus, $message, $errorCode);
-        $this->result = $result;
+        parent::__construct($httpStatus, $message, $errorCode, $result);
     }
 
     /**
@@ -49,15 +45,5 @@ class RefundException extends ApiException
     public function isRetryable(): bool
     {
         return in_array($this->getErrorCode(), self::RETRYABLE_CODES, true);
-    }
-
-    /**
-     * The full envelope, for fields not modelled above.
-     *
-     * @return array<string,mixed>
-     */
-    public function getResult(): array
-    {
-        return $this->result;
     }
 }

@@ -36,9 +36,10 @@ class RateLimitException extends ApiException
 {
     private ?int $retryAfterSeconds;
 
-    public function __construct(string $message, ?int $retryAfterSeconds = null, ?string $errorCode = null)
+    /** @param array<string,mixed> $result The full envelope, when the API sent one. */
+    public function __construct(string $message, ?int $retryAfterSeconds = null, ?string $errorCode = null, array $result = [])
     {
-        parent::__construct(429, $message, $errorCode);
+        parent::__construct(429, $message, $errorCode, $result);
         $this->retryAfterSeconds = $retryAfterSeconds;
     }
 
