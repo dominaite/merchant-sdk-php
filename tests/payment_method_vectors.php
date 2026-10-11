@@ -1,7 +1,8 @@
 <?php
-// Dependency-free tests for stored payment methods: saveCard on a session, the charge
-// body and key handling, declines as results, refusals as exceptions, and the id guard
-// that keeps a payment method id a single path segment of the signed canonical path.
+// Dependency-free tests for stored payment methods: saveCard and verifyOnly on a
+// session, the charge body and key handling, declines as results, refusals as
+// exceptions, and the id guard that keeps a payment method id a single path segment of
+// the signed canonical path.
 // Run: php tests/payment_method_vectors.php - exits non-zero on any mismatch.
 //
 // tests/transport_vectors.php covers the same two routes end to end through real curl,
@@ -18,6 +19,7 @@ require __DIR__ . '/../src/Exception/TransportException.php';
 
 use Dominaite\DominaiteClient;
 use Dominaite\Exception\ApiException;
+use Dominaite\Exception\AuthenticationException;
 use Dominaite\Exception\ChargeException;
 use Dominaite\Exception\RevokeException;
 use Dominaite\Exception\TransportException;
@@ -140,6 +142,78 @@ check('a non-bool saveCard is rejected before the call',
     thrownBy(static function () use ($checkout, $sessionParams): void {
         (new RecordingClient($checkout))->createCheckoutSession($sessionParams + ['saveCard' => 'yes']);
     }), \InvalidArgumentException::class);
+
+// --- verifyOnly ------------------------------------------------------------------------
+// A verify-only session saves the card without a payment. The amount is 0 or left out,
+// because the API sets the verification hold. Every other session keeps the positive
+// amount check.
+$verifyCheckout = $checkout;
+$verifyCheckout['checkout']['amount'] = 30;
+$verifyCheckout['checkout']['verifyOnly'] = true;
+$verifyParams = ['currency' => 'EUR', 'orderReference' => 'verify-customer-7', 'verifyOnly' => true,
+    'idempotencyKey' => 'verify-customer-7'];
+
+$client = new RecordingClient($verifyCheckout);
+$verified = $client->createCheckoutSession($verifyParams);
+check('a verifyOnly session without an amount goes out without one', encode($client->calls[0]['body']),
+    '{"currency":"EUR","orderReference":"verify-customer-7","verifyOnly":true}');
+check('a verifyOnly session signs the caller key', $client->calls[0]['key'], 'verify-customer-7');
+check('a verifyOnly session records the key it sent', (string) $client->getLastIdempotencyKey(), 'verify-customer-7');
+check('the session reads verifyOnly true', var_export($verified['verifyOnly'] ?? null, true), 'true');
+check('the session reads the hold the API set', var_export($verified['amount'], true), '30');
+
+$client = new RecordingClient($verifyCheckout);
+$client->createCheckoutSession($verifyParams + ['amount' => 0]);
+check('a verifyOnly session with amount 0 sends it', encode($client->calls[0]['body']),
+    '{"currency":"EUR","orderReference":"verify-customer-7","verifyOnly":true,"amount":0}');
+
+// The other verify-only rules (saveCard not false, the widget only, no agreementId) are
+// the API's to refuse with a 400. The SDK sends them as they are.
+$client = new RecordingClient($verifyCheckout);
+$client->createCheckoutSession($verifyParams + ['saveCard' => false]);
+check('a verifyOnly session leaves the other rules to the API',
+    var_export($client->calls[0]['body']['saveCard'] ?? 'absent', true), 'false');
+
+// A null verifyOnly is left out, so the signed body of a payment session does not move.
+$client = new RecordingClient($checkout);
+$client->createCheckoutSession($sessionParams + ['verifyOnly' => null]);
+check('a null verifyOnly is left out of the body', encode($client->calls[0]['body']),
+    '{"amount":2500,"currency":"EUR","orderReference":"order-1042"}');
+
+$verifyRefusals = [
+    'a positive amount with verifyOnly' => $verifyParams + ['amount' => 2500],
+    'a string amount with verifyOnly' => $verifyParams + ['amount' => '0'],
+    'a null amount with verifyOnly' => $verifyParams + ['amount' => null],
+    'a non-bool verifyOnly' => ['verifyOnly' => 'yes'] + $verifyParams + ['amount' => 0],
+    'verifyOnly without a currency' => array_diff_key($verifyParams, ['currency' => true]),
+    'verifyOnly without an orderReference' => array_diff_key($verifyParams, ['orderReference' => true]),
+    'verifyOnly without a key' => array_diff_key($verifyParams, ['idempotencyKey' => true]),
+    'amount 0 without verifyOnly' => ['amount' => 0] + $sessionParams,
+    'amount 0 with verifyOnly false' => ['amount' => 0, 'verifyOnly' => false] + $sessionParams,
+    'no amount without verifyOnly' => array_diff_key($sessionParams, ['amount' => true]),
+];
+foreach ($verifyRefusals as $label => $params) {
+    $client = new RecordingClient($verifyCheckout);
+    $thrown = thrownBy(static function () use ($client, $params): void {
+        $client->createCheckoutSession($params);
+    });
+    check("$label is refused before the call", $thrown . ' after ' . count($client->calls) . ' calls',
+        \InvalidArgumentException::class . ' after 0 calls');
+}
+
+// Off until we switch it on for the account: a 403 with its own message.
+$client = new RecordingClient(['success' => false, 'error' => [
+    'code' => 'VERIFY_ONLY_NOT_ENABLED', 'message' => 'Verify-only sessions are not enabled for this account.',
+]], 403);
+$notEnabled = null;
+try {
+    $client->createCheckoutSession($verifyParams);
+} catch (AuthenticationException $e) {
+    $notEnabled = $e;
+}
+check('a verifyOnly session on an account without it is a 403 VERIFY_ONLY_NOT_ENABLED',
+    $notEnabled === null ? 'no exception' : $notEnabled->getHttpStatus() . ' ' . $notEnabled->getErrorCode(),
+    '403 ' . DominaiteClient::VERIFY_ONLY_NOT_ENABLED);
 
 // --- chargePaymentMethod: the signed body ------------------------------------------------
 $client = new RecordingClient($charge, 201);

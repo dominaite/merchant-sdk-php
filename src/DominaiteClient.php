@@ -596,7 +596,25 @@ class DominaiteClient
      * integration (INTEGRATION_WIDGET, the default, or INTEGRATION_FIELDS for card fields
      * in your own page; card fields are enabled per merchant on request and 'fields' on an
      * account without them is a 400; part of the idempotency identity, so a replay with a
-     * different integration is refused with IDEMPOTENCY_KEY_REUSED; omitted when null).
+     * different integration is refused with IDEMPOTENCY_KEY_REUSED; omitted when null),
+     * locationId (the id of the storefront the payment belongs to),
+     * agreementId (the agr_ handle of a pending agreement from createAgreement(): the
+     * session takes the agreement's first payment, saves the card and activates the
+     * agreement; amount and currency must be the agreement's own, and on a plan with a
+     * trial only the currency is held), consent{textVersion,acceptedAt,ip} (only with
+     * agreementId: the platform consent text version the customer accepted, when and
+     * from which IP; required unless the agreement already carries it), verifyOnly (bool,
+     * see below). Any other key is sent as it is, so a field the API adds later needs no
+     * SDK update.
+     *
+     * verifyOnly true saves the card without a payment. Leave amount out or send 0: the
+     * API places its own small verification hold and releases it once the card is saved.
+     * saveCard is implied, integration must be the widget, and agreementId is refused.
+     * Verify-only sessions are off until we switch them on for your account; before that
+     * the API answers 403 VERIFY_ONLY_NOT_ENABLED (an AuthenticationException).
+     * orderIdempotencyKey() needs a positive amount, so build this key yourself, for
+     * example 'verify-' . $customerId. The session comes back with verifyOnly true and
+     * amount set to the hold.
      *
      * The session always carries integration. clientSecret is set only for a fields
      * session (absent for a widget session): an opaque string of at most 128 characters,
@@ -611,9 +629,10 @@ class DominaiteClient
      * getStatus().
      *
      * @param array<string,mixed> $params
-     * @return array{transactionId:string,orderId:string,cashierKey:string,cashierToken:string,amount:int,currency:string,expiresAt:string,integration:string,clientSecret?:?string}
+     * @return array{transactionId:string,orderId:string,cashierKey:string,cashierToken:string,amount:int,currency:string,expiresAt:string,agreementId?:?string,integration:string,clientSecret?:?string,verifyOnly?:bool}
      *
-     * @throws AuthenticationException Wrong/revoked credentials or bad signature (fix config; do not retry).
+     * @throws AuthenticationException Wrong/revoked credentials or bad signature (fix config; do not retry),
+     *                                 or HTTP 403 VERIFY_ONLY_NOT_ENABLED.
      * @throws CheckoutRefusedException The gateway refused the session (inspect getErrorCode()).
      * @throws StorefrontException     The storefront cannot take payments (STOREFRONT_ERROR_CODES, HTTP 409 or 400).
      * @throws ApiException            Unexpected API response.
@@ -628,7 +647,18 @@ class DominaiteClient
         // with it collides with that earlier payment instead.
         $this->lastIdempotencyKey = null;
 
-        self::validateMoneyParams($params);
+        if (array_key_exists('verifyOnly', $params)) {
+            if ($params['verifyOnly'] === null) {
+                unset($params['verifyOnly']);
+            } elseif (!is_bool($params['verifyOnly'])) {
+                throw new \InvalidArgumentException('verifyOnly must be a bool');
+            }
+        }
+        if (($params['verifyOnly'] ?? false) === true) {
+            self::validateVerifyOnlyParams($params);
+        } else {
+            self::validateMoneyParams($params);
+        }
         if (array_key_exists('saveCard', $params) && !is_bool($params['saveCard'])) {
             throw new \InvalidArgumentException('saveCard must be a bool');
         }
@@ -1064,6 +1094,28 @@ class DominaiteClient
         }
         if (!is_int($params['amount']) || $params['amount'] <= 0) {
             throw new \InvalidArgumentException('amount must be a positive integer in MINOR units (e.g. 2500 for 25.00 EUR)');
+        }
+        if (!is_string($params['orderReference']) || $params['orderReference'] === ''
+            || self::codePoints($params['orderReference']) > 100) {
+            throw new \InvalidArgumentException('orderReference must be a non-empty string of at most 100 characters');
+        }
+    }
+
+    /**
+     * The checks for a verify-only session. Currency and orderReference are required as for
+     * a payment. The amount is 0 or left out, because the API sets the verification hold.
+     *
+     * @param array<string,mixed> $params
+     */
+    private static function validateVerifyOnlyParams(array $params): void
+    {
+        foreach (['currency', 'orderReference'] as $required) {
+            if (!isset($params[$required])) {
+                throw new \InvalidArgumentException("Missing required parameter: {$required}");
+            }
+        }
+        if (array_key_exists('amount', $params) && $params['amount'] !== 0) {
+            throw new \InvalidArgumentException('amount must be 0 or left out with verifyOnly: the API sets the verification hold');
         }
         if (!is_string($params['orderReference']) || $params['orderReference'] === ''
             || self::codePoints($params['orderReference']) > 100) {
