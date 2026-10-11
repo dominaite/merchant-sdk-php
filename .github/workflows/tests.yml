@@ -30,7 +30,7 @@ jobs:
             for suite in vectors webhook_vectors idempotency_vectors redaction_vectors \
                          contract_vectors wire_contract_vectors payment_method_vectors \
                          hardening_vectors transport_vectors helper_vectors refund_vectors \
-                         recurring_vectors reporting_vectors; do
+                         recurring_vectors reporting_vectors lenient_vectors; do
               echo "--- tests/$suite.php"
               php "tests/$suite.php"
             done
