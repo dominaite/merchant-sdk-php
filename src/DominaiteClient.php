@@ -52,6 +52,11 @@ class DominaiteClient
      */
     public const PAYMENTS_PATH = '/merchant-api/payments';
     public const PING_PATH = '/merchant-api/ping';
+    /**
+     * Canonical path of subscription plans. POST creates one, GET lists them; GET, PATCH
+     * and DELETE {id} read, change and archive one - all signed with the plan_ id verbatim.
+     */
+    public const PLANS_PATH = '/merchant-api/plans';
     /** The public integration contract. It needs no key; the SDK signs it like ping. */
     public const INTEGRATION_CONTRACT_PATH = '/merchant-api/integration/contract';
     private const USER_AGENT = 'dominaite-php/0.4.0 (php ' . PHP_VERSION . ')';
@@ -84,6 +89,10 @@ class DominaiteClient
      * else would sign one path and request another.
      */
     private const PAYMENT_METHOD_ID_PATTERN = '/^[A-Za-z0-9_-]{1,100}$/';
+
+    /** What a missing key on a create route that is not a payment should be derived from. */
+    private const RECORD_KEY_HINT = 'derive it from your own record of what you create (for example its id in your database), '
+        . 'so a retry sends the same key';
 
     /**
      * Every value getStatus() can return in `status`, in the API's own order.
@@ -722,8 +731,9 @@ class DominaiteClient
     }
 
     /**
-     * The idempotency key the last createCheckoutSession(), chargePaymentMethod() or
-     * createRefund() call sent. Always the one you passed: the SDK no longer generates keys.
+     * The idempotency key the last call that carries one sent: createCheckoutSession(),
+     * chargePaymentMethod(), createRefund(), createPlan(), or updatePlan() with a key.
+     * Always the one you passed: the SDK no longer generates keys.
      *
      * Handy in a generic catch block that did not keep the params around. On a timeout
      * you cannot know whether the gateway created the session, and retrying with a NEW key
@@ -740,10 +750,12 @@ class DominaiteClient
      * recent attempt that went out", never an older order's.
      *
      * It is a single slot on a client you can reuse, so the next createCheckoutSession(),
-     * chargePaymentMethod() or createRefund() overwrites it. On a long-lived worker that means reading it
-     * in the catch block and storing it against your order, not going back for it later.
+     * chargePaymentMethod(), createRefund(), createPlan(), or updatePlan() with a key
+     * overwrites it. On a long-lived worker that means reading it in the catch block and
+     * storing it against your order, not going back for it later.
      *
-     * ping(), getStatus(), getRefund() and revokePaymentMethod() sign an empty key by design
+     * The routes that read or delete (ping(), getStatus(), getRefund(), listRefunds(),
+     * revokePaymentMethod(), the plan reads and deletePlan()) sign an empty key by design
      * and leave this untouched.
      */
     public function getLastIdempotencyKey(): ?string
@@ -1185,6 +1197,196 @@ class DominaiteClient
     }
 
     /**
+     * Creates a subscription plan: the price and the billing interval that agreements are
+     * made from.
+     *
+     * Required params: name (1-100 characters), amount (int, MINOR units, charged every
+     * period), currency (ISO 4217), intervalUnit (day, week, month or year) and
+     * idempotencyKey. Optional: intervalCount (units per period, default 1; the period is at
+     * most one year), periodCount (agreements complete after this many periods; leave it
+     * out to bill until cancelled), trialDays (0-365) and cancelUrl (your https page where
+     * the customer cancels; the platform prints it on every receipt it emails). Any other
+     * key is sent as it is, so a field the API adds later needs no SDK update. The API
+     * checks the values; the SDK does not.
+     *
+     * amount, currency and the interval never change. For a new price, create a new plan
+     * and archive the old one with deletePlan().
+     *
+     * The same idempotencyKey with the same body answers the first plan again, so a create
+     * whose answer you lost is safe to repeat. The same key with a different body is an
+     * ApiException with IDEMPOTENCY_KEY_REUSED. Keys are not case-sensitive on the API.
+     *
+     * @param array<string,mixed> $params
+     * @return array{id:string,name:string,amount:int,currency:string,intervalUnit:string,intervalCount:int,periodCount:?int,trialDays:int,status:string,cancelUrl:?string,createdAt:string,archivedAt:?string}
+     *
+     * @throws AuthenticationException Bad credentials or signature (401), or a key without the payments scope (403).
+     * @throws ApiException            Validation (HTTP 400) or IDEMPOTENCY_KEY_REUSED (HTTP 422): branch on getErrorCode().
+     * @throws RateLimitException     HTTP 429 - back off (getRetryAfterSeconds()), retry with the same key.
+     * @throws TransportException      Network-level failure or a 5xx: retry WITH the same idempotencyKey.
+     */
+    public function createPlan(array $params): array
+    {
+        $this->lastIdempotencyKey = null;
+        $idempotencyKey = self::normalizeIdempotencyKey($params['idempotencyKey'] ?? null, self::RECORD_KEY_HINT);
+        unset($params['idempotencyKey']);
+        $this->lastIdempotencyKey = $idempotencyKey;
+
+        return self::plan(self::objectReply($this->send('POST', self::PLANS_PATH, $params, $idempotencyKey), 'plan'));
+    }
+
+    /**
+     * Lists your plans: at most 200, active first, newest first within a status. There
+     * are no pages on this route; read one plan with getPlan() when you have more.
+     *
+     * @return list<array{id:string,name:string,amount:int,currency:string,intervalUnit:string,intervalCount:int,periodCount:?int,trialDays:int,status:string,cancelUrl:?string,createdAt:string,archivedAt:?string}>
+     *
+     * @throws AuthenticationException Bad credentials or signature (401), or a key without the payments scope (403).
+     * @throws ApiException            Unexpected response.
+     * @throws RateLimitException     HTTP 429 - back off (getRetryAfterSeconds()).
+     * @throws TransportException      Network-level failure or a 5xx (safe to retry).
+     */
+    public function listPlans(): array
+    {
+        return array_map(static function (array $plan): array {
+            return self::plan($plan);
+        }, self::listReply($this->send('GET', self::PLANS_PATH, null, ''), 'plan'));
+    }
+
+    /**
+     * Reads one plan. status is active or archived; only an active plan takes new
+     * agreements.
+     *
+     * @param string $planId The plan_ id createPlan() returned, exactly as returned: it is case-sensitive.
+     * @return array{id:string,name:string,amount:int,currency:string,intervalUnit:string,intervalCount:int,periodCount:?int,trialDays:int,status:string,cancelUrl:?string,createdAt:string,archivedAt:?string}
+     *
+     * @throws AuthenticationException Bad credentials or signature (401), or a key without the payments scope (403).
+     * @throws ApiException            PLAN_NOT_FOUND (HTTP 404), or an unexpected response.
+     * @throws RateLimitException     HTTP 429 - back off (getRetryAfterSeconds()).
+     * @throws TransportException      Network-level failure or a 5xx (safe to retry).
+     */
+    public function getPlan(string $planId): array
+    {
+        $id = self::normalizeHandle($planId, 'planId', 'createPlan()');
+
+        return self::plan(self::objectReply($this->send('GET', self::PLANS_PATH . '/' . $id, null, ''), 'plan'));
+    }
+
+    /**
+     * Changes a plan's name, trialDays or cancelUrl. Send at least one of them. A field you
+     * leave out stays as it is; an empty cancelUrl removes it. A trialDays change reaches
+     * only agreements created afterwards. Any other key is sent as it is.
+     *
+     * The API does not require an idempotency key here: the same change sent twice gives
+     * the same plan. An idempotencyKey you pass anyway is signed and sent.
+     *
+     * @param string              $planId The plan_ id createPlan() returned.
+     * @param array<string,mixed> $params
+     * @return array{id:string,name:string,amount:int,currency:string,intervalUnit:string,intervalCount:int,periodCount:?int,trialDays:int,status:string,cancelUrl:?string,createdAt:string,archivedAt:?string}
+     *
+     * @throws AuthenticationException Bad credentials or signature (401), or a key without the payments scope (403).
+     * @throws ApiException            Validation (HTTP 400) or PLAN_NOT_FOUND (HTTP 404): branch on getErrorCode().
+     * @throws RateLimitException     HTTP 429 - back off (getRetryAfterSeconds()).
+     * @throws TransportException      Network-level failure or a 5xx (safe to retry).
+     */
+    public function updatePlan(string $planId, array $params): array
+    {
+        $idempotencyKey = '';
+        if (array_key_exists('idempotencyKey', $params)) {
+            $this->lastIdempotencyKey = null;
+            $idempotencyKey = self::normalizeIdempotencyKey($params['idempotencyKey'], self::RECORD_KEY_HINT);
+            unset($params['idempotencyKey']);
+        }
+        $id = self::normalizeHandle($planId, 'planId', 'createPlan()');
+        if ($idempotencyKey !== '') {
+            $this->lastIdempotencyKey = $idempotencyKey;
+        }
+
+        return self::plan(self::objectReply($this->send('PATCH', self::PLANS_PATH . '/' . $id, $params, $idempotencyKey), 'plan'));
+    }
+
+    /**
+     * Archives a plan: it takes no new agreements, and the agreements made from it go on
+     * as they are. A plan that is archived already answers the same, so a retry is safe.
+     *
+     * @param string $planId The plan_ id createPlan() returned.
+     *
+     * @throws AuthenticationException Bad credentials or signature (401), or a key without the payments scope (403).
+     * @throws ApiException            PLAN_NOT_FOUND (HTTP 404), or a malformed id (HTTP 400).
+     * @throws RateLimitException     HTTP 429 - back off (getRetryAfterSeconds()).
+     * @throws TransportException      Network-level failure or a 5xx (safe to retry).
+     */
+    public function deletePlan(string $planId): void
+    {
+        $id = self::normalizeHandle($planId, 'planId', 'createPlan()');
+
+        // DELETE signs an EMPTY idempotency key and an EMPTY body, like GET.
+        self::emptyReply($this->send('DELETE', self::PLANS_PATH . '/' . $id, null, ''));
+    }
+
+    /**
+     * The plan as one shape: the API omits periodCount, cancelUrl and archivedAt when they
+     * are null, so absent reads as null. Everything the API sends is carried through as sent.
+     *
+     * @param array<string,mixed> $data
+     * @return array<string,mixed>
+     */
+    private static function plan(array $data): array
+    {
+        foreach (['periodCount', 'cancelUrl', 'archivedAt'] as $nullable) {
+            $data[$nullable] = $data[$nullable] ?? null;
+        }
+
+        return $data;
+    }
+
+    /**
+     * A reply that must carry one object with an id: the object on a 2xx, the generic
+     * failure otherwise.
+     *
+     * @param array{status:int,envelope:array<string,mixed>,payload:array<string,mixed>,error:array<string,mixed>} $reply
+     * @return array<string,mixed>
+     */
+    private static function objectReply(array $reply, string $what): array
+    {
+        $data = self::settle($reply);
+        if (!is_string($data['id'] ?? null)) {
+            throw new ApiException($reply['status'], "The API answered without the {$what}", 'UNEXPECTED_RESPONSE');
+        }
+
+        return $data;
+    }
+
+    /**
+     * A reply that must carry a JSON array of objects: the array on a 2xx, the generic
+     * failure otherwise.
+     *
+     * @param array{status:int,envelope:array<string,mixed>,payload:array<string,mixed>,error:array<string,mixed>} $reply
+     * @return list<array<string,mixed>>
+     */
+    private static function listReply(array $reply, string $what): array
+    {
+        self::settle($reply);
+        $data = $reply['envelope']['data'] ?? null;
+        if (!is_array($data) || $data !== array_values($data) || count(array_filter($data, 'is_array')) !== count($data)) {
+            throw new ApiException($reply['status'], "The API answered without the {$what} list", 'UNEXPECTED_RESPONSE');
+        }
+
+        return $data;
+    }
+
+    /**
+     * A reply that carries no body on success (204): nothing, or the generic failure.
+     *
+     * @param array{status:int,envelope:array<string,mixed>,payload:array<string,mixed>,error:array<string,mixed>} $reply
+     */
+    private static function emptyReply(array $reply): void
+    {
+        if ($reply['status'] >= 400) {
+            throw self::rejection($reply);
+        }
+    }
+
+    /**
      * The checks shared by every request that moves money: amount, currency, orderReference.
      *
      * @param array<string,mixed> $params
@@ -1347,12 +1549,12 @@ class DominaiteClient
      *
      * @param mixed $idempotencyKey
      */
-    private static function normalizeIdempotencyKey($idempotencyKey): string
-    {
+    private static function normalizeIdempotencyKey(
+        $idempotencyKey,
+        string $derive = 'derive it from your order with DominaiteClient::orderIdempotencyKey()'
+    ): string {
         if ($idempotencyKey === null) {
-            throw new \InvalidArgumentException(
-                'idempotencyKey is required; derive it from your order with DominaiteClient::orderIdempotencyKey()'
-            );
+            throw new \InvalidArgumentException('idempotencyKey is required; ' . $derive);
         }
         if (!is_string($idempotencyKey) || $idempotencyKey === '' || self::codePoints($idempotencyKey) > 100) {
             throw new \InvalidArgumentException('idempotencyKey must be a non-empty string of at most 100 characters');
@@ -1398,6 +1600,20 @@ class DominaiteClient
         $normalized = trim($refundId);
         if (preg_match(self::PAYMENT_METHOD_ID_PATTERN, $normalized) !== 1) {
             throw new \InvalidArgumentException('refundId must be the refundId createRefund() returned');
+        }
+
+        return $normalized;
+    }
+
+    /**
+     * Same guard as a payment method id, for the plan_ and agr_ ids: one segment of the
+     * signed path, sent verbatim, because the API reads them case-sensitively.
+     */
+    private static function normalizeHandle(string $handle, string $name, string $source): string
+    {
+        $normalized = trim($handle);
+        if (preg_match(self::PAYMENT_METHOD_ID_PATTERN, $normalized) !== 1) {
+            throw new \InvalidArgumentException("{$name} must be the id {$source} returned");
         }
 
         return $normalized;
