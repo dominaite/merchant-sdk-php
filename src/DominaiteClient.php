@@ -74,7 +74,7 @@ class DominaiteClient
     public const TRANSACTIONS_PATH = '/merchant-api/transactions';
     /** The public integration contract. It needs no key; the SDK signs it like ping. */
     public const INTEGRATION_CONTRACT_PATH = '/merchant-api/integration/contract';
-    private const USER_AGENT = 'dominaite-php/0.4.0 (php ' . PHP_VERSION . ')';
+    private const USER_AGENT = 'dominaite-php/0.5.0 (php ' . PHP_VERSION . ')';
     private const TIMEOUT_SECONDS = 15;
 
     /**
