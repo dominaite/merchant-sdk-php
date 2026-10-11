@@ -9,12 +9,12 @@ declare(strict_types=1);
 
 $path = (string) parse_url((string) ($_SERVER['REQUEST_URI'] ?? '/'), PHP_URL_PATH);
 
-// The stored-payment-method, refund and contract routes record the request exactly as it arrived -
+// The stored-payment-method, refund, contract and transaction routes record the request exactly as it arrived -
 // method, path, body bytes and the signed headers - so the transport test can recompute
 // the signature over what actually went on the wire. Written to a file because the revoke
 // answer is a 204 with no body to echo into.
 if (strpos($path, '/merchant-api/payment-methods/') === 0 || strpos($path, '/merchant-api/payments/') === 0
-    || $path === '/merchant-api/integration/contract') {
+    || $path === '/merchant-api/integration/contract' || $path === '/merchant-api/transactions') {
     $headers = [];
     foreach ($_SERVER as $name => $value) {
         if (strpos($name, 'HTTP_') === 0) {
@@ -26,6 +26,7 @@ if (strpos($path, '/merchant-api/payment-methods/') === 0 || strpos($path, '/mer
         json_encode([
             'method' => $_SERVER['REQUEST_METHOD'] ?? '',
             'path' => $path,
+            'query' => (string) parse_url((string) ($_SERVER['REQUEST_URI'] ?? '/'), PHP_URL_QUERY),
             'body' => (string) file_get_contents('php://input'),
             'headers' => $headers,
         ])
@@ -60,6 +61,18 @@ if (strpos($path, '/merchant-api/payment-methods/') === 0 || strpos($path, '/mer
         echo json_encode([
             'success' => true,
             'data' => ['version' => '2026-10-01', 'sdks' => ['node', 'python', 'php', 'go', 'dotnet', 'rust']],
+            'metadata' => ['requestId' => 'live', 'timestamp' => '2026-10-11T09:00:00Z', 'apiVersion' => '1.0', 'processingTimeMs' => 1],
+        ]);
+        return true;
+    }
+
+    // The transaction list answers one page whatever the query; the test reads the query back.
+    if (($_SERVER['REQUEST_METHOD'] ?? '') === 'GET' && $path === '/merchant-api/transactions') {
+        http_response_code(200);
+        header('Content-Type: application/json');
+        echo json_encode([
+            'success' => true,
+            'data' => ['items' => [], 'nextCursor' => null],
             'metadata' => ['requestId' => 'live', 'timestamp' => '2026-10-11T09:00:00Z', 'apiVersion' => '1.0', 'processingTimeMs' => 1],
         ]);
         return true;

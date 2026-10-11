@@ -67,6 +67,11 @@ class DominaiteClient
      * removes one - signed with the lowercase hyphenated id. Needs the webhooks:manage scope.
      */
     public const WEBHOOKS_PATH = '/merchant-api/webhooks';
+    /**
+     * Canonical path of the transaction list. GET only. The query string is sent in the URL
+     * and is never part of the signature. Needs the transactions:read scope.
+     */
+    public const TRANSACTIONS_PATH = '/merchant-api/transactions';
     /** The public integration contract. It needs no key; the SDK signs it like ping. */
     public const INTEGRATION_CONTRACT_PATH = '/merchant-api/integration/contract';
     private const USER_AGENT = 'dominaite-php/0.4.0 (php ' . PHP_VERSION . ')';
@@ -1544,6 +1549,68 @@ class DominaiteClient
     }
 
     /**
+     * Lists your card-not-present payments in a time window, one page at a time:
+     * {items, nextCursor}.
+     *
+     * Needs a key with the transactions:read scope. A key with the payments scope never
+     * holds it, so use a separate reporting key. Any other key gets an
+     * AuthenticationException (403 INSUFFICIENT_SCOPE).
+     *
+     * Required params: from (inclusive) and to (exclusive), ISO 8601 UTC, at most 31 days
+     * apart. Use the Z form, for example gmdate('Y-m-d\TH:i:s\Z', $unixTime). The window is
+     * on createdAt. Optional: status (only payments now in this status, a value of
+     * STATUS_VOCABULARY), limit (1-100, default 50) and cursor (the nextCursor of the
+     * previous page, unchanged). A null value is left out. Any other key is sent as it is.
+     * Every value must be a string or an int: the SDK sends them in the query string, which
+     * is never part of the signature. The API checks the values; the SDK does not.
+     *
+     * Rows come oldest first. To read the whole window, send nextCursor back as cursor with
+     * the same from, to and status until nextCursor is null. Paging never repeats or skips
+     * a row. A refund is not a row of its own: it shows on its payment as refundedAmount
+     * and status. type is payment, charge or verification (a verifyOnly session saved a
+     * card; leave it out of revenue). A type or status not in these lists is a new value,
+     * not an error. The API omits orderReference, completedAt, storedPaymentMethodId and
+     * refundedAmount when it has no value; they read as null here.
+     *
+     * @param array<string,string|int|null> $params
+     * @return array{items:list<array{transactionId:string,orderReference:?string,type:string,status:string,amount:int,currency:string,createdAt:string,completedAt:?string,storedPaymentMethodId:?string,refundedAmount:?int}>,nextCursor:?string}
+     *
+     * @throws AuthenticationException Bad credentials or signature (401), or a key without transactions:read (403).
+     * @throws ApiException            Validation (HTTP 400): a missing or malformed from, to, status, limit or cursor.
+     * @throws RateLimitException     HTTP 429 - back off (getRetryAfterSeconds()).
+     * @throws TransportException      Network-level failure or a 5xx (safe to retry).
+     */
+    public function listTransactions(array $params): array
+    {
+        foreach ($params as $name => $value) {
+            if ($value === null) {
+                unset($params[$name]);
+            } elseif (!is_string($value) && !is_int($value)) {
+                throw new \InvalidArgumentException("{$name} must be a string or an int: it is sent in the query string");
+            }
+        }
+        // RFC 3986 encoding: a + in a time offset goes out as %2B, never as a space.
+        $query = http_build_query($params, '', '&', PHP_QUERY_RFC3986);
+
+        // GET signs an EMPTY idempotency key and an EMPTY body; send() leaves the query out.
+        $reply = $this->send('GET', self::TRANSACTIONS_PATH . ($query === '' ? '' : '?' . $query), null, '');
+        $page = self::settle($reply);
+        if (!is_array($page['items'] ?? null)) {
+            throw new ApiException($reply['status'], 'The API answered without a transaction page', 'UNEXPECTED_RESPONSE');
+        }
+        $page['items'] = array_map(static function (array $item): array {
+            foreach (['orderReference', 'completedAt', 'storedPaymentMethodId', 'refundedAmount'] as $nullable) {
+                $item[$nullable] = $item[$nullable] ?? null;
+            }
+
+            return $item;
+        }, array_values($page['items']));
+        $page['nextCursor'] = $page['nextCursor'] ?? null;
+
+        return $page;
+    }
+
+    /**
      * The plan as one shape: the API omits periodCount, cancelUrl and archivedAt when they
      * are null, so absent reads as null. Everything the API sends is carried through as sent.
      *
@@ -2010,8 +2077,13 @@ class DominaiteClient
             }
         }
 
+        // The signature covers the route's own path, never a query string: the API signs
+        // its canonical path, not the URL it received. Only listTransactions() sends one.
+        $queryAt = strpos($path, '?');
+        $signedPath = $queryAt === false ? $path : substr($path, 0, $queryAt);
+
         $timestamp = (string) time();
-        $signature = $this->sign($timestamp, $method, $path, $idempotencyKey, $json);
+        $signature = $this->sign($timestamp, $method, $signedPath, $idempotencyKey, $json);
 
         $headers = [
             'Content-Type: application/json',

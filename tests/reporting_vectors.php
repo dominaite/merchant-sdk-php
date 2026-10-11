@@ -245,4 +245,75 @@ foreach (['', 'wh_123', '3f2c9a1e0b7d4c559a8e1d2f3a4b5c6d', '{' . WEBHOOK_ID . '
         }) . ' ' . count($client->calls), \InvalidArgumentException::class . ' 0');
 }
 
+// --- listTransactions -----------------------------------------------------------------------
+// As the gateway sends a page: a payment with nothing optional, a refunded charge, and a
+// verification, which the API added after this SDK knew only payments and charges.
+$page = ['items' => [
+    ['transactionId' => '1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d', 'type' => 'payment', 'status' => 'pending', 'amount' => 2500,
+        'currency' => 'EUR', 'createdAt' => '2026-10-01T08:00:00Z'],
+    ['transactionId' => '2a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d', 'orderReference' => 'order-1043', 'type' => 'charge',
+        'status' => 'partially_refunded', 'amount' => 2500, 'currency' => 'EUR', 'createdAt' => '2026-10-01T09:00:00Z',
+        'completedAt' => '2026-10-01T09:00:02Z', 'storedPaymentMethodId' => 'pm_0123456789abcdef0123456789abcdef',
+        'refundedAmount' => 500],
+    ['transactionId' => '3a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d', 'type' => 'verification', 'status' => 'cancelled',
+        'amount' => 30, 'currency' => 'EUR', 'createdAt' => '2026-10-01T10:00:00Z', 'futureField' => 'kept'],
+], 'nextCursor' => 'eyJjIjoiMjAyNi0xMC0wMVQxMDowMDowMFoifQ'];
+const TX_ITEM_FIELDS = 'amount,completedAt,createdAt,currency,orderReference,refundedAmount,status,storedPaymentMethodId,transactionId,type';
+
+$client = new RecordingClient(envelope($page));
+$listed = $client->listTransactions(['from' => '2026-10-01T00:00:00Z', 'to' => '2026-10-08T00:00:00Z',
+    'status' => 'succeeded', 'limit' => 100, 'cursor' => null, 'futureFilter' => 'x']);
+check('the transactions path is the published one', DominaiteClient::TRANSACTIONS_PATH, '/merchant-api/transactions');
+check('listTransactions sends the params in the query, a null cursor left out', $client->calls[0]['method'] . ' ' . $client->calls[0]['path'],
+    'GET /merchant-api/transactions?from=2026-10-01T00%3A00%3A00Z&to=2026-10-08T00%3A00%3A00Z&status=succeeded&limit=100'
+    . '&futureFilter=x');
+check('listTransactions signs an empty key and an empty body',
+    var_export($client->calls[0]['key'], true) . ' ' . var_export($client->calls[0]['body'], true), "'' NULL");
+check('listTransactions leaves the last key untouched', var_export($client->getLastIdempotencyKey(), true), 'NULL');
+check('the page keeps the API order', implode(',', array_column($listed['items'], 'type')), 'payment,charge,verification');
+check('every item has every field',
+    implode(' | ', array_map('keysOf', array_map(static function (array $item): array {
+        unset($item['futureField']);
+        return $item;
+    }, $listed['items']))), TX_ITEM_FIELDS . ' | ' . TX_ITEM_FIELDS . ' | ' . TX_ITEM_FIELDS);
+foreach (['orderReference', 'completedAt', 'storedPaymentMethodId', 'refundedAmount'] as $nullable) {
+    check("an item reads the omitted $nullable as null", var_export($listed['items'][0][$nullable], true), 'NULL');
+}
+check('a refunded charge carries its card and refunded amount',
+    $listed['items'][1]['storedPaymentMethodId'] . ' ' . $listed['items'][1]['refundedAmount'], 'pm_0123456789abcdef0123456789abcdef 500');
+check('an item field the SDK does not model rides through', (string) ($listed['items'][2]['futureField'] ?? 'missing'), 'kept');
+check('the page carries the next cursor', (string) $listed['nextCursor'], 'eyJjIjoiMjAyNi0xMC0wMVQxMDowMDowMFoifQ');
+
+// The last page has a null cursor; an offset's + goes out encoded, never as a space.
+$client = new RecordingClient(envelope(['items' => [], 'nextCursor' => null]));
+$last = $client->listTransactions(['from' => '2026-10-01T02:00:00+02:00', 'to' => '2026-10-02']);
+check('an offset + is sent as %2B', $client->calls[0]['path'],
+    '/merchant-api/transactions?from=2026-10-01T02%3A00%3A00%2B02%3A00&to=2026-10-02');
+check('the last page has a null cursor', var_export($last['nextCursor'], true), 'NULL');
+check('an empty window is an empty items array', (string) json_encode($last['items']), '[]');
+
+// Values that cannot go into a query string are refused before anything is signed.
+foreach (['a DateTime' => new \DateTimeImmutable('2026-10-01T00:00:00Z'), 'an array' => ['succeeded'], 'a bool' => true,
+    'a float' => 50.0] as $label => $value) {
+    $client = new RecordingClient(envelope($page));
+    check("listTransactions refuses $label",
+        thrownBy(static function () use ($client, $value): void {
+            $client->listTransactions(['from' => $value, 'to' => '2026-10-08T00:00:00Z']);
+        }) . ' ' . count($client->calls), \InvalidArgumentException::class . ' 0');
+}
+
+check('listTransactions 400 VALIDATION_ERROR',
+    refusal(caught(static function (): void {
+        (new RecordingClient(failure(400, 'VALIDATION_ERROR'), 400))->listTransactions(['from' => 'yesterday']);
+    })), ApiException::class . ' 400 VALIDATION_ERROR');
+check('listTransactions with a payments key is a 403',
+    refusal(caught(static function (): void {
+        (new RecordingClient(failure(403, 'INSUFFICIENT_SCOPE'), 403))
+            ->listTransactions(['from' => '2026-10-01T00:00:00Z', 'to' => '2026-10-08T00:00:00Z']);
+    })), AuthenticationException::class . ' 403 INSUFFICIENT_SCOPE');
+check('a 200 without items is an ApiException',
+    refusal(caught(static function (): void {
+        (new RecordingClient(envelope(['nextCursor' => null])))->listTransactions(['from' => 'a', 'to' => 'b']);
+    })), ApiException::class . ' 200 UNEXPECTED_RESPONSE');
+
 exit($failures === 0 ? 0 : 1);
