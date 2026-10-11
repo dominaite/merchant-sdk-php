@@ -799,8 +799,8 @@ customer on one plan. Every payments key can create plans and agreements.
 
 Subscription sessions and scheduled charges are two separate switches: ask us (Dominaite
 support) for both. Until we switch subscription sessions on, a session with `agreementId`
-answers `SUBSCRIPTIONS_NOT_ENABLED`. The SDK then throws `CheckoutRefusedException`, and the
-agreement stays `pending`. With scheduled charges on, the platform charges the saved card once
+answers `SUBSCRIPTIONS_NOT_ENABLED`, and the agreement stays `pending`.
+With scheduled charges on, the platform charges the saved card once
 per period, and you do not call `chargePaymentMethod()` for these charges. Until we switch
 scheduled charges on, the platform runs no scheduled charge and no retry.
 
