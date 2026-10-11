@@ -837,7 +837,10 @@ class DominaiteClient
      *
      * Required params: amount (int, MINOR units), currency (ISO 4217), orderReference
      * (<= 100 chars), idempotencyKey (a missing key throws InvalidArgumentException before
-     * anything is sent). Optional: description.
+     * anything is sent). Optional: description, agreementId (the agr_ handle of the
+     * agreement the charge is made under: it must be yours, linked to this payment method
+     * and carry consent, and the amount must fit the agreement). Any other key is sent as
+     * it is, after these.
      *
      * The HTTP status is the contract on this route. 201 (200 on a replay) returns the
      * charge, status 'succeeded', 'pending' or 'cancelled'. 402 returns the charge too:
@@ -848,8 +851,14 @@ class DominaiteClient
      * declineCode are null unless the charge was declined; the gateway omits them on
      * the wire and the SDK reads absent as null.
      *
+     * agreementId is the agr_ handle the charge was made under, when the request named one.
+     * sequence is the charge's outcome counter as of this answer: data.sequence of its
+     * charge.succeeded or charge.failed event, 0 while pending. A replay answers the first
+     * response as it was, so for the current state read getStatus(). Older gateways do not
+     * send these keys, so read them with ?? null.
+     *
      * @param array<string,mixed> $params
-     * @return array{chargeId:string,status:string,declineClass:?string,declineCode:?string,transactionId:string}
+     * @return array{chargeId:string,status:string,declineClass:?string,declineCode:?string,transactionId:string,agreementId?:?string,sequence?:int}
      *
      * @throws ChargeException         409, 422, 502 or 503 with a code (CHARGE_ERROR_CODES): branch on
      *                                 getErrorCode(). CHARGE_OUTCOME_UNKNOWN carries the charge row
@@ -868,21 +877,28 @@ class DominaiteClient
 
         $id = self::normalizePaymentMethodId($paymentMethodId);
         self::validateMoneyParams($params);
-        if (array_key_exists('description', $params) && !is_string($params['description'])) {
-            throw new \InvalidArgumentException('description must be a string');
+        foreach (['description', 'agreementId'] as $optional) {
+            if (array_key_exists($optional, $params) && !is_string($params[$optional])) {
+                throw new \InvalidArgumentException("{$optional} must be a string");
+            }
         }
         $idempotencyKey = self::normalizeIdempotencyKey($params['idempotencyKey'] ?? null);
+        unset($params['idempotencyKey']);
 
-        // Built field by field, not passed through: the body is what gets signed, and the
-        // contract for this route is exactly these fields in this order.
+        // The contract's fields first, in the contract's order, then any other key as the
+        // caller sent it, so a field the API adds later needs no SDK update. The body is
+        // what gets signed, so this code fixes the order of the known fields.
         $body = [
             'amount' => $params['amount'],
             'currency' => $params['currency'],
             'orderReference' => $params['orderReference'],
         ];
-        if (array_key_exists('description', $params)) {
-            $body['description'] = $params['description'];
+        foreach (['description', 'agreementId'] as $optional) {
+            if (array_key_exists($optional, $params)) {
+                $body[$optional] = $params[$optional];
+            }
         }
+        $body += $params;
 
         $this->lastIdempotencyKey = $idempotencyKey;
 

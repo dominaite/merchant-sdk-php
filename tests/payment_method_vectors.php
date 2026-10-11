@@ -47,6 +47,7 @@ const SECRET = 'dms_0123456789abcdef0123456789abcdef0123456789abcdef0123456789ab
 const PAYMENT_METHOD_ID = 'pm_0123456789abcdef0123456789abcdef';
 const CHARGE_BODY = '{"amount":2500,"currency":"EUR","orderReference":"order-1043"}';
 const CHARGE_KEY = '00000000-0000-4000-8000-000000000003';
+const AGREEMENT_ID = 'agr_0123456789abcdef0123456789abcdef';
 
 /**
  * Records what reached the transport and answers with a canned gateway body under a
@@ -229,16 +230,32 @@ check('charge body is the vector body byte for byte', encode($client->calls[0]['
 check('charge sends the caller idempotency key', $client->calls[0]['key'], CHARGE_KEY);
 check('charge idempotency key is readable afterwards', (string) $client->getLastIdempotencyKey(), CHARGE_KEY);
 
-// Only the contract's fields reach the body, in the contract's order, description last.
+// The contract's fields go first, in the contract's order. Any other key follows as the
+// caller sent it, so a field the API adds later needs no SDK update.
 $client = new RecordingClient($charge);
 $client->chargePaymentMethod(PAYMENT_METHOD_ID, [
-    'orderReference' => 'order-1043', 'description' => 'Monthly plan', 'currency' => 'EUR', 'amount' => 2500,
-    'customer' => ['email' => 'not-on-this-route'], 'idempotencyKey' => CHARGE_KEY,
+    'futureField' => ['nested' => true], 'orderReference' => 'order-1043', 'agreementId' => AGREEMENT_ID,
+    'description' => 'Monthly plan', 'currency' => 'EUR', 'amount' => 2500, 'idempotencyKey' => CHARGE_KEY,
+    'anotherField' => 'x',
 ]);
-check('charge body is built field by field in contract order', encode($client->calls[0]['body']),
-    '{"amount":2500,"currency":"EUR","orderReference":"order-1043","description":"Monthly plan"}');
+check('charge body is the known fields in contract order, then the rest as sent', encode($client->calls[0]['body']),
+    '{"amount":2500,"currency":"EUR","orderReference":"order-1043","description":"Monthly plan","agreementId":"'
+    . AGREEMENT_ID . '","futureField":{"nested":true},"anotherField":"x"}');
 check('the idempotency key rides the header, never the charge body',
     array_key_exists('idempotencyKey', $client->calls[0]['body']) ? 'leaked' : 'absent', 'absent');
+
+// A charge under an agreement says so, with the outcome counter. Both pass through as sent.
+$agreementCharge = $charge;
+$agreementCharge['data']['agreementId'] = AGREEMENT_ID;
+$agreementCharge['data']['sequence'] = 2;
+$client = new RecordingClient($agreementCharge, 201);
+$result = $client->chargePaymentMethod(PAYMENT_METHOD_ID, $chargeParams + ['agreementId' => AGREEMENT_ID]);
+check('charge reads the agreementId it was made under', (string) ($result['agreementId'] ?? 'absent'), AGREEMENT_ID);
+check('charge reads the outcome counter', var_export($result['sequence'] ?? 'absent', true), '2');
+$client = new RecordingClient($charge, 201);
+$result = $client->chargePaymentMethod(PAYMENT_METHOD_ID, $chargeParams);
+check('a charge from a gateway without agreementId and sequence does not invent them',
+    var_export(array_key_exists('agreementId', $result) || array_key_exists('sequence', $result), true), 'false');
 
 // --- chargePaymentMethod: declines are results, refusals are typed exceptions ----------
 // A 402 says success=false and CHARGE_DECLINED, but the charge is right there with its
@@ -350,6 +367,8 @@ $cases = [
     'empty orderReference' => ['orderReference' => ''],
     'orderReference too long' => ['orderReference' => str_repeat('x', 101)],
     'non-string description' => ['description' => 7],
+    'non-string agreementId' => ['agreementId' => 7],
+    'null agreementId' => ['agreementId' => null],
     'empty idempotencyKey' => ['idempotencyKey' => ''],
     'idempotencyKey too long' => ['idempotencyKey' => str_repeat('k', 101)],
     'idempotencyKey with CRLF' => ['idempotencyKey' => "order-1\r\nX-Forwarded-For: 1.2.3.4"],
