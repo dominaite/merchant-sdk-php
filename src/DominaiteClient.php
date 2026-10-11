@@ -1250,11 +1250,12 @@ class DominaiteClient
      * Creates a subscription plan: the price and the billing interval that agreements are
      * made from.
      *
-     * Required params: name (1-100 characters), amount (int, MINOR units, charged every
-     * period), currency (ISO 4217), intervalUnit (day, week, month or year) and
-     * idempotencyKey. Optional: intervalCount (units per period, default 1; the period is at
-     * most one year), periodCount (agreements complete after this many periods; leave it
-     * out to bill until cancelled), trialDays (0-365) and cancelUrl (your https page where
+     * Required params: name (1-100 characters), amount (int, MINOR units; with scheduled
+     * charges on, the platform charges it once per period), currency (ISO 4217),
+     * intervalUnit (day, week, month or year) and idempotencyKey. Optional: intervalCount
+     * (units per period, default 1; the period is at most one year), periodCount
+     * (agreements complete after this many periods; leave it out for an agreement that
+     * runs until cancelled), trialDays (0-365) and cancelUrl (your https page where
      * the customer cancels; the platform prints it on every receipt it emails). Any other
      * key is sent as it is, so a field the API adds later needs no SDK update. The API
      * checks the values; the SDK does not.
