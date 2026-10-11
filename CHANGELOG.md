@@ -28,11 +28,11 @@ Added:
   `transactions:read` key: one page of your payments, oldest first, and the `nextCursor` of the
   next page. The SDK signs the path without the query.
 - `getIntegrationContract()`: the contract that the API publishes about itself, as sent.
-- Response fields: `getStatus()` documents `verifyOnly`, `declineClass`, `isRecurring`,
-  `agreement` and `sequence`, and reads an omitted `agreement.nextChargeAt` as null. The session
-  documents `verifyOnly` and `agreementId`, and the charge documents `agreementId` and
-  `sequence`. Every status, class and reason stays a plain string, so a value the SDK does not
-  know never throws.
+- Response fields: `verifyOnly`, `declineClass`, `isRecurring`, `agreement` and `sequence` in
+  the `getStatus()` shape, which reads an omitted `agreement.nextChargeAt` as null. `verifyOnly`
+  and `agreementId` on the checkout session. `agreementId` and `sequence` on the charge, which
+  reads an omitted `agreementId` as null. Every status, class and reason stays a plain string,
+  so a value the SDK does not know never throws.
 - `agreementId` on `chargePaymentMethod()`.
 - Errors: `ApiException::getResult()` on every API error, the whole JSON answer, for example
   `error.params.webhookId` on 409 `WEBHOOK_ALREADY_REGISTERED`. `RateLimitException` carries the
@@ -42,7 +42,8 @@ Added:
   lists the 403 authorization group, pinned against the wire contract. `PLANS_PATH`,
   `AGREEMENTS_PATH`, `WEBHOOKS_PATH`, `TRANSACTIONS_PATH` and `INTEGRATION_CONTRACT_PATH` name the
   new routes.
-- Wire contract fixture: refreshed from the API, with the authorization error group.
+- Contract fixture: the new status read, checkout session and charge fields, with examples.
+  Wire contract fixture: refreshed from the API, with the authorization error group.
 - Wallet reporting: `paymentMethod` and `walletType` on `getStatus()`, both optional and
   nullable strings. `paymentMethod` is `card`, `wallet`, `bank_transfer` or `sepa`;
   `walletType` names the wallet when `paymentMethod` is `wallet`, and an unknown value is a

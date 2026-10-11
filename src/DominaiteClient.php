@@ -853,7 +853,7 @@ class DominaiteClient
      *   before the first charge.* event.
      *
      * @param string $transactionId The transactionId returned by createCheckoutSession().
-     * @return array{transactionId:string,orderId:string,orderReference:?string,pspReference?:?string,status:string,amount:int,currency:string,refundedAmount:?int,paymentMethod?:?string,walletType?:?string,createdAt:string,updatedAt:?string,expiresAt:?string,storedPaymentMethod?:?array{id:string,brand:?string,last4:?string,expiryMonth:?int,expiryYear:?int,status:string,retiredReason:?string}}
+     * @return array{transactionId:string,orderId:string,orderReference:?string,pspReference?:?string,status:string,amount:int,currency:string,refundedAmount:?int,paymentMethod?:?string,walletType?:?string,declineClass?:?string,isRecurring?:bool,verifyOnly?:bool,createdAt:string,updatedAt:?string,expiresAt:?string,storedPaymentMethod?:?array{id:string,brand:?string,last4:?string,expiryMonth:?int,expiryYear:?int,status:string,retiredReason:?string},agreement?:?array{id:string,status:string,nextChargeAt:?string},sequence?:int}
      *
      * @throws AuthenticationException Wrong/revoked credentials or bad signature (fix config; do not retry).
      * @throws ApiException            Unknown transaction id (HTTP 404) or unexpected response.
@@ -930,14 +930,14 @@ class DominaiteClient
      * declined; the gateway omits null fields on the wire and the SDK reads absent as
      * null.
      *
-     * agreementId is the agr_ handle the charge was made under, when the request named one.
-     * sequence is the charge's outcome counter as of this answer: data.sequence of its
-     * charge.succeeded or charge.failed event, 0 while pending. A replay answers the first
-     * response as it was, so for the current state read getStatus(). Older gateways do not
-     * send these keys, so read them with ?? null.
+     * agreementId is the agr_ handle the charge was made under, and null when the request
+     * named none. sequence is the charge's outcome counter as of this answer: data.sequence
+     * of its charge.succeeded or charge.failed event, 0 while pending. A replay answers the
+     * first response as it was, so for the current state read getStatus(). Older gateways
+     * do not send sequence, so read it with ?? 0.
      *
      * @param array<string,mixed> $params
-     * @return array{chargeId:string,status:string,declineClass:?string,declineCode:?string,transactionId:string,agreementId?:?string,sequence?:int}
+     * @return array{chargeId:string,status:string,declineClass:?string,declineCode:?string,transactionId:string,agreementId:?string,sequence?:int}
      *
      * @throws ChargeException         409, 422, 502 or 503 with a code (CHARGE_ERROR_CODES): branch on
      *                                 getErrorCode(). CHARGE_OUTCOME_UNKNOWN carries the charge row
@@ -2324,8 +2324,9 @@ class DominaiteClient
 
     /**
      * The charge body as one shape: the gateway omits declineClass and declineCode when
-     * they are null (every 201, and a 502 CHARGE_FAILED row), so absent reads as null.
-     * Anything else the gateway sends is carried through.
+     * they are null (every 201, and a 502 CHARGE_FAILED row), and agreementId on a charge
+     * that named no agreement, so absent reads as null. Anything else the gateway sends is
+     * carried through.
      *
      * @param array<string,mixed> $data
      * @return array<string,mixed>
@@ -2337,6 +2338,7 @@ class DominaiteClient
         $data['declineClass'] = is_string($data['declineClass'] ?? null) ? $data['declineClass'] : null;
         $data['declineCode'] = is_string($data['declineCode'] ?? null) ? $data['declineCode'] : null;
         $data['transactionId'] = (string) ($data['transactionId'] ?? '');
+        $data['agreementId'] = is_string($data['agreementId'] ?? null) ? $data['agreementId'] : null;
 
         return $data;
     }

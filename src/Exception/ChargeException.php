@@ -62,7 +62,8 @@ class ChargeException extends \RuntimeException
 
     /**
      * The charge row the gateway attached to its answer: {chargeId, status, declineClass,
-     * declineCode, transactionId}. Null when it attached none.
+     * declineCode, transactionId, agreementId}, and sequence when the API sent it. Null
+     * when it attached none.
      *
      * @return array<string,mixed>|null
      */

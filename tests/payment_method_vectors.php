@@ -260,7 +260,8 @@ check('charge body is the known fields in contract order, then the rest as sent'
 check('the idempotency key rides the header, never the charge body',
     array_key_exists('idempotencyKey', $client->calls[0]['body']) ? 'leaked' : 'absent', 'absent');
 
-// A charge under an agreement says so, with the outcome counter. Both pass through as sent.
+// A charge under an agreement says so, with the outcome counter. The API leaves agreementId
+// out on a charge that named no agreement, and the SDK reads it as null.
 $agreementCharge = $charge;
 $agreementCharge['data']['agreementId'] = AGREEMENT_ID;
 $agreementCharge['data']['sequence'] = 2;
@@ -270,8 +271,10 @@ check('charge reads the agreementId it was made under', (string) ($result['agree
 check('charge reads the outcome counter', var_export($result['sequence'] ?? 'absent', true), '2');
 $client = new RecordingClient($charge, 201);
 $result = $client->chargePaymentMethod(PAYMENT_METHOD_ID, $chargeParams);
-check('a charge from a gateway without agreementId and sequence does not invent them',
-    var_export(array_key_exists('agreementId', $result) || array_key_exists('sequence', $result), true), 'false');
+check('a charge without agreementId on the wire reads it as null',
+    array_key_exists('agreementId', $result) ? var_export($result['agreementId'], true) : 'absent', 'NULL');
+check('a charge from a gateway without sequence does not invent it',
+    var_export(array_key_exists('sequence', $result), true), 'false');
 
 // --- chargePaymentMethod: declines are results, refusals are typed exceptions ----------
 // A 402 says success=false and CHARGE_DECLINED, but the charge is right there with its
