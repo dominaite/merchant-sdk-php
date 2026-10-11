@@ -70,14 +70,33 @@ Each key holds scopes. The scopes decide which routes the key can call:
 - `webhooks:manage`: `createWebhookEndpoint()`, `listWebhookEndpoints()` and
   `deleteWebhookEndpoint()`.
 
-A `payments` key never holds the other two scopes. Use a separate reporting key for them, in
-a second client. A reporting key covers your whole account, not one storefront. The scopes of
-a key never change: for other scopes you need a new key. Every key can call `ping()` and
-`getIntegrationContract()`.
+A `payments` key never holds the other two scopes. A payments key always gets HTTP 403
+`INSUFFICIENT_SCOPE` on the methods of those scopes. Use a separate reporting key for them, in
+a second client. If your dashboard has no reporting key section, ask us (Dominaite support)
+for the key. A reporting key covers your whole account. We cannot bind it to a storefront or
+a location. The scopes of a key never change: for other scopes you need a new key. Every key
+can call `ping()` and `getIntegrationContract()`.
 
 A key without the scope of a route gets HTTP 403 `INSUFFICIENT_SCOPE`, and the SDK throws
 `AuthenticationException`. Its message says that the scope is the problem. The signature was
 valid, so your key id, secret and clock are not the cause. Only a 401 points at those three.
+
+## What we switch on for your account
+
+These features work only after we switch them on for your account: ask us (Dominaite support).
+
+- Stored-card charges: `chargePaymentMethod()`. Without this switch, the API answers HTTP 503
+  `PAYMENT_METHOD_CHARGES_DISABLED`.
+- Subscription sessions. Without this switch, a session with `agreementId` answers
+  `success=false` with `SUBSCRIPTIONS_NOT_ENABLED`.
+- Scheduled charges. Without this switch, the platform runs no scheduled charge and no retry,
+  even when the subscription session works.
+- Verify-only: a session with `'verifyOnly' => true`. Without this switch, the API answers
+  HTTP 403 `VERIFY_ONLY_NOT_ENABLED`.
+- Card fields: enabled per merchant on request (see "Card fields").
+
+The webhook endpoint methods and `listTransactions()` need a second key, the reporting key (see
+"Scopes" above). A payments key always gets HTTP 403 `INSUFFICIENT_SCOPE` on these methods.
 
 ## Ping before your first session
 
@@ -204,7 +223,7 @@ the payment happened.
 
 Register an endpoint in the dashboard (Developers, Webhooks): an HTTPS URL, the events you
 want, and you get a signing secret `whsec_...` shown exactly once. Store it like the API
-secret. Regenerating it kills the old one.
+secret. Regenerating it kills the old one. The dashboard page needs no API key.
 
 ### Manage endpoints from your server
 
@@ -624,6 +643,13 @@ the `brand`, the `last4` and the expiry, and that `id` is what you charge and re
 it against your customer. (`paymentMethod` on the same status is something else: the gateway's
 string category of how the payer paid, `card`, `wallet` and so on.)
 
+`saveCard` works on every account. `chargePaymentMethod()` works only after we switch
+stored-card charges on for your account. Until then, the API answers HTTP 503
+`PAYMENT_METHOD_CHARGES_DISABLED`. The API also answers this code when we pause charges for a
+short time. The code is the same in both cases. If we never switched stored-card charges on
+for your account, a retry does not help: ask us (Dominaite support). If they are on, retry
+later with the same idempotency key.
+
 ```php
 use Dominaite\Exception\ChargeException;
 use Dominaite\Exception\RevokeException;
@@ -681,9 +707,13 @@ try {
             pollUntilSettled($e->getTransactionId());
             break;
         case 'DUPLICATE_REQUEST':
-        case 'PAYMENT_METHOD_CHARGES_DISABLED':
         case 'PAYMENT_PROCESSING_UNAVAILABLE':
             // Nothing was charged; retry later with the SAME idempotency key.
+            break;
+        case 'PAYMENT_METHOD_CHARGES_DISABLED':
+            // 503, nothing was charged. If we never switched stored-card charges on for your
+            // account, a retry does not help: ask us. If they are on, retry later with the
+            // SAME idempotency key.
             break;
         case 'PAYMENT_METHOD_NOT_ACTIVE':
             // Revoked or expired: bring the customer back for a hosted session with saveCard.
@@ -765,8 +795,14 @@ $session = $client->createCheckoutSession([
 ## Subscriptions: plans and agreements
 
 A plan is a price that repeats: an amount, a currency and an interval. An agreement puts one
-customer on one plan. The platform then charges the saved card once per period, so you do not
-call `chargePaymentMethod()` for these charges.
+customer on one plan. Every payments key can create plans and agreements.
+
+Subscription sessions and scheduled charges are two separate switches: ask us (Dominaite
+support) for both. Until we switch subscription sessions on, a session with `agreementId`
+answers `SUBSCRIPTIONS_NOT_ENABLED`, and the agreement stays `pending`.
+With scheduled charges on, the platform charges the saved card once
+per period, and you do not call `chargePaymentMethod()` for these charges. Until we switch
+scheduled charges on, the platform runs no scheduled charge and no retry.
 
 1. Create the plan once.
 2. Create an agreement for each customer. It starts `pending` and charges nothing.
@@ -827,6 +863,10 @@ or an abandoned session it stays `pending`. To follow the agreement after that, 
 of your own account can be refunded, any other id is `PAYMENT_NOT_FOUND`. A refund is always
 in the payment's currency, and the amount is in minor units by the same rules as a payment
 (see [Amounts are minor units](#amounts-are-minor-units)).
+
+`createRefund()` on a payment made on a terminal answers 404 `PAYMENT_NOT_FOUND`. You can
+refund at most the paid amount. Whoever holds your payments key can refund, so keep that key
+on your server.
 
 ```php
 use Dominaite\Exception\RefundException;

@@ -18,8 +18,11 @@ namespace Dominaite\Exception;
  * - DUPLICATE_REQUEST (409): a request with this key is still in flight; retry with the
  *   SAME key in a moment.
  * - IDEMPOTENCY_KEY_REUSED (422): same key, different body or method; a bug on your side.
- * - PAYMENT_METHOD_CHARGES_DISABLED, PAYMENT_PROCESSING_UNAVAILABLE (503): nothing was
- *   charged; retry later with the SAME key.
+ * - PAYMENT_PROCESSING_UNAVAILABLE (503): nothing was charged; retry later with the SAME
+ *   key.
+ * - PAYMENT_METHOD_CHARGES_DISABLED (503): nothing was charged. If we never switched
+ *   stored-card charges on for your account, a retry does not help: ask us. If they are
+ *   on, retry later with the SAME key.
  *
  * A decline (HTTP 402) is deliberately NOT this exception: chargePaymentMethod() returns
  * it as a charge with status 'failed'.
