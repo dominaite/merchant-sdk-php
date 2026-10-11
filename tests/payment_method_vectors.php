@@ -202,6 +202,22 @@ foreach ($verifyRefusals as $label => $params) {
         \InvalidArgumentException::class . ' after 0 calls');
 }
 
+// The status read of a verify-only session: verifyOnly true, the raw status, the card.
+// A one-off payment's read has no verifyOnly key at all, so ?? false reads it.
+$verifyStatus = ['transactionId' => '1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d', 'orderId' => 'ord_1',
+    'orderReference' => 'verify-customer-7', 'status' => 'requires_capture', 'amount' => 30, 'currency' => 'EUR',
+    'createdAt' => '2026-10-01T08:00:00Z', 'isRecurring' => false, 'verifyOnly' => true, 'sequence' => 0,
+    'storedPaymentMethod' => ['id' => PAYMENT_METHOD_ID, 'status' => 'active']];
+$read = (new RecordingClient(['success' => true, 'data' => $verifyStatus]))->getStatus('1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d');
+check('a verify-only status read carries verifyOnly true', var_export($read['verifyOnly'] ?? null, true), 'true');
+check('a verify-only status read keeps the raw status', (string) $read['status'], 'requires_capture');
+check('a verify-only status read carries the saved card', (string) ($read['storedPaymentMethod']['id'] ?? ''), PAYMENT_METHOD_ID);
+unset($verifyStatus['verifyOnly']);
+$read = (new RecordingClient(['success' => true, 'data' => $verifyStatus]))->getStatus('1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d');
+check('a status read without verifyOnly does not invent it', array_key_exists('verifyOnly', $read) ? 'invented' : 'absent', 'absent');
+check('and reads as false with ?? false', var_export($read['verifyOnly'] ?? false, true), 'false');
+check('a status read without declineClass does not invent it', array_key_exists('declineClass', $read) ? 'invented' : 'absent', 'absent');
+
 // Off until we switch it on for the account: a 403 with its own message.
 $client = new RecordingClient(['success' => false, 'error' => [
     'code' => 'VERIFY_ONLY_NOT_ENABLED', 'message' => 'Verify-only sessions are not enabled for this account.',

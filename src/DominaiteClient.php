@@ -767,8 +767,9 @@ class DominaiteClient
      *
      * It is a single slot on a client you can reuse, so the next createCheckoutSession(),
      * chargePaymentMethod(), createRefund(), createPlan(), createAgreement(),
-     * createWebhookEndpoint(), or updatePlan() with a key overwrites it. On a long-lived worker that means reading it in the catch block and
-     * storing it against your order, not going back for it later.
+     * createWebhookEndpoint(), or updatePlan() with a key overwrites it. On a long-lived
+     * worker that means reading it in the catch block and storing it against your order,
+     * not going back for it later.
      *
      * The routes that read or delete (ping(), getStatus(), getRefund(), listRefunds(),
      * revokePaymentMethod(), the plan, agreement and webhook endpoint reads, deletePlan(),
@@ -830,6 +831,27 @@ class DominaiteClient
      * refunds, captures and disputes exactly like a card payment. Older gateways do not
      * send the keys, so read them with ?? null.
      *
+     * The API also sends these fields. It leaves some of them out when they have no value,
+     * so read each one with ?? as shown:
+     * - declineClass ($status['declineClass'] ?? null): why a failed payment was declined,
+     *   a value of DECLINE_CLASS_VOCABULARY. Null while the payment is open, on every other
+     *   status, and on a failure that the platform cannot classify yet. A value not in the
+     *   list is a new class, not an error.
+     * - isRecurring ($status['isRecurring'] ?? false): true for a merchant-initiated charge
+     *   on a stored card (a recurring charge), false for a checkout session.
+     * - verifyOnly ($status['verifyOnly'] ?? false): true for a session created with
+     *   verifyOnly. Its status stays the raw status: requires_capture, then cancelled once
+     *   the hold is released. A non-null storedPaymentMethod is what says the card is
+     *   verified.
+     * - agreement ($status['agreement'] ?? null): {id, status, nextChargeAt} of the
+     *   subscription agreement this payment is for; null on a one-off payment. After a
+     *   subscription session it says whether the subscription started: status turns active
+     *   when the payment is approved, and stays pending after a decline or an abandoned
+     *   session. nextChargeAt reads as null when the API leaves it out.
+     * - sequence ($status['sequence'] ?? 0): data.sequence of the latest charge.* event about
+     *   this payment, to order this read against those events. 0 on a checkout payment and
+     *   before the first charge.* event.
+     *
      * @param string $transactionId The transactionId returned by createCheckoutSession().
      * @return array{transactionId:string,orderId:string,orderReference:?string,pspReference?:?string,status:string,amount:int,currency:string,refundedAmount:?int,paymentMethod?:?string,walletType?:?string,createdAt:string,updatedAt:?string,expiresAt:?string,storedPaymentMethod?:?array{id:string,brand:?string,last4:?string,expiryMonth:?int,expiryYear:?int,status:string,retiredReason:?string}}
      *
@@ -844,11 +866,15 @@ class DominaiteClient
 
         $status = $this->request('GET', self::SESSIONS_PATH . '/' . $normalized, null, '');
 
-        // Passed through as sent, except the card on file: the gateway omits its null
-        // fields on the wire, and the caller gets one shape for it, not two. When the
-        // gateway sent no storedPaymentMethod at all there is no key here either.
+        // Passed through as sent, except the card on file and the agreement: the gateway
+        // omits their null fields on the wire, and the caller gets one shape for each, not
+        // two. When the gateway sent no storedPaymentMethod or agreement at all there is
+        // no key here either.
         if (is_array($status['storedPaymentMethod'] ?? null)) {
             $status['storedPaymentMethod'] = self::storedPaymentMethod($status['storedPaymentMethod']);
+        }
+        if (is_array($status['agreement'] ?? null)) {
+            $status['agreement']['nextChargeAt'] = $status['agreement']['nextChargeAt'] ?? null;
         }
 
         return $status;

@@ -394,6 +394,32 @@ foreach ([[409, 'AGREEMENT_ENDED'], [404, 'AGREEMENT_NOT_FOUND'], [403, 'INSUFFI
         })), ($status === 403 ? AuthenticationException::class : ApiException::class) . " $status $code");
 }
 
+// The status read of a subscription session says whether the subscription started. The
+// agreement's nextChargeAt is left out while it is pending, and reads as null here.
+$sessionStatus = ['transactionId' => '1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d', 'orderId' => 'ord_1',
+    'orderReference' => 'subscription-42', 'status' => 'failed', 'amount' => 2500, 'currency' => 'EUR',
+    'createdAt' => '2026-10-01T08:00:00Z', 'declineClass' => 'soft_funds', 'isRecurring' => false, 'sequence' => 0,
+    'agreement' => ['id' => AGREEMENT_ID, 'status' => 'pending']];
+$read = (new RecordingClient(envelope($sessionStatus)))->getStatus('1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d');
+check('a subscription session read carries its agreement', keysOf((array) ($read['agreement'] ?? [])), 'id,nextChargeAt,status');
+check('a declined subscription session leaves the agreement pending', (string) $read['agreement']['status'], 'pending');
+check('a pending agreement reads the omitted nextChargeAt as null', var_export($read['agreement']['nextChargeAt'], true), 'NULL');
+check('the read carries why the payment was declined', (string) $read['declineClass'], 'soft_funds');
+check('a checkout payment is not recurring and has sequence 0',
+    var_export($read['isRecurring'], true) . ' ' . var_export($read['sequence'], true), 'false 0');
+
+$charged = array_merge($sessionStatus, ['status' => 'succeeded', 'isRecurring' => true, 'sequence' => 3,
+    'agreement' => ['id' => AGREEMENT_ID, 'status' => 'active', 'nextChargeAt' => '2026-12-01T08:00:00Z']]);
+unset($charged['declineClass']);
+$read = (new RecordingClient(envelope($charged)))->getStatus('1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d');
+check('a recurring charge read carries isRecurring and its sequence',
+    var_export($read['isRecurring'], true) . ' ' . var_export($read['sequence'], true), 'true 3');
+check('an active agreement keeps its next charge', (string) $read['agreement']['nextChargeAt'], '2026-12-01T08:00:00Z');
+check('a read without declineClass does not invent it', array_key_exists('declineClass', $read) ? 'invented' : 'absent', 'absent');
+unset($charged['agreement']);
+$read = (new RecordingClient(envelope($charged)))->getStatus('1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d');
+check('a one-off payment read has no agreement key', array_key_exists('agreement', $read) ? 'invented' : 'absent', 'absent');
+
 foreach (['', 'agr_1/x', 'agr_1?x=1', 'agr 1', str_repeat('a', 101)] as $bad) {
     $client = new RecordingClient(envelope($pending));
     foreach (['getAgreement', 'cancelAgreement'] as $route) {
