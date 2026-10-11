@@ -57,6 +57,11 @@ class DominaiteClient
      * and DELETE {id} read, change and archive one - all signed with the plan_ id verbatim.
      */
     public const PLANS_PATH = '/merchant-api/plans';
+    /**
+     * Canonical path of subscription agreements. POST creates one; GET and DELETE {id}
+     * read and cancel one - signed with the agr_ id verbatim.
+     */
+    public const AGREEMENTS_PATH = '/merchant-api/agreements';
     /** The public integration contract. It needs no key; the SDK signs it like ping. */
     public const INTEGRATION_CONTRACT_PATH = '/merchant-api/integration/contract';
     private const USER_AGENT = 'dominaite-php/0.4.0 (php ' . PHP_VERSION . ')';
@@ -732,7 +737,8 @@ class DominaiteClient
 
     /**
      * The idempotency key the last call that carries one sent: createCheckoutSession(),
-     * chargePaymentMethod(), createRefund(), createPlan(), or updatePlan() with a key.
+     * chargePaymentMethod(), createRefund(), createPlan(), createAgreement(), or
+     * updatePlan() with a key.
      * Always the one you passed: the SDK no longer generates keys.
      *
      * Handy in a generic catch block that did not keep the params around. On a timeout
@@ -750,13 +756,13 @@ class DominaiteClient
      * recent attempt that went out", never an older order's.
      *
      * It is a single slot on a client you can reuse, so the next createCheckoutSession(),
-     * chargePaymentMethod(), createRefund(), createPlan(), or updatePlan() with a key
-     * overwrites it. On a long-lived worker that means reading it in the catch block and
+     * chargePaymentMethod(), createRefund(), createPlan(), createAgreement(), or
+     * updatePlan() with a key overwrites it. On a long-lived worker that means reading it in the catch block and
      * storing it against your order, not going back for it later.
      *
      * The routes that read or delete (ping(), getStatus(), getRefund(), listRefunds(),
-     * revokePaymentMethod(), the plan reads and deletePlan()) sign an empty key by design
-     * and leave this untouched.
+     * revokePaymentMethod(), the plan and agreement reads, deletePlan() and
+     * cancelAgreement()) sign an empty key by design and leave this untouched.
      */
     public function getLastIdempotencyKey(): ?string
     {
@@ -1321,6 +1327,123 @@ class DominaiteClient
 
         // DELETE signs an EMPTY idempotency key and an EMPTY body, like GET.
         self::emptyReply($this->send('DELETE', self::PLANS_PATH . '/' . $id, null, ''));
+    }
+
+    /**
+     * Creates a subscription agreement: one customer on one plan. The agreement starts
+     * pending and nothing is charged. The customer activates it in a subscription session:
+     * createCheckoutSession() with its agreementId.
+     *
+     * Required params: planId (the plan_ id of an active plan), customerReference (your id
+     * for the customer, 1-100 characters) and idempotencyKey. Optional:
+     * storedPaymentMethodId (a pm_ card this customer saved in the plan's currency, to bill
+     * instead of saving a new card in the session), consent{textVersion, acceptedAt, ip}
+     * (all three together; required with storedPaymentMethodId or maxAmountPerPeriod) and
+     * maxAmountPerPeriod (int, MINOR units, for a variable-amount subscription; at least
+     * the plan's amount). Any other key is sent as it is. The API checks the values; the
+     * SDK does not.
+     *
+     * The same idempotencyKey with the same body answers the first agreement again; the
+     * same key with a different body is IDEMPOTENCY_KEY_REUSED.
+     *
+     * A refusal is an ApiException; branch on getErrorCode(). 404: PLAN_NOT_FOUND,
+     * PAYMENT_METHOD_NOT_FOUND. 409: PLAN_NOT_ACTIVE, PAYMENT_METHOD_NOT_ACTIVE. 422:
+     * PAYMENT_METHOD_CURRENCY_MISMATCH, MAX_AMOUNT_BELOW_PLAN_AMOUNT,
+     * AGREEMENT_CONSENT_REQUIRED, PAYMENT_METHOD_CURRENCY_UNKNOWN, IDEMPOTENCY_KEY_REUSED.
+     * Nothing was created, and the same request gets the same answer. getResult() has the
+     * envelope; validationErrors[0].params carries the amounts and currencies in question.
+     *
+     * @param array<string,mixed> $params
+     * @return array{id:string,planId:string,customerReference:string,storedPaymentMethodId:?string,status:string,amount:int,maxAmountPerPeriod:?int,currency:string,intervalUnit:string,intervalCount:int,periodCount:?int,trialDays:int,nextChargeAt:?string,pastDueReason:?string,pastDueAt:?string,consent:?array{textVersion:string,acceptedAt:?string,ip:string,receivedAt:?string,receivedFromIp:?string},version:int,sequence:int,createdAt:string,activatedAt:?string,cancelledAt:?string}
+     *
+     * @throws AuthenticationException Bad credentials or signature (401), or a key without the payments scope (403).
+     * @throws ApiException            A refusal above, or validation (HTTP 400): branch on getErrorCode().
+     * @throws RateLimitException     HTTP 429 - back off (getRetryAfterSeconds()), retry with the same key.
+     * @throws TransportException      Network-level failure or a 5xx: retry WITH the same idempotencyKey.
+     */
+    public function createAgreement(array $params): array
+    {
+        $this->lastIdempotencyKey = null;
+        $idempotencyKey = self::normalizeIdempotencyKey($params['idempotencyKey'] ?? null, self::RECORD_KEY_HINT);
+        unset($params['idempotencyKey']);
+        $this->lastIdempotencyKey = $idempotencyKey;
+
+        return self::agreement(
+            self::objectReply($this->send('POST', self::AGREEMENTS_PATH, $params, $idempotencyKey), 'agreement')
+        );
+    }
+
+    /**
+     * Reads one agreement.
+     *
+     * status is pending, active, past_due, cancelled, completed or failed. A value not in
+     * this list is a new status, not an error. pastDueReason says why an agreement is
+     * past_due: card_expired or card_revoked (a new card fixes it), hard_decline,
+     * dunning_exhausted, sca_required or unprocessable. It is null in every other status.
+     * nextChargeAt is null while pending and once the agreement has ended. sequence counts
+     * the agreement's changes: compare it with data.sequence on the agreement.* webhooks.
+     * amount, currency and the interval are copied from the plan when the agreement is
+     * created; version goes up when the price changes for a future period.
+     *
+     * @param string $agreementId The agr_ id createAgreement() returned, exactly as returned: it is case-sensitive.
+     * @return array{id:string,planId:string,customerReference:string,storedPaymentMethodId:?string,status:string,amount:int,maxAmountPerPeriod:?int,currency:string,intervalUnit:string,intervalCount:int,periodCount:?int,trialDays:int,nextChargeAt:?string,pastDueReason:?string,pastDueAt:?string,consent:?array{textVersion:string,acceptedAt:?string,ip:string,receivedAt:?string,receivedFromIp:?string},version:int,sequence:int,createdAt:string,activatedAt:?string,cancelledAt:?string}
+     *
+     * @throws AuthenticationException Bad credentials or signature (401), or a key without the payments scope (403).
+     * @throws ApiException            AGREEMENT_NOT_FOUND (HTTP 404), or an unexpected response.
+     * @throws RateLimitException     HTTP 429 - back off (getRetryAfterSeconds()).
+     * @throws TransportException      Network-level failure or a 5xx (safe to retry).
+     */
+    public function getAgreement(string $agreementId): array
+    {
+        $id = self::normalizeHandle($agreementId, 'agreementId', 'createAgreement()');
+
+        return self::agreement(
+            self::objectReply($this->send('GET', self::AGREEMENTS_PATH . '/' . $id, null, ''), 'agreement')
+        );
+    }
+
+    /**
+     * Cancels an agreement: no further charge is scheduled. A charge already placed is not
+     * reversed here. Allowed from pending, active and past_due. Cancelling a cancelled
+     * agreement answers the same, so a retry is safe.
+     *
+     * @param string $agreementId The agr_ id createAgreement() returned.
+     *
+     * @throws AuthenticationException Bad credentials or signature (401), or a key without the payments scope (403).
+     * @throws ApiException            AGREEMENT_NOT_FOUND (HTTP 404) or AGREEMENT_ENDED (HTTP 409: it completed
+     *                                 or failed, so there is nothing left to cancel).
+     * @throws RateLimitException     HTTP 429 - back off (getRetryAfterSeconds()).
+     * @throws TransportException      Network-level failure or a 5xx (safe to retry).
+     */
+    public function cancelAgreement(string $agreementId): void
+    {
+        $id = self::normalizeHandle($agreementId, 'agreementId', 'createAgreement()');
+
+        // DELETE signs an EMPTY idempotency key and an EMPTY body, like GET.
+        self::emptyReply($this->send('DELETE', self::AGREEMENTS_PATH . '/' . $id, null, ''));
+    }
+
+    /**
+     * The agreement as one shape: the API omits a null field, so absent reads as null, in
+     * consent too. Everything the API sends is carried through as sent.
+     *
+     * @param array<string,mixed> $data
+     * @return array<string,mixed>
+     */
+    private static function agreement(array $data): array
+    {
+        $nullable = ['storedPaymentMethodId', 'maxAmountPerPeriod', 'periodCount', 'nextChargeAt', 'pastDueReason',
+            'pastDueAt', 'consent', 'activatedAt', 'cancelledAt'];
+        foreach ($nullable as $field) {
+            $data[$field] = $data[$field] ?? null;
+        }
+        if (is_array($data['consent'])) {
+            foreach (['acceptedAt', 'receivedAt', 'receivedFromIp'] as $field) {
+                $data['consent'][$field] = $data['consent'][$field] ?? null;
+            }
+        }
+
+        return $data;
     }
 
     /**

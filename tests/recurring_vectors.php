@@ -133,6 +133,11 @@ function refusal(?\Throwable $e): string
 }
 
 const PLAN_FIELDS = 'amount,archivedAt,cancelUrl,createdAt,currency,id,intervalCount,intervalUnit,name,periodCount,status,trialDays';
+const AGREEMENT_ID = 'agr_0123456789abcdef0123456789ABCDEF';
+const AGREEMENT_KEY = 'subscription-customer-42-gold';
+const AGREEMENT_FIELDS = 'activatedAt,amount,cancelledAt,consent,createdAt,currency,customerReference,id,intervalCount,'
+    . 'intervalUnit,maxAmountPerPeriod,nextChargeAt,pastDueAt,pastDueReason,periodCount,planId,sequence,status,'
+    . 'storedPaymentMethodId,trialDays,version';
 
 // --- plans --------------------------------------------------------------------------------
 // As the gateway sends a plan: null fields omitted.
@@ -283,6 +288,121 @@ foreach (['', ' ', 'plan_1/x', 'plan_1?x=1', 'plan 1', '../plans', str_repeat('p
             }), \InvalidArgumentException::class);
     }
     check('the bad plan id ' . var_export($bad, true) . ' never reached the transport', (string) count($client->calls), '0');
+}
+
+// --- agreements ---------------------------------------------------------------------------
+// A new agreement as the gateway sends it: pending, null fields omitted.
+$pending = ['id' => AGREEMENT_ID, 'planId' => PLAN_ID, 'customerReference' => 'customer-42', 'status' => 'pending',
+    'amount' => 2500, 'currency' => 'EUR', 'intervalUnit' => 'month', 'intervalCount' => 1, 'trialDays' => 0,
+    'version' => 1, 'sequence' => 0, 'createdAt' => '2026-10-01T08:00:00Z'];
+// A past-due one with a card and the recorded consent, still without the platform's receipt.
+$pastDue = array_merge($pending, ['status' => 'past_due', 'storedPaymentMethodId' => 'pm_0123456789abcdef0123456789abcdef',
+    'maxAmountPerPeriod' => 5000, 'nextChargeAt' => '2026-11-01T08:00:00Z', 'pastDueReason' => 'card_expired',
+    'pastDueAt' => '2026-11-01T08:05:00Z', 'consent' => ['textVersion' => 'terms-2026-09',
+        'acceptedAt' => '2026-10-01T07:59:00Z', 'ip' => '203.0.113.7'],
+    'sequence' => 2, 'activatedAt' => '2026-10-01T08:10:00Z']);
+
+$client = new RecordingClient(envelope($pending), 201);
+$agreement = $client->createAgreement(['planId' => PLAN_ID, 'customerReference' => 'customer-42',
+    'consent' => ['textVersion' => 'terms-2026-09', 'acceptedAt' => '2026-10-01T07:59:00Z', 'ip' => '203.0.113.7'],
+    'maxAmountPerPeriod' => 5000, 'futureField' => 'x', 'idempotencyKey' => AGREEMENT_KEY]);
+check('createAgreement is a POST on the agreements path', $client->calls[0]['method'] . ' ' . $client->calls[0]['path'],
+    'POST /merchant-api/agreements');
+check('the agreements path is the published one', DominaiteClient::AGREEMENTS_PATH, '/merchant-api/agreements');
+check('createAgreement signs and sends the caller key', $client->calls[0]['key'], AGREEMENT_KEY);
+check('the agreement key is readable afterwards', (string) $client->getLastIdempotencyKey(), AGREEMENT_KEY);
+check('createAgreement sends every other key as given, consent nested', encode($client->calls[0]['body']),
+    '{"planId":"' . PLAN_ID . '","customerReference":"customer-42","consent":{"textVersion":"terms-2026-09",'
+    . '"acceptedAt":"2026-10-01T07:59:00Z","ip":"203.0.113.7"},"maxAmountPerPeriod":5000,"futureField":"x"}');
+check('the 201 is returned as the agreement', (string) $agreement['id'], AGREEMENT_ID);
+check('the agreement has every field', keysOf($agreement), AGREEMENT_FIELDS);
+foreach (['storedPaymentMethodId', 'maxAmountPerPeriod', 'periodCount', 'nextChargeAt', 'pastDueReason', 'pastDueAt',
+    'consent', 'activatedAt', 'cancelledAt'] as $nullable) {
+    check("a pending agreement reads the omitted $nullable as null", var_export($agreement[$nullable], true), 'NULL');
+}
+
+$client = new RecordingClient(envelope($pending), 201);
+check('createAgreement without a key is refused locally',
+    thrownBy(static function () use ($client): void {
+        $client->createAgreement(['planId' => PLAN_ID, 'customerReference' => 'customer-42']);
+    }), \InvalidArgumentException::class);
+check('createAgreement without a key never reaches the transport', (string) count($client->calls), '0');
+
+$refusals = [
+    [404, 'PLAN_NOT_FOUND'], [404, 'PAYMENT_METHOD_NOT_FOUND'], [409, 'PLAN_NOT_ACTIVE'], [409, 'PAYMENT_METHOD_NOT_ACTIVE'],
+    [422, 'PAYMENT_METHOD_CURRENCY_MISMATCH'], [422, 'MAX_AMOUNT_BELOW_PLAN_AMOUNT'], [422, 'AGREEMENT_CONSENT_REQUIRED'],
+    [422, 'PAYMENT_METHOD_CURRENCY_UNKNOWN'], [422, 'IDEMPOTENCY_KEY_REUSED'], [400, 'INVALID_CURRENCY'],
+];
+foreach ($refusals as [$status, $code]) {
+    check("createAgreement $status $code",
+        refusal(caught(static function () use ($status, $code): void {
+            (new RecordingClient(failure($status, $code), $status))
+                ->createAgreement(['planId' => PLAN_ID, 'customerReference' => 'c', 'idempotencyKey' => AGREEMENT_KEY]);
+        })), ApiException::class . " $status $code");
+}
+$below = caught(static function (): void {
+    (new RecordingClient(['success' => false, 'error' => ['code' => 'MAX_AMOUNT_BELOW_PLAN_AMOUNT', 'message' => 'Too low.',
+        'statusCode' => 422], 'validationErrors' => [['field' => 'maxAmountPerPeriod', 'params' => ['min' => 2500]]]], 422))
+        ->createAgreement(['planId' => PLAN_ID, 'customerReference' => 'c', 'idempotencyKey' => AGREEMENT_KEY]);
+});
+check('a refusal keeps validationErrors params in the envelope',
+    var_export($below instanceof ApiException ? ($below->getResult()['validationErrors'][0]['params']['min'] ?? null) : null, true),
+    '2500');
+$client = new RecordingClient(failure(503, 'MERCHANT_API_UNAVAILABLE'), 503);
+check('a 503 on createAgreement is a retryable transport error',
+    thrownBy(static function () use ($client): void {
+        $client->createAgreement(['planId' => PLAN_ID, 'customerReference' => 'c', 'idempotencyKey' => AGREEMENT_KEY]);
+    }), TransportException::class);
+check('after a 503 the agreement key to retry with is readable', (string) $client->getLastIdempotencyKey(), AGREEMENT_KEY);
+
+// getAgreement: the id verbatim; a past-due agreement carries why and since when.
+$client = new RecordingClient(envelope($pastDue));
+$read = $client->getAgreement(AGREEMENT_ID);
+check('getAgreement is a GET on the agreement path, the id verbatim', $client->calls[0]['method'] . ' ' . $client->calls[0]['path'],
+    'GET /merchant-api/agreements/' . AGREEMENT_ID);
+check('getAgreement signs an empty key and an empty body',
+    var_export($client->calls[0]['key'], true) . ' ' . var_export($client->calls[0]['body'], true), "'' NULL");
+check('getAgreement leaves the last key untouched', var_export($client->getLastIdempotencyKey(), true), 'NULL');
+check('a read agreement has every field', keysOf($read), AGREEMENT_FIELDS);
+check('a past-due agreement says why and since when', $read['status'] . ' ' . $read['pastDueReason'] . ' ' . $read['pastDueAt'],
+    'past_due card_expired 2026-11-01T08:05:00Z');
+check('the agreement keeps its sequence and version', $read['sequence'] . ' ' . $read['version'], '2 1');
+check('the recorded consent has every field', keysOf((array) $read['consent']), 'acceptedAt,ip,receivedAt,receivedFromIp,textVersion');
+check('the consent reads the omitted receipt as null',
+    var_export($read['consent']['receivedAt'], true) . ' ' . var_export($read['consent']['receivedFromIp'], true), 'NULL NULL');
+check('the consent keeps what was sent', $read['consent']['textVersion'] . ' ' . $read['consent']['ip'], 'terms-2026-09 203.0.113.7');
+check('getAgreement 404 AGREEMENT_NOT_FOUND',
+    refusal(caught(static function (): void {
+        (new RecordingClient(failure(404, 'AGREEMENT_NOT_FOUND'), 404))->getAgreement(AGREEMENT_ID);
+    })), ApiException::class . ' 404 AGREEMENT_NOT_FOUND');
+check('a 200 without an agreement is an ApiException',
+    refusal(caught(static function (): void {
+        (new RecordingClient(envelope(['status' => 'active']), 200))->getAgreement(AGREEMENT_ID);
+    })), ApiException::class . ' 200 UNEXPECTED_RESPONSE');
+
+// cancelAgreement: a 204, also for an agreement that is cancelled already.
+$client = new RecordingClient([], 204);
+$client->cancelAgreement(AGREEMENT_ID);
+check('cancelAgreement is a DELETE on the agreement path', $client->calls[0]['method'] . ' ' . $client->calls[0]['path'],
+    'DELETE /merchant-api/agreements/' . AGREEMENT_ID);
+check('cancelAgreement signs an empty key and an empty body',
+    var_export($client->calls[0]['key'], true) . ' ' . var_export($client->calls[0]['body'], true), "'' NULL");
+foreach ([[409, 'AGREEMENT_ENDED'], [404, 'AGREEMENT_NOT_FOUND'], [403, 'INSUFFICIENT_SCOPE']] as [$status, $code]) {
+    check("cancelAgreement $status $code",
+        refusal(caught(static function () use ($status, $code): void {
+            (new RecordingClient(failure($status, $code), $status))->cancelAgreement(AGREEMENT_ID);
+        })), ($status === 403 ? AuthenticationException::class : ApiException::class) . " $status $code");
+}
+
+foreach (['', 'agr_1/x', 'agr_1?x=1', 'agr 1', str_repeat('a', 101)] as $bad) {
+    $client = new RecordingClient(envelope($pending));
+    foreach (['getAgreement', 'cancelAgreement'] as $route) {
+        check("$route refuses agreement id " . var_export($bad, true),
+            thrownBy(static function () use ($client, $route, $bad): void {
+                $client->$route($bad);
+            }), \InvalidArgumentException::class);
+    }
+    check('the bad agreement id ' . var_export($bad, true) . ' never reached the transport', (string) count($client->calls), '0');
 }
 
 exit($failures === 0 ? 0 : 1);
