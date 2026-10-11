@@ -984,7 +984,8 @@ class DominaiteClient
      * A missing key throws InvalidArgumentException before anything is sent. Optional:
      * amount (int, MINOR units of the payment's currency, see toMinorUnits()); omit it (or
      * pass null) to refund everything still refundable, and no amount key is sent. reason
-     * (string, at most 500 characters, stored with the refund).
+     * (string, at most 500 characters, stored with the refund). Any other key is sent as
+     * it is, after these.
      *
      * Returns the refund: {refundId, transactionId, status, amount, currency, failureCode,
      * failureMessage, completedAt}, the same shape getRefund() reads. status is pending or
@@ -1016,8 +1017,9 @@ class DominaiteClient
         }
         $idempotencyKey = self::normalizeIdempotencyKey($params['idempotencyKey'] ?? null);
 
-        // Built field by field: the body is what gets signed. A full refund sends no
-        // amount key at all, which is what the gateway reads as "everything left".
+        // The known fields first, in the contract's order, then any other key as the caller
+        // sent it, so a field the API adds later needs no SDK update. A full refund sends
+        // no amount key at all, which is what the gateway reads as "everything left".
         $body = [];
         if (isset($params['amount'])) {
             $body['amount'] = $params['amount'];
@@ -1025,6 +1027,8 @@ class DominaiteClient
         if (isset($params['reason'])) {
             $body['reason'] = $params['reason'];
         }
+        unset($params['amount'], $params['reason'], $params['idempotencyKey']);
+        $body += $params;
 
         $this->lastIdempotencyKey = $idempotencyKey;
 

@@ -140,12 +140,13 @@ foreach (['failureCode', 'failureMessage', 'completedAt'] as $nullable) {
     check("a pending refund reads the omitted $nullable as null", var_export($refund[$nullable], true), 'NULL');
 }
 
-// With a reason, in contract order after the amount.
+// With a reason, in contract order after the amount. Any other key follows as the caller
+// sent it, so a field the API adds later needs no SDK update.
 $client = new RecordingClient($pendingPartial);
-$client->createRefund(TRANSACTION_ID, ['reason' => 'Returned item', 'amount' => 2500, 'idempotencyKey' => REFUND_KEY,
-    'currency' => 'EUR']);
-check('the refund body is built field by field in contract order', encode($client->calls[0]['body']),
-    '{"amount":2500,"reason":"Returned item"}');
+$client->createRefund(TRANSACTION_ID, ['futureField' => 'x', 'reason' => 'Returned item', 'amount' => 2500,
+    'idempotencyKey' => REFUND_KEY, 'currency' => 'EUR']);
+check('the refund body is the known fields in contract order, then the rest as sent', encode($client->calls[0]['body']),
+    '{"amount":2500,"reason":"Returned item","futureField":"x","currency":"EUR"}');
 
 // --- createRefund: full ---------------------------------------------------------------
 // Everything still refundable: no amount key at all, never "amount": null.
