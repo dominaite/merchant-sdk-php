@@ -211,6 +211,21 @@ class DominaiteClient
         'IDEMPOTENCY_KEY_REQUIRED',
     ];
 
+    /**
+     * HTTP 403: the API key does not hold the scope this route needs. A key holds either
+     * payments, or one or both of transactions:read and webhooks:manage, never both kinds.
+     * Not retryable: call the route with a key issued with that scope.
+     */
+    public const INSUFFICIENT_SCOPE = 'INSUFFICIENT_SCOPE';
+
+    /**
+     * The authorization codes the gateway publishes, in the contract's order. Each is an
+     * HTTP 403 and arrives as an AuthenticationException.
+     */
+    public const AUTHORIZATION_ERROR_CODES = [
+        self::INSUFFICIENT_SCOPE,
+    ];
+
     /** integration value for the hosted cashier widget, the default when you send none. */
     public const INTEGRATION_WIDGET = 'widget';
 

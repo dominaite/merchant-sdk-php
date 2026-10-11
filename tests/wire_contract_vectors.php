@@ -140,6 +140,19 @@ foreach ($wire['errorCodes']['storefront'] as $entry) {
     check("the contract's {$entry['code']} is not retryable", var_export($entry['retry'], true), 'false');
 }
 
+// The authorization group is the 403 a key gets on a route outside its scope. The SDK's
+// list is that group in order, each at 403, none retryable.
+check('constant INSUFFICIENT_SCOPE carries its own wire spelling', DominaiteClient::INSUFFICIENT_SCOPE, 'INSUFFICIENT_SCOPE');
+check('the authorization list is exactly the contract authorization group, in order',
+    json_encode(DominaiteClient::AUTHORIZATION_ERROR_CODES),
+    json_encode(array_map(static function (array $entry): string {
+        return $entry['code'];
+    }, $wire['errorCodes']['authorization'] ?? [])));
+foreach ($wire['errorCodes']['authorization'] ?? [] as $entry) {
+    check("the contract's {$entry['code']} is HTTP 403", (string) $entry['httpStatus'], '403');
+    check("the contract's {$entry['code']} is not retryable", var_export($entry['retry'], true), 'false');
+}
+
 check('the contract still lists this SDK', in_array('php', $wire['sdks'], true) ? 'listed' : 'missing', 'listed');
 
 check(
