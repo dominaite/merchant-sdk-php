@@ -219,6 +219,13 @@ class DominaiteClient
     public const INSUFFICIENT_SCOPE = 'INSUFFICIENT_SCOPE';
 
     /**
+     * HTTP 403 on createCheckoutSession() with verifyOnly: verify-only sessions are not
+     * switched on for your account. We switch it on for your account. Nothing was
+     * created. Arrives as an AuthenticationException.
+     */
+    public const VERIFY_ONLY_NOT_ENABLED = 'VERIFY_ONLY_NOT_ENABLED';
+
+    /**
      * The authorization codes the gateway publishes, in the contract's order. Each is an
      * HTTP 403 and arrives as an AuthenticationException.
      */
@@ -1511,13 +1518,40 @@ class DominaiteClient
         $envelopeError = isset($decoded['error']) && is_array($decoded['error']) ? $decoded['error'] : [];
 
         if ($status === 401 || $status === 403) {
+            $errorCode = (string) ($payload['errorCode'] ?? $envelopeError['code'] ?? 'UNAUTHORIZED');
             throw new AuthenticationException(
-                (string) ($payload['errorCode'] ?? $envelopeError['code'] ?? 'UNAUTHORIZED'),
-                'Authentication failed - check your key id, secret, and server clock.'
+                $errorCode,
+                self::refusalMessage($status, $errorCode, $envelopeError['message'] ?? null),
+                $status
             );
         }
 
         return ['status' => $status, 'envelope' => $decoded, 'payload' => $payload, 'error' => $envelopeError];
+    }
+
+    /**
+     * The message for a 401 or 403. Only a 401 is about the key id, secret or clock: a
+     * 403 comes after the signature verified, so that hint would send the caller to
+     * fix the wrong thing.
+     *
+     * @param mixed $gatewayMessage error.message from the envelope, when there is one.
+     */
+    private static function refusalMessage(int $status, string $errorCode, $gatewayMessage): string
+    {
+        if ($status === 401) {
+            return 'Authentication failed - check your key id, secret, and server clock.';
+        }
+        $detail = is_string($gatewayMessage) && $gatewayMessage !== '' ? ' The API said: ' . $gatewayMessage : '';
+        if ($errorCode === self::INSUFFICIENT_SCOPE) {
+            return 'This API key does not hold the scope this route needs. The signature was valid, so the '
+                . 'key id, secret and clock are fine. Use a key issued with that scope.' . $detail;
+        }
+        if ($errorCode === self::VERIFY_ONLY_NOT_ENABLED) {
+            return 'Verify-only sessions are not switched on for this account. We switch it on for your '
+                . 'account. Contact Dominaite to ask for it. Nothing was created.';
+        }
+
+        return "The API refused this call (HTTP 403, {$errorCode})." . $detail;
     }
 
     /**

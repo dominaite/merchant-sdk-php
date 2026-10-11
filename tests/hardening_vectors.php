@@ -21,6 +21,7 @@ require __DIR__ . '/../src/Exception/TransportException.php';
 
 use Dominaite\DominaiteClient;
 use Dominaite\Exception\ApiException;
+use Dominaite\Exception\AuthenticationException;
 use Dominaite\Exception\RateLimitException;
 use Dominaite\Exception\StorefrontException;
 use Dominaite\Exception\TransportException;
@@ -142,6 +143,60 @@ check('429 keeps the HTTP status', (string) ($limit === null ? 0 : $limit->getHt
 check('HTML 429 is still a RateLimitException',
     thrownBy(static function () use ($responseClient, $html): void { $responseClient->handle(429, $html); }),
     RateLimitException::class);
+
+// --- 401 and 403 get different messages -------------------------------------------------
+// A 403 comes after the signature verified. The 401 hint about the key id, secret and
+// clock would send the caller to fix the wrong thing.
+/** @return array{class:string,code:string,status:int,message:string} */
+function refusal(ResponseClient $client, int $status, string $raw): array
+{
+    try {
+        $client->handle($status, $raw);
+    } catch (AuthenticationException $e) {
+        return ['class' => get_class($e), 'code' => $e->getErrorCode(), 'status' => $e->getHttpStatus(), 'message' => $e->getMessage()];
+    }
+
+    return ['class' => 'no exception', 'code' => '', 'status' => 0, 'message' => ''];
+}
+
+$unauthorized = refusal($responseClient, 401,
+    '{"success":false,"error":{"code":"INVALID_SIGNATURE","message":"Request signature does not match"}}');
+check('401 is an AuthenticationException', $unauthorized['class'], AuthenticationException::class);
+check('401 keeps its code', $unauthorized['code'], 'INVALID_SIGNATURE');
+check('401 reports HTTP 401', (string) $unauthorized['status'], '401');
+check('401 points at the key id, secret and clock',
+    strpos($unauthorized['message'], 'check your key id, secret, and server clock') !== false ? 'yes' : $unauthorized['message'], 'yes');
+
+$scope = refusal($responseClient, 403, (string) json_encode(['success' => false, 'error' => [
+    'code' => 'INSUFFICIENT_SCOPE',
+    'message' => "This API key does not have the 'webhooks:manage' scope this route requires",
+]]));
+check('403 INSUFFICIENT_SCOPE is an AuthenticationException', $scope['class'], AuthenticationException::class);
+check('403 INSUFFICIENT_SCOPE keeps its code', $scope['code'], DominaiteClient::INSUFFICIENT_SCOPE);
+check('403 INSUFFICIENT_SCOPE reports HTTP 403', (string) $scope['status'], '403');
+check('403 INSUFFICIENT_SCOPE does not blame the clock',
+    strpos($scope['message'], 'server clock') === false ? 'no clock hint' : $scope['message'], 'no clock hint');
+check('403 INSUFFICIENT_SCOPE says the key lacks the scope',
+    strpos($scope['message'], 'does not hold the scope this route needs') !== false ? 'yes' : $scope['message'], 'yes');
+check('403 INSUFFICIENT_SCOPE names the scope the API named',
+    strpos($scope['message'], "'webhooks:manage'") !== false ? 'yes' : $scope['message'], 'yes');
+
+$verifyOnly = refusal($responseClient, 403, (string) json_encode(['success' => false, 'error' => [
+    'code' => 'VERIFY_ONLY_NOT_ENABLED',
+    'message' => 'Verify-only sessions are not enabled for this account.',
+]]));
+check('403 VERIFY_ONLY_NOT_ENABLED keeps its code', $verifyOnly['code'], DominaiteClient::VERIFY_ONLY_NOT_ENABLED);
+check('403 VERIFY_ONLY_NOT_ENABLED reports HTTP 403', (string) $verifyOnly['status'], '403');
+check('403 VERIFY_ONLY_NOT_ENABLED says how it gets switched on',
+    strpos($verifyOnly['message'], 'We switch it on for your account.') !== false ? 'yes' : $verifyOnly['message'], 'yes');
+check('403 VERIFY_ONLY_NOT_ENABLED does not blame the clock',
+    strpos($verifyOnly['message'], 'server clock') === false ? 'no clock hint' : $verifyOnly['message'], 'no clock hint');
+
+$otherForbidden = refusal($responseClient, 403, '{"success":false,"error":{"code":"SOME_FUTURE_REFUSAL","message":"Not for you"}}');
+check('an unknown 403 keeps its code', $otherForbidden['code'], 'SOME_FUTURE_REFUSAL');
+check('an unknown 403 carries the API message without the clock hint',
+    strpos($otherForbidden['message'], 'Not for you') !== false && strpos($otherForbidden['message'], 'server clock') === false
+        ? 'yes' : $otherForbidden['message'], 'yes');
 
 // Retry-After in the HTTP-date form is not converted: a wrong number is worse than none,
 // because the caller would sleep on it.
