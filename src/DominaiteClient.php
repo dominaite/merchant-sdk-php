@@ -225,6 +225,23 @@ class DominaiteClient
      */
     public const VERIFY_ONLY_NOT_ENABLED = 'VERIFY_ONLY_NOT_ENABLED';
 
+    /** HTTP 429: a request limit. Arrives as a RateLimitException; read Retry-After. */
+    public const RATE_LIMIT_EXCEEDED = 'RATE_LIMIT_EXCEEDED';
+
+    /**
+     * HTTP 429 on chargePaymentMethod(): the card has the most charges allowed in 24
+     * hours, or the charge would pass your hourly ceiling in its currency. Nothing was
+     * charged. Arrives as a RateLimitException; retry with the same key after Retry-After.
+     */
+    public const CHARGE_VELOCITY_EXCEEDED = 'CHARGE_VELOCITY_EXCEEDED';
+
+    /**
+     * HTTP 429 on chargePaymentMethod(): the key collected too many declined charges in a
+     * short window, so its charge route is locked. Nothing was charged. Arrives as a
+     * RateLimitException; retry after Retry-After.
+     */
+    public const CHARGE_DECLINE_RATE_EXCEEDED = 'CHARGE_DECLINE_RATE_EXCEEDED';
+
     /**
      * The authorization codes the gateway publishes, in the contract's order. Each is an
      * HTTP 403 and arrives as an AuthenticationException.
@@ -1493,9 +1510,14 @@ class DominaiteClient
     protected function readResponse(int $status, string $raw, array $responseHeaders = []): array
     {
         if ($status === 429) {
+            // The code is read when the body is the gateway's envelope, and skipped
+            // otherwise: an edge's HTML 429 is still a rate limit.
+            $limited = json_decode($raw, true);
+            $limitCode = is_array($limited) && is_array($limited['error'] ?? null) ? ($limited['error']['code'] ?? null) : null;
             throw new RateLimitException(
                 'Rate limit exceeded (HTTP 429); back off and retry with the same idempotency key.',
-                self::parseRetryAfter($responseHeaders['retry-after'] ?? null)
+                self::parseRetryAfter($responseHeaders['retry-after'] ?? null),
+                is_string($limitCode) && $limitCode !== '' ? $limitCode : null
             );
         }
 

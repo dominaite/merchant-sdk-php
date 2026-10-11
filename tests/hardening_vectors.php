@@ -130,7 +130,7 @@ check('HTML 400 stays a non-retryable API error',
 // --- A11: rate limiting -----------------------------------------------------------------
 $limit = null;
 try {
-    $responseClient->handle(429, '{"error":{"code":"RATE_LIMITED"}}', ['retry-after' => '120']);
+    $responseClient->handle(429, '{"success":false,"error":{"code":"RATE_LIMIT_EXCEEDED","message":"Too many requests"}}', ['retry-after' => '120']);
 } catch (RateLimitException $e) {
     $limit = $e;
 }
@@ -138,11 +138,35 @@ check('429 raises RateLimitException', $limit === null ? 'no exception' : get_cl
     RateLimitException::class);
 check('429 carries Retry-After seconds', var_export($limit === null ? null : $limit->getRetryAfterSeconds(), true), '120');
 check('429 keeps the HTTP status', (string) ($limit === null ? 0 : $limit->getHttpStatus()), '429');
+check('429 carries the code the API sent', var_export($limit === null ? null : $limit->getErrorCode(), true),
+    var_export(DominaiteClient::RATE_LIMIT_EXCEEDED, true));
+
+// The charge route has its own limits. Each is still a RateLimitException, told apart by
+// its code, and a code the SDK has never seen is a rate limit too.
+foreach ([DominaiteClient::CHARGE_VELOCITY_EXCEEDED, DominaiteClient::CHARGE_DECLINE_RATE_EXCEEDED, 'SOME_FUTURE_LIMIT'] as $code) {
+    $seen = 'no exception';
+    try {
+        $responseClient->handle(429, (string) json_encode(['success' => false, 'error' => ['code' => $code]]), ['retry-after' => '30']);
+    } catch (RateLimitException $e) {
+        $seen = (string) $e->getErrorCode() . ' after ' . var_export($e->getRetryAfterSeconds(), true);
+    }
+    check("429 $code is a RateLimitException with its code", $seen, "$code after 30");
+}
+check('the charge limit codes keep their wire spelling',
+    DominaiteClient::CHARGE_VELOCITY_EXCEEDED . ',' . DominaiteClient::CHARGE_DECLINE_RATE_EXCEEDED,
+    'CHARGE_VELOCITY_EXCEEDED,CHARGE_DECLINE_RATE_EXCEEDED');
 
 // An HTML 429 comes from an edge that never reached us; it must classify the same way.
 check('HTML 429 is still a RateLimitException',
     thrownBy(static function () use ($responseClient, $html): void { $responseClient->handle(429, $html); }),
     RateLimitException::class);
+$edgeLimit = null;
+try {
+    $responseClient->handle(429, $html);
+} catch (RateLimitException $e) {
+    $edgeLimit = $e;
+}
+check('an HTML 429 has no code', var_export($edgeLimit === null ? 'no exception' : $edgeLimit->getErrorCode(), true), 'NULL');
 
 // --- 401 and 403 get different messages -------------------------------------------------
 // A 403 comes after the signature verified. The 401 hint about the key id, secret and
