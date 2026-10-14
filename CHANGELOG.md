@@ -3,6 +3,16 @@
 Versions follow semver. The package installs from git tags, so a version exists once its
 `v` tag does.
 
+## 0.5.1
+
+Added:
+
+- `listTransactions()` items carry `fee`, `netAmount`, `settledAt` and `payoutId`. They are
+  `null` until the acquirer settles the payment. `fee` and `netAmount` are in minor units.
+  `netAmount` is `amount` minus the fee of this payment only.
+- `listTransactions()` documents `settledFrom` and `settledTo`, a settlement-date window in
+  dates only (`2026-10-13`). Send both or neither. `from` and `to` are still required.
+
 ## 0.5.0
 
 Added:

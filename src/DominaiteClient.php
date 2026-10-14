@@ -74,7 +74,7 @@ class DominaiteClient
     public const TRANSACTIONS_PATH = '/merchant-api/transactions';
     /** The public integration contract. It needs no key; the SDK signs it like ping. */
     public const INTEGRATION_CONTRACT_PATH = '/merchant-api/integration/contract';
-    private const USER_AGENT = 'dominaite-php/0.5.0 (php ' . PHP_VERSION . ')';
+    private const USER_AGENT = 'dominaite-php/0.5.1 (php ' . PHP_VERSION . ')';
     private const TIMEOUT_SECONDS = 15;
 
     /**
@@ -1594,23 +1594,30 @@ class DominaiteClient
      * apart. Use the Z form, for example gmdate('Y-m-d\TH:i:s\Z', $unixTime). The window is
      * on createdAt. Optional: status (only payments now in this status, a value of
      * STATUS_VOCABULARY), limit (1-100, default 50) and cursor (the nextCursor of the
-     * previous page, unchanged). A null value is left out. Any other key is sent as it is.
+     * previous page, unchanged). Optional settledFrom (inclusive) and settledTo (exclusive)
+     * filter on the settlement date: dates only (2026-10-13), sent together, at most 31 days
+     * apart. from and to still apply on createdAt. A null value is left out. Any other key is sent as it is.
      * Every value must be a string or an int: the SDK sends them in the query string, which
      * is never part of the signature. The API checks the values; the SDK does not.
      *
      * Rows come oldest first. To read the whole window, send nextCursor back as cursor with
-     * the same from, to and status until nextCursor is null. Paging never repeats or skips
+     * the same from, to, settledFrom, settledTo and status until nextCursor is null. Paging never repeats or skips
      * a row. A refund is not a row of its own: it shows on its payment as refundedAmount
      * and status. type is payment, charge or verification (a verifyOnly session saved a
      * card; leave it out of revenue). A type or status not in these lists is a new value,
      * not an error. The API omits orderReference, completedAt, storedPaymentMethodId and
      * refundedAmount when it has no value; they read as null here.
      *
+     * fee, netAmount (amount minus fee, in minor units), settledAt (the settlement date at
+     * midnight UTC) and payoutId read as null until the acquirer settles the payment.
+     * payoutId stays null until the money is paid out. fee and netAmount can change or go
+     * back to null when the settlement is matched again.
+     *
      * @param array<string,string|int|null> $params
-     * @return array{items:list<array{transactionId:string,orderReference:?string,type:string,status:string,amount:int,currency:string,createdAt:string,completedAt:?string,storedPaymentMethodId:?string,refundedAmount:?int}>,nextCursor:?string}
+     * @return array{items:list<array{transactionId:string,orderReference:?string,type:string,status:string,amount:int,currency:string,createdAt:string,completedAt:?string,storedPaymentMethodId:?string,refundedAmount:?int,fee:?int,netAmount:?int,settledAt:?string,payoutId:?string}>,nextCursor:?string}
      *
      * @throws AuthenticationException Bad credentials or signature (401), or a key without transactions:read (403).
-     * @throws ApiException            Validation (HTTP 400): a missing or malformed from, to, status, limit or cursor.
+     * @throws ApiException            Validation (HTTP 400): a missing or malformed from, to, settledFrom, settledTo, status, limit or cursor.
      * @throws RateLimitException     HTTP 429 - back off (getRetryAfterSeconds()).
      * @throws TransportException      Network-level failure or a 5xx (safe to retry).
      */
@@ -1633,7 +1640,8 @@ class DominaiteClient
             throw new ApiException($reply['status'], 'The API answered without a transaction page', 'UNEXPECTED_RESPONSE');
         }
         $page['items'] = array_map(static function (array $item): array {
-            foreach (['orderReference', 'completedAt', 'storedPaymentMethodId', 'refundedAmount'] as $nullable) {
+            foreach (['orderReference', 'completedAt', 'storedPaymentMethodId', 'refundedAmount', 'fee', 'netAmount',
+                'settledAt', 'payoutId'] as $nullable) {
                 $item[$nullable] = $item[$nullable] ?? null;
             }
 

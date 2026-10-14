@@ -246,7 +246,7 @@ foreach (['', 'wh_123', '3f2c9a1e0b7d4c559a8e1d2f3a4b5c6d', '{' . WEBHOOK_ID . '
 }
 
 // --- listTransactions -----------------------------------------------------------------------
-// As the gateway sends a page: a payment with nothing optional, a refunded charge, and a
+// As the gateway sends a page: a payment with nothing optional, a refunded and settled charge, and a
 // verification, which the API added after this SDK knew only payments and charges.
 $page = ['items' => [
     ['transactionId' => '1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d', 'type' => 'payment', 'status' => 'pending', 'amount' => 2500,
@@ -254,11 +254,13 @@ $page = ['items' => [
     ['transactionId' => '2a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d', 'orderReference' => 'order-1043', 'type' => 'charge',
         'status' => 'partially_refunded', 'amount' => 2500, 'currency' => 'EUR', 'createdAt' => '2026-10-01T09:00:00Z',
         'completedAt' => '2026-10-01T09:00:02Z', 'storedPaymentMethodId' => 'pm_0123456789abcdef0123456789abcdef',
-        'refundedAmount' => 500],
+        'refundedAmount' => 500, 'fee' => 63, 'netAmount' => 2437, 'settledAt' => '2026-10-02T00:00:00Z',
+        'payoutId' => '7d1e2f3a-4b5c-4d6e-8f70-8192a3b4c5d6'],
     ['transactionId' => '3a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d', 'type' => 'verification', 'status' => 'cancelled',
         'amount' => 30, 'currency' => 'EUR', 'createdAt' => '2026-10-01T10:00:00Z', 'futureField' => 'kept'],
 ], 'nextCursor' => 'eyJjIjoiMjAyNi0xMC0wMVQxMDowMDowMFoifQ'];
-const TX_ITEM_FIELDS = 'amount,completedAt,createdAt,currency,orderReference,refundedAmount,status,storedPaymentMethodId,transactionId,type';
+const TX_ITEM_FIELDS = 'amount,completedAt,createdAt,currency,fee,netAmount,orderReference,payoutId,refundedAmount,settledAt,status,'
+    . 'storedPaymentMethodId,transactionId,type';
 
 $client = new RecordingClient(envelope($page));
 $listed = $client->listTransactions(['from' => '2026-10-01T00:00:00Z', 'to' => '2026-10-08T00:00:00Z',
@@ -276,9 +278,27 @@ check('every item has every field',
         unset($item['futureField']);
         return $item;
     }, $listed['items']))), TX_ITEM_FIELDS . ' | ' . TX_ITEM_FIELDS . ' | ' . TX_ITEM_FIELDS);
-foreach (['orderReference', 'completedAt', 'storedPaymentMethodId', 'refundedAmount'] as $nullable) {
+foreach (['orderReference', 'completedAt', 'storedPaymentMethodId', 'refundedAmount', 'fee', 'netAmount', 'settledAt',
+    'payoutId'] as $nullable) {
     check("an item reads the omitted $nullable as null", var_export($listed['items'][0][$nullable], true), 'NULL');
 }
+check('a settled charge carries its fee, net amount, settlement date and payout',
+    var_export([$listed['items'][1]['fee'], $listed['items'][1]['netAmount'], $listed['items'][1]['settledAt'],
+        $listed['items'][1]['payoutId']], true),
+    var_export([63, 2437, '2026-10-02T00:00:00Z', '7d1e2f3a-4b5c-4d6e-8f70-8192a3b4c5d6'], true));
+
+// A settlement day: settledFrom and settledTo go in the query, the signed path stays bare.
+$client = new RecordingClient(envelope(['items' => [], 'nextCursor' => null]));
+$client->listTransactions(['from' => '2026-09-13T00:00:00Z', 'to' => '2026-10-14T00:00:00Z',
+    'settledFrom' => '2026-10-13', 'settledTo' => '2026-10-14', 'cursor' => null]);
+check('listTransactions sends the settlement window in the query', $client->calls[0]['method'] . ' ' . $client->calls[0]['path'],
+    'GET /merchant-api/transactions?from=2026-09-13T00%3A00%3A00Z&to=2026-10-14T00%3A00%3A00Z'
+    . '&settledFrom=2026-10-13&settledTo=2026-10-14');
+$client = new RecordingClient(envelope(['items' => [], 'nextCursor' => null]));
+$client->listTransactions(['from' => '2026-10-01T00:00:00Z', 'to' => '2026-10-08T00:00:00Z', 'settledFrom' => null,
+    'settledTo' => null]);
+check('a null settlement window is left out', $client->calls[0]['path'],
+    '/merchant-api/transactions?from=2026-10-01T00%3A00%3A00Z&to=2026-10-08T00%3A00%3A00Z');
 check('a refunded charge carries its card and refunded amount',
     $listed['items'][1]['storedPaymentMethodId'] . ' ' . $listed['items'][1]['refundedAmount'], 'pm_0123456789abcdef0123456789abcdef 500');
 check('an item field the SDK does not model rides through', (string) ($listed['items'][2]['futureField'] ?? 'missing'), 'kept');
