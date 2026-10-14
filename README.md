@@ -964,7 +964,8 @@ do {
     $page = $reporting->listTransactions($params);
     foreach ($page['items'] as $item) {
         // transactionId, orderReference, type, status, amount, currency, createdAt,
-        // completedAt, storedPaymentMethodId, refundedAmount
+        // completedAt, storedPaymentMethodId, refundedAmount,
+        // fee, netAmount, settledAt, payoutId
     }
     $params['cursor'] = $page['nextCursor'];
 } while ($page['nextCursor'] !== null);
@@ -974,12 +975,18 @@ do {
   apart. Use the `Z` form, for example `gmdate('Y-m-d\TH:i:s\Z', $time)`.
 - `status` is optional and keeps the payments that have that status now. `limit` is 1 to 100,
   50 when you leave it out.
-- Rows come oldest first. Send `nextCursor` back as `cursor`, with the same `from`, `to` and
-  `status`, until it is `null`. Paging never repeats or skips a row.
+- Rows come oldest first. Send `nextCursor` back as `cursor`, with the same `from`, `to`,
+  `settledFrom`, `settledTo` and `status`, until it is `null`. Paging never repeats or skips a row.
 - `type` is `payment`, `charge` or `verification`. A `verification` is not a purchase, so leave
   it out of revenue.
 - A refund is not a row of its own. It shows on its payment as `refundedAmount` and `status`.
-  Fees are not in this read.
+- `fee`, `netAmount`, `settledAt` and `payoutId` are `null` until the acquirer settles the
+  payment, usually the next business day. `payoutId` stays `null` until we pay the money out.
+- `netAmount` is `amount` minus the fee of this payment only. Deductions on the whole payout are
+  not in it. `fee` and `netAmount` can change, so read a settlement day again before you close
+  your books.
+- To get one settlement day, send `'settledFrom' => '2026-10-13', 'settledTo' => '2026-10-14'`
+  (dates only), with a `from` and `to` that cover when those payments were created.
 - The SDK sends the parameters in the query string. The signature covers the path only.
 
 ## Fallback: status polling
