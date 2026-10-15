@@ -303,6 +303,23 @@ check('clientSecret is at most 128 characters',
     strlen((string) $fieldsCheckout['clientSecret']) <= 128 ? 'within' : 'too long', 'within');
 check('integration is sent in the session body', (string) ($fieldsClient->bodies[0]['integration'] ?? 'absent'), 'fields');
 
+// The billing address fields go out exactly as given: same keys, same values, same order.
+$billingCustomer = [
+    'firstName' => 'Ana',
+    'email' => 'ana@example.test',
+    'address' => '1 Market St, Apt 4',
+    'city' => 'San Francisco',
+    'postalCode' => '94105',
+    'state' => 'CA',
+];
+$billingClient = new CannedClient($session['successExample']);
+$billingClient->createCheckoutSession([
+    'amount' => 8440, 'currency' => 'USD', 'orderReference' => 'order-1042',
+    'customer' => $billingCustomer, 'idempotencyKey' => 'order-1042',
+]);
+check('the billing address fields reach the session body unchanged',
+    (string) json_encode($billingClient->bodies[0]['customer'] ?? null), (string) json_encode($billingCustomer));
+
 $widgetClient = new CannedClient($session['successExample']);
 $widgetClient->createCheckoutSession([
     'amount' => 8440, 'currency' => 'EUR', 'orderReference' => 'order-1042',
