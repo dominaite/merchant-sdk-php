@@ -634,7 +634,8 @@ class DominaiteClient
      * ASCII chars; build it with orderIdempotencyKey() so the same order at the same
      * amount always sends the same key - retrying with it never creates a second payment).
      * A missing key throws InvalidArgumentException before anything is sent.
-     * Optional: customer{firstName,lastName,email,phone}, country (ISO 3166-1 alpha-2),
+     * Optional: customer{firstName,lastName,email,phone,address,city,postalCode,state}
+     * (see below for the billing address), country (ISO 3166-1 alpha-2),
      * language (ISO 639-1), theme ('light'|'dark'|'bright'), description,
      * saveCard (bool - keep the card on file once this payment is approved, so you can
      * charge it again with chargePaymentMethod(); the stored method shows up as
@@ -652,6 +653,13 @@ class DominaiteClient
      * from which IP; required unless the agreement already carries it), verifyOnly (bool,
      * see below). Any other key is sent as it is, so a field the API adds later needs no
      * SDK update.
+     *
+     * The billing address on customer is optional: address (street, one line, <= 200
+     * chars), city (<= 100), postalCode (<= 20) and state (<= 50, an ISO 3166-2
+     * subdivision code such as 'CA' or 'NSW', only used for the United States, Canada and
+     * Australia). The checkout does not ask the payer for a field the session carries. A
+     * value over its limit is a 400 ApiException: getErrorCode() is VALIDATION_ERROR and
+     * getResult()['error']['validationErrors'] names the field with code MAX_LENGTH.
      *
      * verifyOnly true saves the card without a payment. Leave amount out or send 0: the
      * API places its own small verification hold and releases it once the card is saved.
