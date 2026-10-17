@@ -42,9 +42,11 @@ Added:
 
 - The request id. `getLastRequestId()` on the client, and `getRequestId()` on every SDK
   exception. The SDK reads the `Dominaite-Request-Id` header, then `metadata.requestId` in
-  the body. The debug line prints that id, and `attempt=N` on a retry.
+  the body. The debug line prints that id, and `attempt=N` on a retry. When the last retry
+  gets no answer, the thrown `TransportException` and `getLastRequestId()` carry the id of
+  the last attempt that answered.
 - The `maxRetries` option (int, 0 or more, default 2) and the `timeout` option (seconds per
-  attempt, default 45).
+  attempt, default 45). A client restored with `unserialize()` keeps both.
 - Error code lists: `AUTHENTICATION_ERROR_CODES`, `TRANSIENT_ERROR_CODES`,
   `FIELD_VALIDATION_CODES`, `RECURRING_ERROR_CODES`, `WEBHOOK_ERROR_CODES` and
   `MERCHANT_API_UNAVAILABLE`. Webhook event lists: `PAYMENT_WEBHOOK_EVENTS`,
@@ -57,11 +59,6 @@ Fixed:
   `chargePaymentMethod()`. It means an earlier request with this key is still running, or
   it finished and its answer can no longer be replayed, so a charge may exist. Retry with
   the same key; if the code comes back, read the transaction. Never retry under a new key.
-- `unserialize()` reset `maxRetries` and `timeout` to the defaults. A restored client now
-  keeps the values you passed to the constructor.
-- When a retry got no answer, the request id of the earlier attempt that did was lost.
-  `getRequestId()` on the thrown `TransportException`, and `getLastRequestId()`, now return
-  the id of the last attempt that answered.
 - A `pm_` id with uppercase hex is lowercased before signing. The API signs a charge on the
   lowercase id, so an uppercase id failed with `INVALID_SIGNATURE`.
 - The README and the `createWebhookEndpoint()` docblock no longer say a same-key retry always
