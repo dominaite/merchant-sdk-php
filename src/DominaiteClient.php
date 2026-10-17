@@ -80,8 +80,11 @@ class DominaiteClient
     /** This SDK's version. The User-Agent carries it. */
     public const VERSION = '0.6.0';
     private const TIMEOUT_SECONDS = 15;
+    private const DEFAULT_MAX_RETRIES = 2;
+    private const RETRY_BASE_MS = 500;
+    private const RETRY_CAP_MS = 8000;
     /** The keys the constructor's $options accepts. */
-    private const OPTION_KEYS = ['userAgent', 'logger', 'debug'];
+    private const OPTION_KEYS = ['userAgent', 'logger', 'debug', 'maxRetries', 'timeout'];
     /** Distinct Dominaite-Sdk-Notice values one client remembers; later new ones are dropped. */
     private const MAX_NOTICES = 32;
     /** The API rejects requests from 300 seconds of skew; the SDK warns well before that. */
@@ -640,6 +643,18 @@ class DominaiteClient
      */
     private const CHARGE_GENERIC_FAILURE_STATUSES = [400, 401, 403, 429];
 
+    /**
+     * The 5xx codes the automatic retry leaves to the caller. Each one is an answer about
+     * this request, not an outage: the provider failed or broke the contract, the charge
+     * outcome needs a getStatus() check, or charges are off for the payment method.
+     */
+    private const NOT_RETRIED_5XX_CODES = [
+        'CHARGE_OUTCOME_UNKNOWN',
+        'CHARGE_FAILED',
+        'PAYMENT_METHOD_CHARGES_DISABLED',
+        'UPSTREAM_CONTRACT_ERROR',
+    ];
+
     private string $keyId;
     private string $secret;
     private string $baseUrl;
@@ -649,6 +664,8 @@ class DominaiteClient
     /** @var object|null Anything with warning(string $message, array $context = []); PSR-3 fits. */
     private ?object $logger = null;
     private bool $debug = false;
+    private int $maxRetries = self::DEFAULT_MAX_RETRIES;
+    private int $timeoutMs = self::TIMEOUT_SECONDS * 1000;
     /** @var array<string,true> The Dominaite-Sdk-Notice values this client already warned about. */
     private array $seenNotices = [];
 
@@ -670,6 +687,12 @@ class DominaiteClient
      *                         debug (bool) - one line per request (method, path, status,
      *                         time, request id, idempotency key) to the logger's debug(),
      *                         or to error_log() without one. Off by default.
+     *                         maxRetries (int, 0 or more) - how many times a failed attempt is
+     *                         sent again, with the same idempotency key. Default 2; 0 sends
+     *                         each request once. See send() for what is retried.
+     *                         timeout (int|float seconds, more than 0) - the limit for ONE
+     *                         attempt. Default 15. With retries, one call can take up to
+     *                         (maxRetries + 1) x timeout, plus the waits between attempts.
      *                         An unknown key throws InvalidArgumentException.
      */
     public function __construct(string $keyId, string $secret, ?string $baseUrl = null, array $options = [])
@@ -703,6 +726,17 @@ class DominaiteClient
             throw new \InvalidArgumentException('debug must be a bool');
         }
         $this->debug = $debug;
+
+        $maxRetries = $options['maxRetries'] ?? self::DEFAULT_MAX_RETRIES;
+        if (!is_int($maxRetries) || $maxRetries < 0) {
+            throw new \InvalidArgumentException('maxRetries must be an int of 0 or more');
+        }
+        $this->maxRetries = $maxRetries;
+        $timeout = $options['timeout'] ?? self::TIMEOUT_SECONDS;
+        if ((!is_int($timeout) && !is_float($timeout)) || !($timeout > 0) || is_infinite((float) $timeout)) {
+            throw new \InvalidArgumentException('timeout must be a number of seconds, more than 0');
+        }
+        $this->timeoutMs = max(1, (int) round($timeout * 1000));
     }
 
     /**
@@ -933,6 +967,8 @@ class DominaiteClient
         $this->userAgent = self::userAgent(null);
         $this->logger = null;
         $this->debug = false;
+        $this->maxRetries = self::DEFAULT_MAX_RETRIES;
+        $this->timeoutMs = self::TIMEOUT_SECONDS * 1000;
         $this->seenNotices = [];
     }
 
@@ -2509,8 +2545,20 @@ class DominaiteClient
      * to read, because the payment-method routes answer 402, 409, 422, 502 and 503
      * with a body that the caller needs.
      *
+     * A failed attempt is sent again, up to the maxRetries option (default 2), when the
+     * API can replay it: a GET, or a POST with an idempotency key. The body, the path and
+     * the idempotency key are the same on every attempt; only the timestamp, and so the
+     * signature, is new. An attempt is retried after:
+     *  - no answer at all (connect error, reset, timeout);
+     *  - a 5xx, except a code in NOT_RETRIED_5XX_CODES;
+     *  - a PAYMENT_PROCESSING_UNAVAILABLE refusal, whatever the status.
+     * Never retried: a 429 (back off as Retry-After says), a 4xx, an answer over the size
+     * cap, PATCH and DELETE, and webhook endpoint create, whose answer carries the signing
+     * secret once. Before retry n (from 0) the client waits a random time from 0 to
+     * min(8 s, 500 ms x 2^n). The last attempt's answer or exception is what the route sees.
+     *
      * @param array<string,mixed>|null $body Null for GET and DELETE.
-     * @return array{status:int,envelope:array<string,mixed>,payload:array<string,mixed>,error:array<string,mixed>}
+     * @return array{status:int,envelope:array<string,mixed>,payload:array<string,mixed>,error:array<string,mixed>,requestId:?string}
      *
      * Protected for the same reason as request(); not part of the public API.
      */
@@ -2534,36 +2582,122 @@ class DominaiteClient
         $queryAt = strpos($path, '?');
         $signedPath = $queryAt === false ? $path : substr($path, 0, $queryAt);
 
-        $timestamp = (string) time();
-        $signature = $this->sign($timestamp, $method, $signedPath, $idempotencyKey, $json);
+        $replayable = $method === 'GET'
+            || ($method === 'POST' && $idempotencyKey !== '' && $signedPath !== self::WEBHOOKS_PATH);
+        $retries = $replayable ? $this->maxRetries : 0;
 
-        $headers = [
-            'Content-Type: application/json',
-            'X-Api-Key-Id: ' . $this->keyId,
-            'X-Timestamp: ' . $timestamp,
-            'X-Signature: ' . $signature,
-        ];
-        if ($idempotencyKey !== '') {
-            $headers[] = 'Idempotency-Key: ' . $idempotencyKey;
+        for ($attempt = 1; ; $attempt++) {
+            $canRetry = $attempt <= $retries;
+            $retry = false;
+
+            $timestamp = (string) time();
+            $headers = [
+                'Content-Type: application/json',
+                'X-Api-Key-Id: ' . $this->keyId,
+                'X-Timestamp: ' . $timestamp,
+                'X-Signature: ' . $this->sign($timestamp, $method, $signedPath, $idempotencyKey, $json),
+            ];
+            if ($idempotencyKey !== '') {
+                $headers[] = 'Idempotency-Key: ' . $idempotencyKey;
+            }
+
+            $started = hrtime(true);
+            $answer = $this->exchange($method, $this->baseUrl . $path, $headers, $body === null ? null : $json);
+            $this->lastRequestId = null;
+            try {
+                if ($answer['oversized']) {
+                    throw new TransportException(
+                        'The API response exceeded ' . self::MAX_RESPONSE_BYTES . ' bytes and was not read; '
+                        . 'retry with the same idempotency key.'
+                    );
+                }
+                if ($answer['error'] !== null) {
+                    $retry = $canRetry;
+                    throw new TransportException("Could not reach the Dominaite API: {$answer['error']}");
+                }
+                try {
+                    $reply = $this->readResponse($answer['status'], $answer['body'], $answer['headers']);
+                } catch (TransportException $unreadable) {
+                    // Only a 5xx without a JSON body lands here: an edge's error page.
+                    $retry = $canRetry;
+                    throw $unreadable;
+                }
+                $retry = $canRetry && self::retriesReply($reply);
+                if (!$retry) {
+                    return $reply;
+                }
+            } catch (TransportException $failure) {
+                if (!$retry) {
+                    throw $failure;
+                }
+            } finally {
+                // After readResponse(), so the line carries the request id from the header or
+                // the body, and is written for an answer that throws too.
+                if ($this->debug) {
+                    $line = 'dominaite-php: ' . $method . ' ' . $signedPath . ' '
+                        . ($answer['oversized'] || $answer['error'] !== null ? 'error' : (string) $answer['status']) . ' '
+                        . intdiv(hrtime(true) - $started, 1000000) . 'ms';
+                    if ($this->lastRequestId !== null) {
+                        $line .= ' request_id=' . $this->lastRequestId;
+                    }
+                    if ($idempotencyKey !== '') {
+                        $line .= ' idempotency_key=' . $idempotencyKey;
+                    }
+                    if ($attempt > 1) {
+                        $line .= ' attempt=' . $attempt;
+                    }
+                    $this->debugLine($line);
+                }
+            }
+
+            $this->sleepMs($this->randomMs(min(self::RETRY_CAP_MS, self::RETRY_BASE_MS * 2 ** ($attempt - 1))));
+        }
+    }
+
+    /**
+     * Whether a reply that readResponse() returned is worth another attempt.
+     *
+     * @param array{status:int,envelope:array<string,mixed>,payload:array<string,mixed>,error:array<string,mixed>} $reply
+     */
+    private static function retriesReply(array $reply): bool
+    {
+        $code = $reply['error']['code'] ?? $reply['payload']['errorCode'] ?? null;
+        if ($code === self::PAYMENT_PROCESSING_UNAVAILABLE) {
+            return true;
         }
 
+        return $reply['status'] >= 500 && !in_array($code, self::NOT_RETRIED_5XX_CODES, true);
+    }
+
+    /**
+     * Sends one attempt over curl and hands back what came back, without reading it.
+     *
+     * @param list<string> $headers
+     * @param ?string      $payload The JSON body, or null to send none.
+     * @return array{status:int,body:string,headers:array<string,string>,error:?string,oversized:bool}
+     *         error is curl's message when no answer came back, else null. headers has
+     *         lowercased names.
+     *
+     * Protected so tests can stand in for the network; not part of the public API.
+     */
+    protected function exchange(string $method, string $url, array $headers, ?string $payload): array
+    {
         $raw = '';
         $oversized = false;
         $responseHeaders = [];
 
-        $started = hrtime(true);
-        $ch = curl_init($this->baseUrl . $path);
+        $ch = curl_init($url);
         $options = [
             CURLOPT_CUSTOMREQUEST => $method,
             CURLOPT_RETURNTRANSFER => true,
-            CURLOPT_TIMEOUT => self::TIMEOUT_SECONDS,
+            CURLOPT_TIMEOUT_MS => $this->timeoutMs,
             // Some edges block requests without a real User-Agent - always send one.
             CURLOPT_USERAGENT => $this->userAgent,
             CURLOPT_HTTPHEADER => $headers,
             // Buffer the body ourselves so the size cap can abort mid-transfer. Returning
             // a short count from this callback is curl's documented way to stop a read;
             // the transfer then fails with a write error, which $oversized tells apart
-            // from a real network failure below.
+            // from a real network failure.
             CURLOPT_WRITEFUNCTION => static function ($handle, string $chunk) use (&$raw, &$oversized): int {
                 if ($oversized || strlen($raw) + strlen($chunk) > self::MAX_RESPONSE_BYTES) {
                     $oversized = true;
@@ -2583,8 +2717,12 @@ class DominaiteClient
                 return strlen($header);
             },
         ];
-        if ($body !== null) {
-            $options[CURLOPT_POSTFIELDS] = $json;
+        if ($this->timeoutMs < 1000) {
+            // Below one second curl needs this, or the name lookup ignores the limit.
+            $options[CURLOPT_NOSIGNAL] = true;
+        }
+        if ($payload !== null) {
+            $options[CURLOPT_POSTFIELDS] = $payload;
         }
         curl_setopt_array($ch, $options);
 
@@ -2593,35 +2731,32 @@ class DominaiteClient
         $status = (int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
         curl_close($ch);
 
-        $this->lastRequestId = null;
-        try {
-            if ($oversized) {
-                throw new TransportException(
-                    'The API response exceeded ' . self::MAX_RESPONSE_BYTES . ' bytes and was not read; '
-                    . 'retry with the same idempotency key.'
-                );
-            }
-            if ($completed === false) {
-                throw new TransportException("Could not reach the Dominaite API: {$error}");
-            }
+        return [
+            'status' => $status,
+            'body' => $raw,
+            'headers' => $responseHeaders,
+            'error' => $completed === false && !$oversized ? $error : null,
+            'oversized' => $oversized,
+        ];
+    }
 
-            return $this->readResponse($status, $raw, $responseHeaders);
-        } finally {
-            // After readResponse(), so the line carries the request id from the header or
-            // the body, and is written for an answer that throws too.
-            if ($this->debug) {
-                $line = 'dominaite-php: ' . $method . ' ' . $signedPath . ' '
-                    . ($oversized || $completed === false ? 'error' : (string) $status) . ' '
-                    . intdiv(hrtime(true) - $started, 1000000) . 'ms';
-                if ($this->lastRequestId !== null) {
-                    $line .= ' request_id=' . $this->lastRequestId;
-                }
-                if ($idempotencyKey !== '') {
-                    $line .= ' idempotency_key=' . $idempotencyKey;
-                }
-                $this->debugLine($line);
-            }
+    /**
+     * Waits before a retry. Protected so tests can record the wait instead of sleeping.
+     */
+    protected function sleepMs(int $milliseconds): void
+    {
+        if ($milliseconds > 0) {
+            usleep($milliseconds * 1000);
         }
+    }
+
+    /**
+     * The random part of the backoff: a whole number from 0 to $max milliseconds.
+     * Protected so tests can pin the draw; not part of the public API.
+     */
+    protected function randomMs(int $max): int
+    {
+        return random_int(0, $max);
     }
 
     /**
