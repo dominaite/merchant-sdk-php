@@ -288,7 +288,8 @@ it). Branch on `getErrorCode()`, using the constants on `DominaiteClient`:
 | `STOREFRONT_MISMATCH` | 400 | The API key belongs to another storefront than the request names. | Use the key issued for this site. |
 
 Replaying a key that was first used for a different storefront answers `STOREFRONT_MISMATCH`
-as an HTTP 200 refusal, so that one case arrives as `CheckoutRefusedException`.
+as an HTTP 200 refusal. It arrives as `StorefrontException` too, with `getHttpStatus()` 200
+and the refusal (with the `transactionId` it collided with) on `getResult()`.
 
 That's the checkout half: the session call above, the script tag, and your domain bound to
 your checkout by Dominaite during onboarding. The other half is the webhook that tells you

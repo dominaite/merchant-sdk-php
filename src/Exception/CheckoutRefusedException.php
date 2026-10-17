@@ -12,8 +12,9 @@ namespace Dominaite\Exception;
  * - ALREADY_PROCESSED: this idempotency key's payment already completed.
  * - PRIOR_ATTEMPT_FAILED: a prior attempt with this key failed terminally; use a fresh key.
  * - IDEMPOTENCY_KEY_REUSED: same key sent with a DIFFERENT body; use a fresh key.
- * - STOREFRONT_MISMATCH: the key was first used for a different storefront. A fresh
- *   request with that problem is a StorefrontException (HTTP 400) instead.
+ *
+ * A STOREFRONT_MISMATCH refusal (the key was first used for a different storefront) is
+ * not this exception: it arrives as a StorefrontException with getHttpStatus() 200.
  *
  * The codes are named constants on DominaiteClient (DominaiteClient::ALREADY_PROCESSED
  * and so on), so a typo in a branch fails loudly instead of never matching.

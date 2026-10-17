@@ -45,7 +45,7 @@ class DominaiteClient
     public const SESSIONS_PATH = '/merchant-api/checkout/sessions';
     /**
      * Canonical path of stored payment methods. POST {id}/charges charges one, DELETE
-     * {id} revokes it - both signed on this path with the id verbatim.
+     * {id} revokes it - both signed on this path with the id in lowercase.
      */
     public const PAYMENT_METHODS_PATH = '/merchant-api/payment-methods';
     /**
@@ -110,8 +110,8 @@ class DominaiteClient
     /**
      * A payment method id is opaque (pm_...), so this only pins what keeps it a single
      * path segment: no slash, no query, no whitespace, nothing that needs
-     * percent-encoding. The id goes into the signed canonical path verbatim, so anything
-     * else would sign one path and request another.
+     * percent-encoding. Anything else would sign one path and request another. The plan_,
+     * agr_ and re_ ids share the pattern and go into the signed path verbatim.
      */
     private const PAYMENT_METHOD_ID_PATTERN = '/^[A-Za-z0-9_-]{1,100}$/';
 
@@ -207,7 +207,8 @@ class DominaiteClient
     /**
      * HTTP 400: the API key is bound to one storefront and the request named another. A
      * configuration bug: use the key issued for that storefront. On a replay of a key
-     * first used for a different storefront it arrives as an HTTP 200 refusal instead.
+     * first used for a different storefront the API answers HTTP 200 instead; both arrive
+     * as a StorefrontException, the replay with getHttpStatus() 200.
      */
     public const STOREFRONT_MISMATCH = 'STOREFRONT_MISMATCH';
 
@@ -483,6 +484,12 @@ class DominaiteClient
      * route's typed exception; without a code a 5xx stays the retryable transport error.
      */
     private const GENERIC_FAILURE_STATUSES = [400, 401, 403, 404, 429];
+
+    /**
+     * The same for the charge route, without 404: a coded 404 there (PAYMENT_METHOD_NOT_FOUND,
+     * AGREEMENT_NOT_FOUND) is a ChargeException like the other charge refusals.
+     */
+    private const CHARGE_GENERIC_FAILURE_STATUSES = [400, 401, 403, 429];
 
     private string $keyId;
     private string $secret;
@@ -890,7 +897,8 @@ class DominaiteClient
      * @throws AuthenticationException Wrong/revoked credentials or bad signature (fix config; do not retry),
      *                                 or HTTP 403 VERIFY_ONLY_NOT_ENABLED.
      * @throws CheckoutRefusedException The gateway refused the session (inspect getErrorCode()).
-     * @throws StorefrontException     The storefront cannot take payments (STOREFRONT_ERROR_CODES, HTTP 409 or 400).
+     * @throws StorefrontException     The storefront cannot take payments (STOREFRONT_ERROR_CODES, HTTP 409 or 400,
+     *                                 or 200 for a replayed key first used for another storefront).
      * @throws ApiException            Unexpected API response.
      * @throws RateLimitException     HTTP 429 - you are over the rate limit; back off (getRetryAfterSeconds()).
      * @throws TransportException      Network-level failure (retry WITH the same idempotencyKey - getLastIdempotencyKey()).
@@ -943,10 +951,18 @@ class DominaiteClient
             // (and the whole payload) so the caller can reconcile with getStatus()
             // instead of minting a second payment for the same order.
             $transactionId = $response['transactionId'] ?? null;
+            $errorCode = (string) ($response['errorCode'] ?? 'UNKNOWN');
+            $errorMessage = (string) ($response['errorMessage'] ?? 'The checkout session was refused.');
+
+            // A storefront problem is one class whatever the status: a replay for another
+            // storefront answers 200, a fresh request 400.
+            if (in_array($errorCode, self::STOREFRONT_ERROR_CODES, true)) {
+                throw new StorefrontException(200, $errorMessage, $errorCode, $response);
+            }
 
             throw new CheckoutRefusedException(
-                (string) ($response['errorCode'] ?? 'UNKNOWN'),
-                (string) ($response['errorMessage'] ?? 'The checkout session was refused.'),
+                $errorCode,
+                $errorMessage,
                 is_string($transactionId) && $transactionId !== '' ? $transactionId : null,
                 $response
             );
@@ -1157,16 +1173,17 @@ class DominaiteClient
      * @param array<string,mixed> $params
      * @return array{chargeId:string,status:string,declineClass:?string,declineCode:?string,transactionId:string,agreementId:?string,sequence?:int}
      *
-     * @throws ChargeException         409, 422, 502 or 503 with a code (CHARGE_ERROR_CODES): branch on
-     *                                 getErrorCode(). CHARGE_OUTCOME_UNKNOWN carries the charge row
-     *                                 (getCharge(), getTransactionId()): poll getStatus() with it, never
-     *                                 retry under a new key.
+     * @throws ChargeException         404, 409 or 422 with a code, or 502 or 503 with a code in
+     *                                 CHARGE_ERROR_CODES: branch on getErrorCode(). An id that is not
+     *                                 yours is 404 PAYMENT_METHOD_NOT_FOUND. CHARGE_OUTCOME_UNKNOWN
+     *                                 carries the charge row (getCharge(), getTransactionId()): poll
+     *                                 getStatus() with it, never retry under a new key.
      * @throws AuthenticationException Wrong/revoked credentials or bad signature (fix config; do not retry).
-     * @throws ApiException            An id that is not yours (HTTP 404, getErrorCode() PAYMENT_METHOD_NOT_FOUND),
-     *                                 validation (HTTP 400) or an unexpected response.
+     * @throws ApiException            Validation (HTTP 400) or an unexpected response.
      * @throws RateLimitException     HTTP 429 - back off (getRetryAfterSeconds()), retry with the same key.
-     * @throws TransportException      Network-level failure or a 5xx without a code (retry WITH the same
-     *                                 idempotencyKey - getLastIdempotencyKey()).
+     * @throws TransportException      Network-level failure, or a 5xx with no code or a code not in
+     *                                 CHARGE_ERROR_CODES (getErrorCode() keeps it). Retry WITH the same
+     *                                 idempotencyKey - getLastIdempotencyKey().
      */
     public function chargePaymentMethod(string $paymentMethodId, array $params): array
     {
@@ -1213,7 +1230,11 @@ class DominaiteClient
             return $charge;
         }
 
-        if ($errorCode !== null && $reply['status'] >= 400 && !in_array($reply['status'], self::GENERIC_FAILURE_STATUSES, true)) {
+        // A 5xx is the charge's own outcome only for the codes the route owns. Any other
+        // coded 5xx (the platform's INTERNAL_ERROR, say) stays the transport error it is.
+        if ($errorCode !== null && $reply['status'] >= 400
+            && !in_array($reply['status'], self::CHARGE_GENERIC_FAILURE_STATUSES, true)
+            && ($reply['status'] < 500 || in_array($errorCode, self::CHARGE_ERROR_CODES, true))) {
             throw new ChargeException(
                 $reply['status'],
                 $errorCode,
@@ -1241,7 +1262,8 @@ class DominaiteClient
      * @throws AuthenticationException Wrong/revoked credentials or bad signature (fix config; do not retry).
      * @throws ApiException            An id that is not yours (HTTP 404) or unexpected response.
      * @throws RateLimitException     HTTP 429 - back off (getRetryAfterSeconds()).
-     * @throws TransportException      Network-level failure or a 5xx without a code (safe to retry).
+     * @throws TransportException      Network-level failure, or a 5xx with no code or another code
+     *                                 (getErrorCode() keeps it). Safe to retry.
      */
     public function revokePaymentMethod(string $paymentMethodId): void
     {
@@ -1255,7 +1277,8 @@ class DominaiteClient
         }
 
         $errorCode = $reply['error']['code'] ?? null;
-        if (is_string($errorCode) && $errorCode !== '' && !in_array($reply['status'], self::GENERIC_FAILURE_STATUSES, true)) {
+        if (is_string($errorCode) && $errorCode !== '' && !in_array($reply['status'], self::GENERIC_FAILURE_STATUSES, true)
+            && ($reply['status'] < 500 || in_array($errorCode, self::REVOKE_ERROR_CODES, true))) {
             throw new RevokeException(
                 $reply['status'],
                 $errorCode,
@@ -2111,10 +2134,14 @@ class DominaiteClient
         return $idempotencyKey;
     }
 
-    /** Refuses anything that would not survive as one path segment of the signed canonical path. */
+    /**
+     * Refuses anything that would not survive as one path segment of the signed canonical
+     * path, and lowercases the rest. The API signs a charge on the lowercase pm_ id
+     * whatever case the request used, so an uppercase id would fail the signature.
+     */
     private static function normalizePaymentMethodId(string $paymentMethodId): string
     {
-        $normalized = trim($paymentMethodId);
+        $normalized = strtolower(trim($paymentMethodId));
         if (preg_match(self::PAYMENT_METHOD_ID_PATTERN, $normalized) !== 1) {
             throw new \InvalidArgumentException('paymentMethodId must be the storedPaymentMethod id from getStatus()');
         }
@@ -2548,11 +2575,11 @@ class DominaiteClient
      */
     private static function rejection(array $reply): \RuntimeException
     {
-        if ($reply['status'] >= 500) {
-            return self::unavailable($reply['status']);
-        }
         $errorCode = $reply['payload']['errorCode'] ?? $reply['error']['code'] ?? null;
         $errorCode = is_string($errorCode) && $errorCode !== '' ? $errorCode : null;
+        if ($reply['status'] >= 500) {
+            return self::unavailable($reply['status'], $errorCode, $reply['envelope']);
+        }
         $message = (string) ($reply['payload']['errorMessage'] ?? $reply['error']['message'] ?? 'Request rejected');
 
         if ($errorCode !== null && in_array($errorCode, self::STOREFRONT_ERROR_CODES, true)) {
@@ -2562,9 +2589,18 @@ class DominaiteClient
         return new ApiException($reply['status'], $message, $errorCode, $reply['envelope']);
     }
 
-    private static function unavailable(int $status): TransportException
+    /** @param array<string,mixed> $envelope */
+    private static function unavailable(int $status, ?string $errorCode = null, array $envelope = []): TransportException
     {
-        return new TransportException("The Dominaite API is unavailable (HTTP {$status}); retry with the same idempotency key.");
+        return new TransportException(
+            "The Dominaite API is unavailable (HTTP {$status}" . ($errorCode === null ? '' : ", {$errorCode}")
+            . '); retry with the same idempotency key.',
+            0,
+            null,
+            $status,
+            $errorCode,
+            $envelope
+        );
     }
 
     /**

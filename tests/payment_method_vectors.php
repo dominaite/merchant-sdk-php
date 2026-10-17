@@ -329,16 +329,45 @@ foreach ([409 => 'PAYMENT_METHOD_NOT_ACTIVE', 422 => 'IDEMPOTENCY_KEY_REUSED', 5
     check("$status $code has no transaction to poll", $thrown !== null && $thrown->getTransactionId() === null ? 'null' : 'set', 'null');
 }
 
-// The generic statuses keep their generic exceptions, code and all.
-$missing = null;
-try {
-    (new RecordingClient(['success' => false, 'error' => ['message' => 'No stored payment method with this id.', 'code' => 'PAYMENT_METHOD_NOT_FOUND', 'statusCode' => 404]], 404))
-        ->chargePaymentMethod(PAYMENT_METHOD_ID, $chargeParams);
-} catch (ApiException $e) {
-    $missing = $e;
+// A coded 404 on a charge is a charge refusal like the 409 and 422 ones.
+foreach (['PAYMENT_METHOD_NOT_FOUND', 'AGREEMENT_NOT_FOUND'] as $code) {
+    $missing = null;
+    try {
+        (new RecordingClient(['success' => false, 'error' => ['message' => 'Not found.', 'code' => $code, 'statusCode' => 404]], 404))
+            ->chargePaymentMethod(PAYMENT_METHOD_ID, $chargeParams);
+    } catch (\Throwable $e) {
+        $missing = $e;
+    }
+    check("a 404 $code on a charge is a ChargeException", $missing === null ? 'no exception' : get_class($missing), ChargeException::class);
+    check("the charge 404 $code keeps status and code",
+        $missing instanceof ChargeException ? $missing->getHttpStatus() . ' ' . $missing->getErrorCode() : '', "404 $code");
 }
-check('a 404 on a charge is an ApiException', $missing === null ? 'no exception' : get_class($missing), ApiException::class);
-check('the charge 404 keeps its code', $missing === null ? '' : (string) $missing->getErrorCode(), 'PAYMENT_METHOD_NOT_FOUND');
+
+// A coded 5xx that the route does not own is the platform failing, not a charge or revoke
+// outcome: a retryable transport error that keeps the status, the code and the envelope.
+$internal = ['success' => false, 'error' => ['code' => 'INTERNAL_ERROR', 'message' => 'An unexpected error occurred', 'statusCode' => 500]];
+foreach ([
+    'charge' => static function () use ($internal, $chargeParams): void {
+        (new RecordingClient($internal, 500))->chargePaymentMethod(PAYMENT_METHOD_ID, $chargeParams);
+    },
+    'revoke' => static function () use ($internal): void {
+        (new RecordingClient($internal, 500))->revokePaymentMethod(PAYMENT_METHOD_ID);
+    },
+] as $route => $call) {
+    $thrown = null;
+    try {
+        $call();
+    } catch (\Throwable $e) {
+        $thrown = $e;
+    }
+    check("a coded 500 on a $route is a TransportException", $thrown === null ? 'no exception' : get_class($thrown), TransportException::class);
+    check("the $route 500 keeps its status and code",
+        $thrown instanceof TransportException ? $thrown->getHttpStatus() . ' ' . $thrown->getErrorCode() : '', '500 INTERNAL_ERROR');
+    check("the $route 500 keeps the envelope",
+        $thrown instanceof TransportException ? (string) ($thrown->getResult()['error']['message'] ?? '') : '', 'An unexpected error occurred');
+}
+
+// The generic statuses keep their generic exceptions, code and all.
 check('a 400 on a charge is an ApiException',
     thrownBy(static function () use ($chargeParams): void {
         (new RecordingClient(['success' => false, 'error' => ['message' => 'Validation failed', 'code' => 'VALIDATION_ERROR', 'statusCode' => 400]], 400))
@@ -432,6 +461,15 @@ check('no bad id reached the transport', (string) count($client->calls), '0');
 $client = new RecordingClient($charge, 201);
 $client->chargePaymentMethod(' ' . PAYMENT_METHOD_ID . ' ', $chargeParams);
 check('a padded id is trimmed', $client->calls[0]['path'], DominaiteClient::PAYMENT_METHODS_PATH . '/' . PAYMENT_METHOD_ID . '/charges');
+
+// The API signs a charge on the lowercase pm_ id whatever case the request used, so the SDK
+// sends and signs the lowercase form on both routes.
+$client = new RecordingClient($charge, 201);
+$client->chargePaymentMethod(strtoupper(PAYMENT_METHOD_ID), $chargeParams);
+check('an uppercase id is charged in lowercase', $client->calls[0]['path'], DominaiteClient::PAYMENT_METHODS_PATH . '/' . PAYMENT_METHOD_ID . '/charges');
+$client = new RecordingClient([], 204);
+$client->revokePaymentMethod('PM_' . substr(PAYMENT_METHOD_ID, 3));
+check('an uppercase id is revoked in lowercase', $client->calls[0]['path'], DominaiteClient::PAYMENT_METHODS_PATH . '/' . PAYMENT_METHOD_ID);
 
 // --- revokePaymentMethod ---------------------------------------------------------------
 $client = new RecordingClient($charge, 201);

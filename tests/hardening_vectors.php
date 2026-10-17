@@ -370,6 +370,30 @@ foreach ($storefrontCases as [$status, $code, $message]) {
     check("$status $code carries its status", $thrown instanceof ApiException ? (string) $thrown->getHttpStatus() : '', (string) $status);
     check("$status $code carries the gateway message", $thrown === null ? '' : $thrown->getMessage(), $message);
 }
+// A 5xx in the gateway's envelope stays the retryable TransportException, and keeps the
+// status, the code and the envelope, so a caller can tell MERCHANT_API_UNAVAILABLE from a crash.
+$unavailable = null;
+try {
+    $responseClient->handle(503, '{"success":false,"error":{"code":"MERCHANT_API_UNAVAILABLE","message":"Try again.","statusCode":503}}');
+} catch (\Throwable $e) {
+    $unavailable = $e;
+}
+check('a coded 503 is a TransportException', $unavailable === null ? 'no exception' : get_class($unavailable), TransportException::class);
+check('the coded 503 keeps status and code',
+    $unavailable instanceof TransportException ? $unavailable->getHttpStatus() . ' ' . $unavailable->getErrorCode() : '',
+    '503 MERCHANT_API_UNAVAILABLE');
+check('the coded 503 keeps the envelope',
+    $unavailable instanceof TransportException ? (string) ($unavailable->getResult()['error']['message'] ?? '') : '', 'Try again.');
+$bare = null;
+try {
+    $responseClient->handle(502, '<html>bad gateway</html>');
+} catch (\Throwable $e) {
+    $bare = $e;
+}
+check('an HTML 502 is a TransportException with the status and no code',
+    $bare instanceof TransportException ? $bare->getHttpStatus() . ' ' . var_export($bare->getErrorCode(), true) : 'not',
+    '502 NULL');
+
 // A rejection keeps the whole envelope: error.params is where the API names the record a
 // conflict is about, and the SDK does not model every code's params.
 $conflict = null;

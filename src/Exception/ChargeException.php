@@ -13,6 +13,8 @@ namespace Dominaite\Exception;
  *   webhook. Never retry under a new key.
  * - CHARGE_FAILED (502): nothing was charged. getCharge() is set when a row exists (its
  *   declineClass and declineCode are null), null when the provider refused before one.
+ * - PAYMENT_METHOD_NOT_FOUND (404): the id is not one of your stored payment methods.
+ *   Nothing was charged. Any other coded 404 on the charge route is this exception too.
  * - PAYMENT_METHOD_NOT_ACTIVE (409): the method is revoked or expired; ask the customer
  *   for another card via a hosted session with saveCard.
  * - DUPLICATE_REQUEST (409): a request with this key is still in flight; retry with the
@@ -25,7 +27,11 @@ namespace Dominaite\Exception;
  *   on, retry later with the SAME key.
  *
  * A decline (HTTP 402) is deliberately NOT this exception: chargePaymentMethod() returns
- * it as a charge with status 'failed'.
+ * it as a charge with status 'failed'. A 5xx with a code not listed in
+ * DominaiteClient::CHARGE_ERROR_CODES (for example INTERNAL_ERROR) is not this exception
+ * either: it is a TransportException that keeps the code.
+ *
+ * Not an ApiException: a catch (ApiException $e) block does not see it.
  *
  * getResult() is the whole envelope the gateway sent, for fields not modelled above.
  */

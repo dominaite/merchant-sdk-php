@@ -242,6 +242,30 @@ foreach (DominaiteClient::REFUSAL_ERROR_CODES as $code) {
     }
 }
 
+// A replayed key first used for another storefront answers HTTP 200 with STOREFRONT_MISMATCH.
+// It is a storefront problem like the 400 one, so it gets the same class, at status 200.
+$replayed = null;
+try {
+    (new CannedClient([
+        'success' => false,
+        'checkout' => null,
+        'transactionId' => '0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0',
+        'errorCode' => DominaiteClient::STOREFRONT_MISMATCH,
+        'errorMessage' => 'This key was first used for another storefront.',
+    ]))->createCheckoutSession(['amount' => 8440, 'currency' => 'EUR', 'orderReference' => 'order-1042',
+        'idempotencyKey' => 'order-1042']);
+} catch (\Throwable $e) {
+    $replayed = $e;
+}
+check('a 200 STOREFRONT_MISMATCH replay is a StorefrontException',
+    $replayed === null ? 'no exception' : get_class($replayed), StorefrontException::class);
+check('the 200 STOREFRONT_MISMATCH replay keeps status and code',
+    $replayed instanceof StorefrontException ? $replayed->getHttpStatus() . ' ' . $replayed->getErrorCode() : '',
+    '200 ' . DominaiteClient::STOREFRONT_MISMATCH);
+check('the 200 STOREFRONT_MISMATCH replay keeps the transaction it collided with',
+    $replayed instanceof StorefrontException ? (string) ($replayed->getResult()['transactionId'] ?? '') : '',
+    '0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0');
+
 // 3. The endpoints. Each canned response is the fixture's own example object.
 $endpoints = $fixture['endpoints'];
 
@@ -748,15 +772,16 @@ check('CHARGE_OUTCOME_UNKNOWN is the example that carries a transaction to poll'
     (string) $charge['errorExamples'][0]['code'] . ' ' . (isset($charge['errorExamples'][0]['body']['data']['transactionId']) ? 'with transactionId' : 'without'),
     'CHARGE_OUTCOME_UNKNOWN with transactionId');
 
-// 404: an id that is not yours stays the generic ApiException, code and all.
+// 404: an id that is not yours is a ChargeException, code and all. The fixture still calls
+// it a generic error; the SDKs follow one rule instead: a coded charge answer is a charge error.
 $notFound = $charge['notFoundExample'];
 $missing = null;
 try {
     (new CannedClient($notFound['body'], (int) $notFound['httpStatus']))->chargePaymentMethod($paymentMethodId, $chargeParams);
-} catch (ApiException $e) {
+} catch (ChargeException $e) {
     $missing = $e;
 }
-check('a charge on an id that is not yours is an ApiException', $missing === null ? 'no exception' : get_class($missing), ApiException::class);
+check('a charge on an id that is not yours is a ChargeException', $missing === null ? 'no exception' : get_class($missing), ChargeException::class);
 check('the charge 404 keeps its status', (string) ($missing === null ? 0 : $missing->getHttpStatus()), (string) $notFound['httpStatus']);
 check('the charge 404 keeps its code', (string) ($missing === null ? '' : $missing->getErrorCode()), (string) $notFound['code']);
 check('the charge 404 keeps its message', $missing === null ? '' : $missing->getMessage(), (string) $notFound['body']['error']['message']);
