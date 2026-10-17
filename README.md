@@ -847,6 +847,11 @@ try {
             pollUntilSettled($e->getTransactionId());
             break;
         case 'DUPLICATE_REQUEST':
+            // 409: an earlier request with this key is still running, or it finished and
+            // its answer can no longer be replayed. A charge MAY exist. Retry with the SAME
+            // idempotency key in a moment. If the code comes back again, read the
+            // transaction (or wait for the webhook). Never retry under a new key.
+            break;
         case 'PAYMENT_PROCESSING_UNAVAILABLE':
             // Nothing was charged; retry later with the SAME idempotency key.
             break;

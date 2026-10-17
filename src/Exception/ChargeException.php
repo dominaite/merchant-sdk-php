@@ -17,8 +17,10 @@ namespace Dominaite\Exception;
  *   Nothing was charged. Any other coded 404 on the charge route is this exception too.
  * - PAYMENT_METHOD_NOT_ACTIVE (409): the method is revoked or expired; ask the customer
  *   for another card via a hosted session with saveCard.
- * - DUPLICATE_REQUEST (409): a request with this key is still in flight; retry with the
- *   SAME key in a moment.
+ * - DUPLICATE_REQUEST (409): an earlier request with this key is still running, or it
+ *   finished and its answer can no longer be replayed. A charge MAY exist. Retry with
+ *   the SAME key in a moment; if the code comes back, read the transaction. Never retry
+ *   under a new key.
  * - IDEMPOTENCY_KEY_REUSED (422): same key, different body or method; a bug on your side.
  * - PAYMENT_PROCESSING_UNAVAILABLE (503): nothing was charged; retry later with the SAME
  *   key.

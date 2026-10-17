@@ -427,7 +427,11 @@ class DominaiteClient
      * body, or the currency or the amount does not fit the card, the agreement or the
      * per-charge cap, or the agreement cannot be charged now), 502 (CHARGE_OUTCOME_UNKNOWN,
      * CHARGE_FAILED) and 503 (PAYMENT_METHOD_CHARGES_DISABLED, PAYMENT_PROCESSING_UNAVAILABLE).
-     * Nothing was charged under any of them except, maybe, CHARGE_OUTCOME_UNKNOWN.
+     * Nothing was charged under any of them except, maybe, CHARGE_OUTCOME_UNKNOWN and
+     * DUPLICATE_REQUEST. DUPLICATE_REQUEST means an earlier request with this key is still
+     * running, or it finished and its answer can no longer be replayed: in both cases a
+     * charge may exist. Retry with the SAME key, or read the transaction; never retry under
+     * a new key.
      * CHARGE_DECLINED (402) is deliberately not one of them: a decline is a charge with
      * status failed. The 429 codes are RateLimitExceptions (CHARGE_VELOCITY_EXCEEDED,
      * CHARGE_DECLINE_RATE_EXCEEDED).
