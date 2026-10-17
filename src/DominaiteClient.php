@@ -23,7 +23,7 @@ use Dominaite\Exception\TransportException;
  *
  * Usage:
  *
- *   $client = new DominaiteClient('dmk_...', 'dms_...');
+ *   $client = new DominaiteClient('dmk_...', 'dms_...', DominaiteClient::SANDBOX_BASE_URL);
  *   $session = $client->createCheckoutSession([
  *       'amount'         => 2500,          // minor units: 25.00 EUR
  *       'currency'       => 'EUR',
@@ -38,7 +38,10 @@ use Dominaite\Exception\TransportException;
 // members are an internal seam and can change without a major version.
 class DominaiteClient
 {
-    private const DEFAULT_BASE_URL = 'https://api.dominaite.com/payments';
+    /** The sandbox base URL. Pass it as the third constructor argument. */
+    public const SANDBOX_BASE_URL = 'https://api.staging.dominaite.com/payments';
+    /** The production base URL. Pass it as the third constructor argument. */
+    public const PRODUCTION_BASE_URL = 'https://api.dominaite.com/payments';
     public const SESSIONS_PATH = '/merchant-api/checkout/sessions';
     /**
      * Canonical path of stored payment methods. POST {id}/charges charges one, DELETE
@@ -482,10 +485,13 @@ class DominaiteClient
     /**
      * @param string $keyId   Your API key id (dmk_...), from the Dominaite dashboard/operator.
      * @param string $secret  Your API secret (dms_...). Server-side only.
-     * @param string $baseUrl Override for non-production environments. Must be https://,
-     *                        except on localhost / 127.0.0.1 / ::1 for local development.
+     * @param ?string $baseUrl Required. self::SANDBOX_BASE_URL or self::PRODUCTION_BASE_URL.
+     *                         There is no default: null, empty or whitespace throws, so an
+     *                         unset environment variable cannot reach production. Must be
+     *                         https://, except on localhost / 127.0.0.1 / ::1 for local
+     *                         development.
      */
-    public function __construct(string $keyId, string $secret, string $baseUrl = self::DEFAULT_BASE_URL)
+    public function __construct(string $keyId, string $secret, ?string $baseUrl = null)
     {
         if (strpos($keyId, 'dmk_') !== 0) {
             throw new \InvalidArgumentException('keyId must start with dmk_');
@@ -494,10 +500,32 @@ class DominaiteClient
             throw new \InvalidArgumentException('secret must start with dms_');
         }
         self::assertHeaderSafe('keyId', $keyId);
-        self::assertTransportIsEncrypted($baseUrl);
+        $baseUrl = self::requireBaseUrl($baseUrl);
         $this->keyId = $keyId;
         $this->secret = $secret;
-        $this->baseUrl = rtrim($baseUrl, '/');
+        $this->baseUrl = $baseUrl;
+    }
+
+    /**
+     * Returns the base URL without surrounding whitespace or trailing slashes, or throws
+     * when there is none.
+     *
+     * There is deliberately no default. A default of production turns an unset
+     * environment variable into sandbox credentials sent to production, which fail
+     * authentication and can get the caller's IP blocked.
+     */
+    private static function requireBaseUrl(?string $baseUrl): string
+    {
+        $trimmed = rtrim(trim((string) $baseUrl), '/');
+        if ($trimmed === '') {
+            throw new \InvalidArgumentException(
+                'baseUrl is required. Use ' . self::SANDBOX_BASE_URL . ' for the sandbox or '
+                . self::PRODUCTION_BASE_URL . ' for production.'
+            );
+        }
+        self::assertTransportIsEncrypted($trimmed);
+
+        return $trimmed;
     }
 
     /**
@@ -580,7 +608,7 @@ class DominaiteClient
     {
         $this->keyId = (string) ($data['keyId'] ?? '');
         $this->secret = (string) ($data['secret'] ?? self::REDACTED);
-        $this->baseUrl = (string) ($data['baseUrl'] ?? self::DEFAULT_BASE_URL);
+        $this->baseUrl = self::requireBaseUrl(isset($data['baseUrl']) ? (string) $data['baseUrl'] : null);
         $this->lastIdempotencyKey = isset($data['lastIdempotencyKey']) ? (string) $data['lastIdempotencyKey'] : null;
     }
 

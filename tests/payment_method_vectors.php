@@ -65,7 +65,7 @@ final class RecordingClient extends DominaiteClient
     /** @param array<string,mixed> $canned */
     public function __construct(array $canned, int $status = 200)
     {
-        parent::__construct(KEY_ID, SECRET);
+        parent::__construct(KEY_ID, SECRET, DominaiteClient::SANDBOX_BASE_URL);
         $this->canned = $canned;
         $this->status = $status;
     }
@@ -486,7 +486,7 @@ check('a codeless 503 on a revoke is still a retryable transport error',
     }), TransportException::class);
 
 // --- the generic response handling the other routes keep ---------------------------------
-$responses = new ResponseClient(KEY_ID, SECRET);
+$responses = new ResponseClient(KEY_ID, SECRET, DominaiteClient::SANDBOX_BASE_URL);
 check('a 204 with no body is a success with nothing to parse', (string) count($responses->handle(204, '')), '0');
 check('a body inside the envelope is unwrapped',
     (string) ($responses->handle(200, '{"success":true,"data":{"chargeId":"ch_1","status":"failed","declineClass":"hard","transactionId":"t"}}')['declineClass'] ?? ''), 'hard');

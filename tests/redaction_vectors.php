@@ -35,7 +35,7 @@ function verdict(string $output): string
     return strpos($output, 'SENTINEL') === false ? 'redacted' : 'LEAKS THE SECRET';
 }
 
-$client = new DominaiteClient('dmk_live_abc', SENTINEL);
+$client = new DominaiteClient('dmk_live_abc', SENTINEL, DominaiteClient::SANDBOX_BASE_URL);
 
 // var_dump writes to the output buffer rather than returning, so capture it.
 ob_start();
@@ -67,7 +67,7 @@ check('the restored client does not carry the secret either',
     verdict(serialize($restored)), 'redacted');
 
 // The dump keeps working after a create call has populated the key slot.
-$withKey = new DominaiteClient('dmk_live_abc', SENTINEL);
+$withKey = new DominaiteClient('dmk_live_abc', SENTINEL, DominaiteClient::SANDBOX_BASE_URL);
 ob_start();
 var_dump($withKey);
 check('var_dump of a fresh client is redacted too', verdict((string) ob_get_clean()), 'redacted');

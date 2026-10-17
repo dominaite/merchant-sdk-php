@@ -45,7 +45,8 @@ final class FlakyClient extends DominaiteClient
     {
         parent::__construct(
             'dmk_0123456789abcdef',
-            'dms_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'
+            'dms_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef',
+            DominaiteClient::SANDBOX_BASE_URL
         );
         $this->failFirst = $failFirst;
     }
@@ -256,7 +257,7 @@ $badKeyIds = [
 foreach ($badKeyIds as $label => $badKeyId) {
     $outcome = 'accepted';
     try {
-        new DominaiteClient($badKeyId, 'dms_0123456789abcdef');
+        new DominaiteClient($badKeyId, 'dms_0123456789abcdef', DominaiteClient::SANDBOX_BASE_URL);
     } catch (\InvalidArgumentException $e) {
         $outcome = 'rejected locally';
     }
@@ -274,7 +275,8 @@ final class RouteClient extends DominaiteClient
     {
         parent::__construct(
             'dmk_0123456789abcdef',
-            'dms_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'
+            'dms_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef',
+            DominaiteClient::SANDBOX_BASE_URL
         );
     }
 

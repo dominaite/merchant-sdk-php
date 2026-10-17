@@ -30,11 +30,29 @@ You get two values from Dominaite (shown once - store them like passwords):
 Every request is signed with the secret (HMAC-SHA256) and timestamped. Keep your server
 clock on NTP - signatures older than 5 minutes are rejected.
 
-The third constructor argument overrides the base URL for non-production environments. It
-has to be `https://`: the key id and the signature travel in headers, and a captured
-signed request stays replayable for the whole 5 minute clock window. `http://` is accepted
-only for `localhost`, `127.0.0.1` and `::1`, so a local mock still works. Anything else
-throws `InvalidArgumentException` at construction rather than on your first live payment.
+### Base URL
+
+The third constructor argument is the base URL. It is required: there is no default.
+
+| Environment | Base URL | Constant |
+|-------------|----------|----------|
+| Sandbox | `https://api.staging.dominaite.com/payments` | `DominaiteClient::SANDBOX_BASE_URL` |
+| Production | `https://api.dominaite.com/payments` | `DominaiteClient::PRODUCTION_BASE_URL` |
+
+The examples below read it from `DOMINAITE_BASE_URL`:
+
+```bash
+export DOMINAITE_BASE_URL=https://api.staging.dominaite.com/payments
+```
+
+A missing, empty or whitespace-only base URL throws `InvalidArgumentException` at
+construction. An unset environment variable therefore fails loudly instead of sending your
+sandbox key to production.
+
+The base URL has to be `https://`: the key id and the signature travel in headers, and a
+captured signed request stays replayable for the whole 5 minute clock window. `http://` is
+accepted only for `localhost`, `127.0.0.1` and `::1`, so a local mock still works. Anything
+else throws `InvalidArgumentException` at construction rather than on your first live payment.
 
 ### Do not dump the client
 
@@ -109,7 +127,7 @@ require __DIR__ . '/vendor/autoload.php';
 
 use Dominaite\DominaiteClient;
 
-$client = new DominaiteClient(getenv('DOMINAITE_KEY_ID'), getenv('DOMINAITE_SECRET'));
+$client = new DominaiteClient(getenv('DOMINAITE_KEY_ID'), getenv('DOMINAITE_SECRET'), getenv('DOMINAITE_BASE_URL'));
 
 print_r($client->ping());
 // ['pong' => true, 'merchantId' => '...', 'serverTime' => '...', 'clockSkewSeconds' => 0]
@@ -144,7 +162,7 @@ use Dominaite\Exception\RateLimitException;
 use Dominaite\Exception\StorefrontException;
 use Dominaite\Exception\TransportException;
 
-$client = new DominaiteClient(getenv('DOMINAITE_KEY_ID'), getenv('DOMINAITE_SECRET'));
+$client = new DominaiteClient(getenv('DOMINAITE_KEY_ID'), getenv('DOMINAITE_SECRET'), getenv('DOMINAITE_BASE_URL'));
 
 $amount = 2500;                              // minor units: 2500 = 25.00 EUR
 
@@ -237,7 +255,11 @@ You can also manage endpoints through the API. These calls need a reporting key 
 `webhooks:manage` scope (see "Scopes" above).
 
 ```php
-$reporting = new DominaiteClient(getenv('DOMINAITE_REPORTING_KEY_ID'), getenv('DOMINAITE_REPORTING_SECRET'));
+$reporting = new DominaiteClient(
+    getenv('DOMINAITE_REPORTING_KEY_ID'),
+    getenv('DOMINAITE_REPORTING_SECRET'),
+    getenv('DOMINAITE_BASE_URL')
+);
 
 $endpoint = $reporting->createWebhookEndpoint([
     'url'            => 'https://shop.example/webhook.php',
@@ -982,7 +1004,11 @@ $list = $client->listRefunds($transactionId);
 needs a reporting key with the `transactions:read` scope (see "Scopes" above).
 
 ```php
-$reporting = new DominaiteClient(getenv('DOMINAITE_REPORTING_KEY_ID'), getenv('DOMINAITE_REPORTING_SECRET'));
+$reporting = new DominaiteClient(
+    getenv('DOMINAITE_REPORTING_KEY_ID'),
+    getenv('DOMINAITE_REPORTING_SECRET'),
+    getenv('DOMINAITE_BASE_URL')
+);
 
 $params = ['from' => '2026-10-01T00:00:00Z', 'to' => '2026-10-08T00:00:00Z', 'limit' => 100];
 do {
