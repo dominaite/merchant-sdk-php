@@ -3,6 +3,18 @@
 Versions follow semver. The package installs from git tags, so a version exists once its
 `v` tag does.
 
+## 0.6.0
+
+Breaking:
+
+- The base URL is required. The client no longer falls back to production when you leave it
+  out, so an unset environment variable cannot send sandbox credentials to production.
+  Construction fails with `InvalidArgumentException` when the base URL is missing, empty or
+  whitespace. Pass `DominaiteClient::SANDBOX_BASE_URL`
+  (`https://api.staging.dominaite.com/payments`) or `DominaiteClient::PRODUCTION_BASE_URL`
+  (`https://api.dominaite.com/payments`), or your own value.
+- The private `DEFAULT_BASE_URL` is removed. Use `DominaiteClient::PRODUCTION_BASE_URL`.
+
 ## 0.5.2
 
 Added:
