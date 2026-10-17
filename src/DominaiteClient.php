@@ -81,7 +81,11 @@ class DominaiteClient
     public const VERSION = '0.6.0';
     private const TIMEOUT_SECONDS = 15;
     /** The keys the constructor's $options accepts. */
-    private const OPTION_KEYS = ['userAgent'];
+    private const OPTION_KEYS = ['userAgent', 'logger', 'debug'];
+    /** Distinct Dominaite-Sdk-Notice values one client remembers; later new ones are dropped. */
+    private const MAX_NOTICES = 32;
+    /** The API rejects requests from 300 seconds of skew; the SDK warns well before that. */
+    private const CLOCK_SKEW_WARNING_SECONDS = 60;
 
     /**
      * Hard cap on how much response body we will buffer, in bytes.
@@ -485,6 +489,11 @@ class DominaiteClient
     private string $baseUrl;
     private ?string $lastIdempotencyKey = null;
     private string $userAgent;
+    /** @var object|null Anything with warning(string $message, array $context = []); PSR-3 fits. */
+    private ?object $logger = null;
+    private bool $debug = false;
+    /** @var array<string,true> The Dominaite-Sdk-Notice values this client already warned about. */
+    private array $seenNotices = [];
 
     /**
      * @param string $keyId   Your API key id (dmk_...), from the Dominaite dashboard/operator.
@@ -497,6 +506,13 @@ class DominaiteClient
      * @param array<string,mixed> $options Optional:
      *                         userAgent (string) - your own identifier, appended to the SDK's
      *                         User-Agent after one space. It helps support find your calls.
+     *                         logger (object) - receives the SDK's warnings through
+     *                         warning(string $message, array $context = []). A PSR-3
+     *                         LoggerInterface fits; psr/log is not required. Without one,
+     *                         warnings go to trigger_error(E_USER_DEPRECATED).
+     *                         debug (bool) - one line per request (method, path, status,
+     *                         time, request id, idempotency key) to the logger's debug(),
+     *                         or to error_log() without one. Off by default.
      *                         An unknown key throws InvalidArgumentException.
      */
     public function __construct(string $keyId, string $secret, ?string $baseUrl = null, array $options = [])
@@ -519,6 +535,113 @@ class DominaiteClient
         $this->secret = $secret;
         $this->baseUrl = $baseUrl;
         $this->userAgent = self::userAgent($options['userAgent'] ?? null);
+
+        $logger = $options['logger'] ?? null;
+        if ($logger !== null && (!is_object($logger) || !method_exists($logger, 'warning'))) {
+            throw new \InvalidArgumentException('logger must be an object with a warning() method, for example a PSR-3 LoggerInterface');
+        }
+        $this->logger = $logger;
+        $debug = $options['debug'] ?? false;
+        if (!is_bool($debug)) {
+            throw new \InvalidArgumentException('debug must be a bool');
+        }
+        $this->debug = $debug;
+    }
+
+    /**
+     * Hands one warning to the logger, or to trigger_error() without one.
+     *
+     * E_USER_DEPRECATED rather than E_USER_WARNING: frameworks turn warnings into exceptions,
+     * and a notice about this SDK must never fail a payment call. For the same reason
+     * anything the logger or an error handler throws is dropped here.
+     */
+    private function warn(string $message): void
+    {
+        try {
+            if ($this->logger !== null) {
+                $this->logger->warning($message);
+            } else {
+                trigger_error($message, E_USER_DEPRECATED);
+            }
+        } catch (\Throwable $ignored) {
+            // A log sink must not break the request it reports on.
+        }
+    }
+
+    /** One debug line, only when the debug option is on. Never a body, a secret or a signature. */
+    private function debugLine(string $line): void
+    {
+        if (!$this->debug) {
+            return;
+        }
+        try {
+            if ($this->logger !== null && method_exists($this->logger, 'debug')) {
+                $this->logger->debug($line);
+            } else {
+                error_log($line);
+            }
+        } catch (\Throwable $ignored) {
+            // A log sink must not break the request it reports on.
+        }
+    }
+
+    /** A header value cut to $max characters, without control characters. */
+    private static function headerText(string $value, int $max): string
+    {
+        $value = mb_substr($value, 0, $max, 'UTF-8');
+
+        return (string) preg_replace('/[\x00-\x1F\x7F]/', '', $value);
+    }
+
+    /**
+     * Warns once per distinct Dominaite-Sdk-Notice value. The API sends it when this SDK
+     * version is deprecated; a missing or empty header is no notice.
+     */
+    private function readNotice(?string $header): void
+    {
+        if ($header === null) {
+            return;
+        }
+        $value = trim(self::headerText($header, 512));
+        if ($value === '' || isset($this->seenNotices[$value]) || count($this->seenNotices) >= self::MAX_NOTICES) {
+            return;
+        }
+        $this->seenNotices[$value] = true;
+        $this->warn(self::noticeMessage($value));
+    }
+
+    /** deprecated; current="0.6.0"; sunset="2027-01-31"; info="https://..." as a sentence. */
+    private static function noticeMessage(string $value): string
+    {
+        $parts = explode(';', $value);
+        if (strtolower(trim($parts[0])) !== 'deprecated') {
+            return 'dominaite-php ' . self::VERSION . ': ' . $value;
+        }
+        $params = [];
+        foreach (array_slice($parts, 1) as $part) {
+            $pair = explode('=', $part, 2);
+            if (count($pair) !== 2) {
+                continue;
+            }
+            $param = trim($pair[1]);
+            if (strlen($param) >= 2 && $param[0] === '"' && substr($param, -1) === '"') {
+                $param = substr($param, 1, -1);
+            }
+            $params[strtolower(trim($pair[0]))] = $param;
+        }
+        $message = 'dominaite-php ' . self::VERSION . ' is deprecated';
+        if (($params['current'] ?? '') !== '') {
+            $message .= '; upgrade to ' . $params['current'];
+        }
+        if (($params['sunset'] ?? '') !== '') {
+            $message .= ' (sunset ' . $params['sunset'] . ')';
+        }
+        $message .= '.';
+        if (($params['info'] ?? '') !== '') {
+            $message .= ' ' . $params['info'];
+        }
+
+        return $message;
     }
 
     /**
@@ -651,6 +774,9 @@ class DominaiteClient
         $this->baseUrl = self::requireBaseUrl(isset($data['baseUrl']) ? (string) $data['baseUrl'] : null);
         $this->lastIdempotencyKey = isset($data['lastIdempotencyKey']) ? (string) $data['lastIdempotencyKey'] : null;
         $this->userAgent = self::userAgent(null);
+        $this->logger = null;
+        $this->debug = false;
+        $this->seenNotices = [];
     }
 
     /**
@@ -673,7 +799,14 @@ class DominaiteClient
     {
         // GET signs an EMPTY idempotency key and an EMPTY body, and sends no
         // Idempotency-Key header - the same signed shape getStatus() uses.
-        return $this->request('GET', self::PING_PATH, null, '');
+        $ping = $this->request('GET', self::PING_PATH, null, '');
+
+        $skew = (int) ($ping['clockSkewSeconds'] ?? 0);
+        if (abs($skew) > self::CLOCK_SKEW_WARNING_SECONDS) {
+            $this->warn("dominaite-php: clock skew is {$skew} s; requests fail at 300 s. Sync this server's clock.");
+        }
+
+        return $ping;
     }
 
     /**
@@ -2218,6 +2351,7 @@ class DominaiteClient
         $oversized = false;
         $responseHeaders = [];
 
+        $started = hrtime(true);
         $ch = curl_init($this->baseUrl . $path);
         $options = [
             CURLOPT_CUSTOMREQUEST => $method,
@@ -2238,9 +2372,9 @@ class DominaiteClient
                 $raw .= $chunk;
                 return strlen($chunk);
             },
-            // Retry-After (429) is the only response header the SDK reads, but capturing
-            // the set costs nothing and keeps the parsing in one place. Later duplicates
-            // win, which is what a redirect chain's final response should give us.
+            // The SDK reads Retry-After (429), Dominaite-Sdk-Notice and Dominaite-Request-Id.
+            // Capturing the set costs nothing and keeps the parsing in one place. Later
+            // duplicates win, which is what a redirect chain's final response should give us.
             CURLOPT_HEADERFUNCTION => static function ($handle, string $header) use (&$responseHeaders): int {
                 $pair = explode(':', $header, 2);
                 if (count($pair) === 2) {
@@ -2258,6 +2392,20 @@ class DominaiteClient
         $error = curl_error($ch);
         $status = (int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
         curl_close($ch);
+
+        if ($this->debug) {
+            $line = 'dominaite-php: ' . $method . ' ' . $signedPath . ' '
+                . ($oversized || $completed === false ? 'error' : (string) $status) . ' '
+                . intdiv(hrtime(true) - $started, 1000000) . 'ms';
+            $requestId = self::headerText($responseHeaders['dominaite-request-id'] ?? '', 128);
+            if ($requestId !== '') {
+                $line .= ' request_id=' . $requestId;
+            }
+            if ($idempotencyKey !== '') {
+                $line .= ' idempotency_key=' . $idempotencyKey;
+            }
+            $this->debugLine($line);
+        }
 
         if ($oversized) {
             throw new TransportException(
@@ -2301,6 +2449,9 @@ class DominaiteClient
      */
     protected function readResponse(int $status, string $raw, array $responseHeaders = []): array
     {
+        // First, so a notice on a 429, a 401 or an unreadable body still reaches the caller.
+        $this->readNotice($responseHeaders['dominaite-sdk-notice'] ?? null);
+
         if ($status === 429) {
             // The code is read when the body is the gateway's envelope, and skipped
             // otherwise: an edge's HTML 429 is still a rate limit.
