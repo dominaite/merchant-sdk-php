@@ -329,6 +329,36 @@ foreach ([409 => 'PAYMENT_METHOD_NOT_ACTIVE', 422 => 'IDEMPOTENCY_KEY_REUSED', 5
     check("$status $code has no transaction to poll", $thrown !== null && $thrown->getTransactionId() === null ? 'null' : 'set', 'null');
 }
 
+// Every code the charge route answers reaches the caller as a ChargeException with that code.
+$chargeStatus = static function (string $code): int {
+    if (in_array($code, ['PAYMENT_METHOD_NOT_FOUND', 'AGREEMENT_NOT_FOUND'], true)) {
+        return 404;
+    }
+    if (in_array($code, ['PAYMENT_METHOD_NOT_ACTIVE', 'CHARGE_IN_PROGRESS', 'DUPLICATE_REQUEST'], true)) {
+        return 409;
+    }
+    if (in_array($code, ['CHARGE_OUTCOME_UNKNOWN', 'CHARGE_FAILED'], true)) {
+        return 502;
+    }
+    if (in_array($code, ['PAYMENT_METHOD_CHARGES_DISABLED', 'PAYMENT_PROCESSING_UNAVAILABLE'], true)) {
+        return 503;
+    }
+
+    return 422;
+};
+foreach (DominaiteClient::CHARGE_ERROR_CODES as $code) {
+    $status = $chargeStatus($code);
+    $thrown = null;
+    try {
+        (new RecordingClient(['success' => false, 'error' => ['message' => 'Refused.', 'code' => $code, 'statusCode' => $status]], $status))
+            ->chargePaymentMethod(PAYMENT_METHOD_ID, $chargeParams);
+    } catch (\Throwable $e) {
+        $thrown = $e;
+    }
+    check("charge code $code ($status) is a ChargeException with its code",
+        $thrown instanceof ChargeException ? $thrown->getErrorCode() : ($thrown === null ? 'no exception' : get_class($thrown)), $code);
+}
+
 // A coded 404 on a charge is a charge refusal like the 409 and 422 ones.
 foreach (['PAYMENT_METHOD_NOT_FOUND', 'AGREEMENT_NOT_FOUND'] as $code) {
     $missing = null;

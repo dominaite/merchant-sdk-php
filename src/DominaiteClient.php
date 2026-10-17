@@ -213,9 +213,13 @@ class DominaiteClient
     public const STOREFRONT_MISMATCH = 'STOREFRONT_MISMATCH';
 
     /**
-     * Every errorCode a refused createCheckoutSession() can carry, as pinned by the
-     * canonical contract fixture. These arrive as HTTP 200 with success=false and reach
-     * the caller as a CheckoutRefusedException - branch on getErrorCode().
+     * Every errorCode a refused createCheckoutSession() can carry as a CheckoutRefusedException.
+     * These arrive as HTTP 200 with success=false - branch on getErrorCode(). The first five
+     * are the replay and availability refusals of every session. The rest refuse a
+     * subscription session (one with agreementId): the agreement is unknown, not pending,
+     * paid already or has a session open; the amount or the consent does not fit it; or
+     * subscriptions are not switched on for your account. STOREFRONT_MISMATCH can arrive as
+     * an HTTP 200 refusal too, but as a StorefrontException, so it is not in this list.
      */
     public const REFUSAL_ERROR_CODES = [
         self::PAYMENT_PROCESSING_UNAVAILABLE,
@@ -223,6 +227,14 @@ class DominaiteClient
         self::ALREADY_PROCESSED,
         self::IDEMPOTENCY_KEY_REUSED,
         self::PRIOR_ATTEMPT_FAILED,
+        'AGREEMENT_NOT_FOUND',
+        'AGREEMENT_NOT_PENDING',
+        'AGREEMENT_AMOUNT_MISMATCH',
+        'AGREEMENT_CONSENT_REQUIRED',
+        'AGREEMENT_SESSION_OPEN',
+        'AGREEMENT_ALREADY_PAID',
+        'AGREEMENT_VARIABLE_AMOUNT_UNSUPPORTED',
+        'SUBSCRIPTIONS_NOT_ENABLED',
     ];
 
     /**
@@ -285,6 +297,48 @@ class DominaiteClient
      */
     public const AUTHORIZATION_ERROR_CODES = [
         self::INSUFFICIENT_SCOPE,
+    ];
+
+    /**
+     * The authentication codes the gateway publishes, in the contract's order. Each is an
+     * HTTP 401 and arrives as an AuthenticationException: the key id, the signature, the
+     * clock or the source IP. Not retryable: fix the configuration.
+     */
+    public const AUTHENTICATION_ERROR_CODES = [
+        'INVALID_API_KEY',
+        'INVALID_SIGNATURE',
+        'TIMESTAMP_OUT_OF_RANGE',
+        'IP_NOT_ALLOWED',
+    ];
+
+    /** HTTP 503: the API cannot serve the request right now. Nothing changed; retry later. */
+    public const MERCHANT_API_UNAVAILABLE = 'MERCHANT_API_UNAVAILABLE';
+
+    /**
+     * The transient codes the gateway publishes, in the contract's order: retry later with
+     * the SAME idempotency key. MERCHANT_API_UNAVAILABLE is an HTTP 503 (a TransportException
+     * that keeps the code, a RevokeException on revokePaymentMethod()).
+     * PAYMENT_PROCESSING_UNAVAILABLE is an HTTP 200 refusal on a session and a 503
+     * ChargeException on a charge.
+     */
+    public const TRANSIENT_ERROR_CODES = [
+        self::MERCHANT_API_UNAVAILABLE,
+        self::PAYMENT_PROCESSING_UNAVAILABLE,
+    ];
+
+    /**
+     * The codes a 400 VALIDATION_ERROR names per field, in the contract's order, at
+     * getResult()['error']['validationErrors'][n]['code']. They are never getErrorCode().
+     */
+    public const FIELD_VALIDATION_CODES = [
+        'REQUIRED',
+        'MIN_VALUE',
+        'MAX_LENGTH',
+        'INVALID_FORMAT',
+        'INVALID_SELECTION',
+        'DATE_IN_FUTURE',
+        'INVALID_EMAIL',
+        'INVALID_CURRENCY',
     ];
 
     /** integration value for the hosted cashier widget, the default when you send none. */
@@ -364,20 +418,115 @@ class DominaiteClient
     ];
 
     /**
-     * Every errorCode chargePaymentMethod() raises as a ChargeException, in the API's
-     * own order: 409 (PAYMENT_METHOD_NOT_ACTIVE, DUPLICATE_REQUEST), 422
-     * (IDEMPOTENCY_KEY_REUSED), 502 (CHARGE_OUTCOME_UNKNOWN, CHARGE_FAILED) and 503
-     * (PAYMENT_METHOD_CHARGES_DISABLED, PAYMENT_PROCESSING_UNAVAILABLE). CHARGE_DECLINED
-     * (402) is deliberately not one of them: a decline is a charge with status failed.
+     * Every errorCode chargePaymentMethod() raises as a ChargeException, by HTTP status:
+     * 404 (the payment method or the agreement is not yours), 409 (the method is not
+     * active, or a charge with this key is in flight), 422 (the key was used for another
+     * body, or the currency or the amount does not fit the card, the agreement or the
+     * per-charge cap, or the agreement cannot be charged now), 502 (CHARGE_OUTCOME_UNKNOWN,
+     * CHARGE_FAILED) and 503 (PAYMENT_METHOD_CHARGES_DISABLED, PAYMENT_PROCESSING_UNAVAILABLE).
+     * Nothing was charged under any of them except, maybe, CHARGE_OUTCOME_UNKNOWN.
+     * CHARGE_DECLINED (402) is deliberately not one of them: a decline is a charge with
+     * status failed. The 429 codes are RateLimitExceptions (CHARGE_VELOCITY_EXCEEDED,
+     * CHARGE_DECLINE_RATE_EXCEEDED).
      */
     public const CHARGE_ERROR_CODES = [
+        'PAYMENT_METHOD_NOT_FOUND',
+        'AGREEMENT_NOT_FOUND',
         'PAYMENT_METHOD_NOT_ACTIVE',
+        'CHARGE_IN_PROGRESS',
         'DUPLICATE_REQUEST',
         'IDEMPOTENCY_KEY_REUSED',
+        'CHARGE_CURRENCY_MISMATCH',
+        'AGREEMENT_METHOD_MISMATCH',
+        'AGREEMENT_CONSENT_MISSING',
+        'AGREEMENT_CURRENCY_MISMATCH',
+        'AGREEMENT_AMOUNT_MISMATCH',
+        'CHARGE_AMOUNT_ABOVE_AGREEMENT',
+        'AGREEMENT_PERIOD_ALREADY_CHARGED',
+        'AGREEMENT_ENDED',
+        'AGREEMENT_NOT_STARTED',
+        'CHARGE_AMOUNT_ABOVE_CAP',
         'CHARGE_OUTCOME_UNKNOWN',
         'CHARGE_FAILED',
         'PAYMENT_METHOD_CHARGES_DISABLED',
         'PAYMENT_PROCESSING_UNAVAILABLE',
+    ];
+
+    /**
+     * Every errorCode the plan and agreement routes answer, by HTTP status: 404
+     * (PLAN_NOT_FOUND, AGREEMENT_NOT_FOUND, PAYMENT_METHOD_NOT_FOUND), 409 (PLAN_NOT_ACTIVE,
+     * AGREEMENT_ENDED, PAYMENT_METHOD_NOT_ACTIVE) and 422 (the card's currency, a variable
+     * amount below the plan's, missing consent, or IDEMPOTENCY_KEY_REUSED). Each arrives as
+     * an ApiException; branch on getErrorCode(). Nothing was created or changed.
+     */
+    public const RECURRING_ERROR_CODES = [
+        'PLAN_NOT_FOUND',
+        'PLAN_NOT_ACTIVE',
+        'AGREEMENT_NOT_FOUND',
+        'AGREEMENT_ENDED',
+        'PAYMENT_METHOD_NOT_FOUND',
+        'PAYMENT_METHOD_NOT_ACTIVE',
+        'PAYMENT_METHOD_CURRENCY_MISMATCH',
+        'PAYMENT_METHOD_CURRENCY_UNKNOWN',
+        'MAX_AMOUNT_BELOW_PLAN_AMOUNT',
+        'AGREEMENT_CONSENT_REQUIRED',
+        'IDEMPOTENCY_KEY_REUSED',
+    ];
+
+    /**
+     * Every errorCode the webhook endpoint routes answer: 404 WEBHOOK_NOT_FOUND, 409
+     * WEBHOOK_LIMIT_REACHED and WEBHOOK_ALREADY_REGISTERED, 400 WEBHOOK_URL_REJECTED, 422
+     * IDEMPOTENCY_KEY_REUSED and 409 DUPLICATE_REQUEST (retry the SAME key after a second).
+     * Each arrives as an ApiException; branch on getErrorCode().
+     */
+    public const WEBHOOK_ERROR_CODES = [
+        'WEBHOOK_NOT_FOUND',
+        'WEBHOOK_LIMIT_REACHED',
+        'WEBHOOK_ALREADY_REGISTERED',
+        'WEBHOOK_URL_REJECTED',
+        'IDEMPOTENCY_KEY_REUSED',
+        'DUPLICATE_REQUEST',
+    ];
+
+    /**
+     * The payment events a webhook endpoint can receive, in the contract's order. Their
+     * data is the payment: transactionId, status, previousStatus, amount, currency,
+     * paymentMethod, walletType, storedPaymentMethod, verifyOnly, declineClass and the rest
+     * of the fields in the README. Every field is in the payload, null when it has no value.
+     */
+    public const PAYMENT_WEBHOOK_EVENTS = [
+        'payment.succeeded',
+        'payment.failed',
+        'payment.requires_capture',
+        'payment.cancelled',
+        'payment.abandoned',
+        'payment.refunded',
+        'payment.disputed',
+    ];
+
+    /**
+     * The subscription events, in the contract's order. agreement.* data is the agreement
+     * (id, planId, status, previousStatus, nextChargeAt, sequence, ...); charge.* data is
+     * one scheduled charge (chargeId, transactionId, agreementId, outcome, paymentMethod
+     * {brand, last4}, declineClass, nextAttemptAt, sequence, ...). Order both by
+     * data.sequence. Every field is in the payload, null when it has no value.
+     */
+    public const RECURRING_WEBHOOK_EVENTS = [
+        'agreement.activated',
+        'agreement.past_due',
+        'agreement.cancelled',
+        'charge.succeeded',
+        'charge.failed',
+        'charge.retrying',
+    ];
+
+    /**
+     * The verify-only events: a session created with verifyOnly saved the card or did not.
+     * Their data has the payment events' shape, with verifyOnly true.
+     */
+    public const VERIFICATION_WEBHOOK_EVENTS = [
+        'verification.succeeded',
+        'verification.failed',
     ];
 
     /**

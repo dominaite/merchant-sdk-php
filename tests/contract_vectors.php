@@ -214,8 +214,16 @@ foreach ($fixture['sessionRefusalErrorCodes'] as $code) {
     check("refusal code recognised: $code",
         in_array($code, DominaiteClient::REFUSAL_ERROR_CODES, true) ? 'known' : 'unknown', 'known');
 }
-check('refusal codes match the fixture exactly',
-    sortedList(DominaiteClient::REFUSAL_ERROR_CODES), sortedList($fixture['sessionRefusalErrorCodes']));
+// The fixture lists the replay and availability refusals only. The SDK adds the subscription
+// session refusals the gateway answers in the same shape, and nothing else.
+check('the fixture refusal codes are the first SDK refusal codes',
+    sortedList(array_slice(DominaiteClient::REFUSAL_ERROR_CODES, 0, count($fixture['sessionRefusalErrorCodes']))),
+    sortedList($fixture['sessionRefusalErrorCodes']));
+check('every other SDK refusal code is a subscription session refusal',
+    listOf(array_values(array_filter(array_slice(DominaiteClient::REFUSAL_ERROR_CODES, count($fixture['sessionRefusalErrorCodes'])),
+        static function (string $code): bool {
+            return strpos($code, 'AGREEMENT_') !== 0 && $code !== 'SUBSCRIPTIONS_NOT_ENABLED';
+        }))), '');
 
 // Validation codes are the HTTP 400 family, kept separate from the success=false refusals
 // because a caller must not retry them the same way.
@@ -506,8 +514,10 @@ check('charge status vocabulary matches the fixture',
     listOf(DominaiteClient::CHARGE_STATUS_VOCABULARY), listOf($fixture['chargeStatusVocabulary']));
 check('decline class vocabulary matches the fixture',
     listOf(DominaiteClient::DECLINE_CLASS_VOCABULARY), listOf($fixture['declineClassVocabulary']));
-check('charge error codes match the fixture',
-    listOf(DominaiteClient::CHARGE_ERROR_CODES), listOf($fixture['chargeErrorCodes']));
+// The fixture lists 7 of the charge codes; the SDK list holds every code the route answers.
+check('the fixture charge error codes are in the SDK list, in the same order',
+    listOf(array_values(array_intersect(DominaiteClient::CHARGE_ERROR_CODES, $fixture['chargeErrorCodes']))),
+    listOf($fixture['chargeErrorCodes']));
 check('revoke error codes match the fixture',
     listOf(DominaiteClient::REVOKE_ERROR_CODES), listOf($fixture['revokeErrorCodes']));
 check('CHARGE_DECLINED is a result, never a charge error code',
@@ -766,8 +776,8 @@ foreach ($charge['errorExamples'] as $index => $example) {
         }
     }
 }
-check('the fixture exercises every charge error code',
-    sortedList(array_values(array_unique($seenCodes))), sortedList(DominaiteClient::CHARGE_ERROR_CODES));
+check('the fixture exercises every charge error code it lists',
+    sortedList(array_values(array_unique($seenCodes))), sortedList($fixture['chargeErrorCodes']));
 check('CHARGE_OUTCOME_UNKNOWN is the example that carries a transaction to poll',
     (string) $charge['errorExamples'][0]['code'] . ' ' . (isset($charge['errorExamples'][0]['body']['data']['transactionId']) ? 'with transactionId' : 'without'),
     'CHARGE_OUTCOME_UNKNOWN with transactionId');
