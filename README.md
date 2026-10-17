@@ -405,7 +405,10 @@ checked against a 300 second window, so a captured delivery cannot be replayed l
     "paymentMethodBrand": "visa",
     "paymentMethodLast4": "4242",
     "originalTransactionId": null,
-    "idempotencyKey": "order-123"
+    "idempotencyKey": "order-123",
+    "storedPaymentMethod": null,
+    "verifyOnly": false,
+    "declineClass": null
   }
 }
 ```
@@ -435,7 +438,9 @@ event recorded before the field existed arrives without it: read it as
 so nothing changes in how you verify.
 
 Events: `payment.succeeded`, `payment.failed`, `payment.requires_capture`,
-`payment.cancelled`, `payment.abandoned`, `payment.refunded`, `payment.disputed`.
+`payment.cancelled`, `payment.abandoned`, `payment.refunded`, `payment.disputed`
+(`DominaiteClient::PAYMENT_WEBHOOK_EVENTS`). The subscription events are in
+`RECURRING_WEBHOOK_EVENTS` and the verify-only ones in `VERIFICATION_WEBHOOK_EVENTS`.
 `payment.succeeded` is the only one that means money in hand. In-flight states (`pending`,
 `processing`) are not webhooked, so drive that part of your UX from the session status.
 

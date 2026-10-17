@@ -585,7 +585,7 @@ $oldBody = $status['example'];
 unset($oldBody['pspReference']);
 $oldRead = (new CannedClient($oldBody))->getStatus($status['example']['transactionId']);
 check('getStatus from a gateway without pspReference still parses', var_export($oldRead['pspReference'] ?? null, true), 'NULL');
-check('and the field is not invented', var_export(array_key_exists('pspReference', $oldRead), true), 'false');
+check('and the omitted field reads as null', var_export(array_key_exists('pspReference', $oldRead) ? $oldRead['pspReference'] : 'missing', true), 'NULL');
 
 // The documented status type names exactly the fixture's fields, so a field the gateway
 // adds cannot reach callers undocumented.
@@ -614,8 +614,10 @@ check('getStatus keeps a null walletType present on a card payment',
 $preWallet = $status['example'];
 unset($preWallet['paymentMethod'], $preWallet['walletType']);
 $preRead = (new CannedClient($preWallet))->getStatus($preWallet['transactionId']);
-check('getStatus from a gateway without the wallet fields does not invent them',
-    var_export(array_key_exists('paymentMethod', $preRead) || array_key_exists('walletType', $preRead), true), 'false');
+foreach (['paymentMethod', 'walletType'] as $omitted) {
+    check("getStatus reads an omitted $omitted as null",
+        var_export(array_key_exists($omitted, $preRead) ? $preRead[$omitted] : 'missing', true), 'NULL');
+}
 
 // A card the platform retired because the payment that saved it was refunded: it reads
 // as retired with its reason, as spelled and with the wire's null members omitted.

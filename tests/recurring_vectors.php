@@ -415,7 +415,8 @@ $read = (new RecordingClient(envelope($charged)))->getStatus('1a2b3c4d-5e6f-4a7b
 check('a recurring charge read carries isRecurring and its sequence',
     var_export($read['isRecurring'], true) . ' ' . var_export($read['sequence'], true), 'true 3');
 check('an active agreement keeps its next charge', (string) $read['agreement']['nextChargeAt'], '2026-12-01T08:00:00Z');
-check('a read without declineClass does not invent it', array_key_exists('declineClass', $read) ? 'invented' : 'absent', 'absent');
+check('a read without declineClass reads it as null',
+    var_export(array_key_exists('declineClass', $read) ? $read['declineClass'] : 'missing', true), 'NULL');
 unset($charged['agreement']);
 $read = (new RecordingClient(envelope($charged)))->getStatus('1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d');
 check('a one-off payment read has no agreement key', array_key_exists('agreement', $read) ? 'invented' : 'absent', 'absent');
