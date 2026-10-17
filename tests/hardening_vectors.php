@@ -14,6 +14,7 @@
 require __DIR__ . '/../src/DominaiteClient.php';
 require __DIR__ . '/../src/Exception/ApiException.php';
 require __DIR__ . '/../src/Exception/AuthenticationException.php';
+require __DIR__ . '/../src/Exception/ChargeException.php';
 require __DIR__ . '/../src/Exception/CheckoutRefusedException.php';
 require __DIR__ . '/../src/Exception/RateLimitException.php';
 require __DIR__ . '/../src/Exception/StorefrontException.php';
@@ -22,6 +23,8 @@ require __DIR__ . '/../src/Exception/TransportException.php';
 use Dominaite\DominaiteClient;
 use Dominaite\Exception\ApiException;
 use Dominaite\Exception\AuthenticationException;
+use Dominaite\Exception\ChargeException;
+use Dominaite\Exception\CheckoutRefusedException;
 use Dominaite\Exception\RateLimitException;
 use Dominaite\Exception\StorefrontException;
 use Dominaite\Exception\TransportException;
@@ -370,6 +373,30 @@ foreach ($storefrontCases as [$status, $code, $message]) {
     check("$status $code carries its status", $thrown instanceof ApiException ? (string) $thrown->getHttpStatus() : '', (string) $status);
     check("$status $code carries the gateway message", $thrown === null ? '' : $thrown->getMessage(), $message);
 }
+// A 5xx in the gateway's envelope stays the retryable TransportException, and keeps the
+// status, the code and the envelope, so a caller can tell MERCHANT_API_UNAVAILABLE from a crash.
+$unavailable = null;
+try {
+    $responseClient->handle(503, '{"success":false,"error":{"code":"MERCHANT_API_UNAVAILABLE","message":"Try again.","statusCode":503}}');
+} catch (\Throwable $e) {
+    $unavailable = $e;
+}
+check('a coded 503 is a TransportException', $unavailable === null ? 'no exception' : get_class($unavailable), TransportException::class);
+check('the coded 503 keeps status and code',
+    $unavailable instanceof TransportException ? $unavailable->getHttpStatus() . ' ' . $unavailable->getErrorCode() : '',
+    '503 MERCHANT_API_UNAVAILABLE');
+check('the coded 503 keeps the envelope',
+    $unavailable instanceof TransportException ? (string) ($unavailable->getResult()['error']['message'] ?? '') : '', 'Try again.');
+$bare = null;
+try {
+    $responseClient->handle(502, '<html>bad gateway</html>');
+} catch (\Throwable $e) {
+    $bare = $e;
+}
+check('an HTML 502 is a TransportException with the status and no code',
+    $bare instanceof TransportException ? $bare->getHttpStatus() . ' ' . var_export($bare->getErrorCode(), true) : 'not',
+    '502 NULL');
+
 // A rejection keeps the whole envelope: error.params is where the API names the record a
 // conflict is about, and the SDK does not model every code's params.
 $conflict = null;
@@ -498,5 +525,114 @@ check('verifyWebhook still accepts a valid signature',
 check('verifyWebhook still rejects a forged signature',
     var_export(DominaiteClient::verifyWebhook($payload, 't=' . $now . ',v1=' . str_repeat('a', 64), 'whsec_test', 300, $now), true),
     'false');
+
+// --- The request id: the header first, then metadata.requestId ---------------------------
+// Production sends only the body field so far; an edge or a later gateway can send the
+// header. Both name the same request, so the header wins when both are present.
+$withBoth = '{"success":true,"data":{"ok":true},"metadata":{"requestId":"req_body"}}';
+$idClient = new ResponseClient(KEY_ID, SECRET, DominaiteClient::SANDBOX_BASE_URL);
+check('no request id before the first answer', var_export($idClient->getLastRequestId(), true), 'NULL');
+$idClient->handle(200, $withBoth, ['dominaite-request-id' => 'req_header']);
+check('the header wins over the body requestId', (string) $idClient->getLastRequestId(), 'req_header');
+$idClient->handle(200, $withBoth);
+check('the body requestId is the fallback', (string) $idClient->getLastRequestId(), 'req_body');
+$idClient->handle(200, $withBoth, ['dominaite-request-id' => '   ']);
+check('a blank header falls back to the body', (string) $idClient->getLastRequestId(), 'req_body');
+$idClient->handle(200, '{"success":true,"data":{"ok":true}}');
+check('an answer without an id resets the last one', var_export($idClient->getLastRequestId(), true), 'NULL');
+$idClient->handle(204, '', ['dominaite-request-id' => 'req_void']);
+check('a 204 reads the header', (string) $idClient->getLastRequestId(), 'req_void');
+$idClient->handle(200, '{"success":true,"data":{},"metadata":{"requestId":42}}');
+check('a non-string body requestId is ignored', var_export($idClient->getLastRequestId(), true), 'NULL');
+
+/** @return string The request id on the exception the call threw, or what went wrong. */
+function requestIdOf(callable $fn): string
+{
+    try {
+        $fn();
+    } catch (\Throwable $e) {
+        if (!method_exists($e, 'getRequestId')) {
+            return get_class($e) . ' has no getRequestId()';
+        }
+        $id = $e->getRequestId();
+
+        return get_class($e) . ' ' . ($id === null ? 'null' : $id);
+    }
+
+    return 'no exception';
+}
+
+$refusedBody = '{"success":false,"error":{"code":"VALIDATION_ERROR","message":"bad"},"metadata":{"requestId":"req_err"}}';
+check('an ApiException carries the body request id',
+    requestIdOf(static function () use ($idClient, $refusedBody): void { $idClient->handle(400, $refusedBody); }),
+    ApiException::class . ' req_err');
+check('an ApiException prefers the header request id',
+    requestIdOf(static function () use ($idClient, $refusedBody): void {
+        $idClient->handle(400, $refusedBody, ['dominaite-request-id' => 'req_h']);
+    }),
+    ApiException::class . ' req_h');
+check('a 401 carries the request id',
+    requestIdOf(static function () use ($idClient): void {
+        $idClient->handle(401, '{"success":false,"error":{"code":"INVALID_SIGNATURE","message":"x"},"metadata":{"requestId":"req_401"}}');
+    }),
+    AuthenticationException::class . ' req_401');
+check('a 429 carries the request id',
+    requestIdOf(static function () use ($idClient): void {
+        $idClient->handle(429, '{"success":false,"error":{"code":"RATE_LIMITED","message":"x"},"metadata":{"requestId":"req_429"}}');
+    }),
+    RateLimitException::class . ' req_429');
+check('a coded 503 carries the request id',
+    requestIdOf(static function () use ($idClient): void {
+        $idClient->handle(503, '{"success":false,"error":{"code":"MERCHANT_API_UNAVAILABLE","message":"x"},"metadata":{"requestId":"req_503"}}');
+    }),
+    TransportException::class . ' req_503');
+check('an HTML 502 carries the header request id',
+    requestIdOf(static function () use ($idClient, $html): void {
+        $idClient->handle(502, $html, ['dominaite-request-id' => 'req_edge']);
+    }),
+    TransportException::class . ' req_edge');
+check('an HTML 400 carries the header request id',
+    requestIdOf(static function () use ($idClient, $html): void {
+        $idClient->handle(400, $html, ['dominaite-request-id' => 'req_html']);
+    }),
+    ApiException::class . ' req_html');
+check('the last request id is the failed answer',
+    (string) $idClient->getLastRequestId(), 'req_html');
+
+/** Pushes a canned answer through the real response reading, below every route. */
+final class CannedClient extends DominaiteClient
+{
+    /** @var array{0:int,1:string,2:array<string,string>} */
+    public array $answer = [200, '{}', []];
+
+    protected function send(string $method, string $path, ?array $body, string $idempotencyKey): array
+    {
+        return $this->readResponse($this->answer[0], $this->answer[1], $this->answer[2]);
+    }
+}
+
+$canned = new CannedClient(KEY_ID, SECRET, DominaiteClient::SANDBOX_BASE_URL);
+$canned->answer = [200, '{"success":false,"transactionId":"0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0",'
+    . '"error":{"code":"AMOUNT_TOO_LOW","message":"x"},"metadata":{"requestId":"req_refused"}}', []];
+check('a CheckoutRefusedException carries the request id',
+    requestIdOf(static function () use ($canned): void {
+        $canned->createCheckoutSession([
+            'amount' => 8440, 'currency' => 'EUR', 'orderReference' => 'order-1', 'idempotencyKey' => 'order-1',
+        ]);
+    }),
+    CheckoutRefusedException::class . ' req_refused');
+$canned->answer = [409, '{"success":false,"error":{"code":"PAYMENT_METHOD_REVOKED","message":"x"},'
+    . '"metadata":{"requestId":"req_charge"}}', []];
+check('a ChargeException carries the request id',
+    requestIdOf(static function () use ($canned): void {
+        $canned->chargePaymentMethod('pm_' . str_repeat('a', 32), [
+            'amount' => 100, 'currency' => 'EUR', 'orderReference' => 'order-2', 'idempotencyKey' => 'charge-1',
+        ]);
+    }),
+    ChargeException::class . ' req_charge');
+$canned->answer = [200, '{"success":true,"data":{"items":[],"page":1,"pageSize":20,"totalCount":0},'
+    . '"metadata":{"requestId":"req_list"}}', ['dominaite-request-id' => 'req_list_h']];
+$canned->listTransactions([]);
+check('a list result reads its request id on the client', (string) $canned->getLastRequestId(), 'req_list_h');
 
 exit($failures === 0 ? 0 : 1);

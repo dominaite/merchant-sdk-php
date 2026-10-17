@@ -85,10 +85,13 @@ check(
     json_encode($wire['statuses'])
 );
 
+// The contract's HTTP 200 codes are the first refusal codes. The SDK adds the subscription
+// session refusals, which the contract does not group yet.
+$http200 = codesWithStatus(200, $wire['errorCodes']['transient'], $wire['errorCodes']['idempotency']);
 check(
-    'refusal codes are exactly the HTTP 200 error codes',
-    sortedJson(DominaiteClient::REFUSAL_ERROR_CODES),
-    sortedJson(codesWithStatus(200, $wire['errorCodes']['transient'], $wire['errorCodes']['idempotency']))
+    'the HTTP 200 error codes are the first refusal codes',
+    sortedJson(array_slice(DominaiteClient::REFUSAL_ERROR_CODES, 0, count($http200))),
+    sortedJson($http200)
 );
 
 check(
@@ -113,8 +116,8 @@ $named = [
 foreach ($named as $name => $value) {
     check("constant $name carries its own wire spelling", $value, $name);
 }
-check('the refusal list is built from the named constants',
-    sortedJson(DominaiteClient::REFUSAL_ERROR_CODES),
+check('the refusal list starts with the named constants',
+    sortedJson(array_slice(DominaiteClient::REFUSAL_ERROR_CODES, 0, 5)),
     sortedJson(array_slice(array_values($named), 0, 5)));
 check('the storefront list is exactly the storefront constants',
     sortedJson(DominaiteClient::STOREFRONT_ERROR_CODES),
@@ -152,6 +155,63 @@ foreach ($wire['errorCodes']['authorization'] ?? [] as $entry) {
     check("the contract's {$entry['code']} is HTTP 403", (string) $entry['httpStatus'], '403');
     check("the contract's {$entry['code']} is not retryable", var_export($entry['retry'], true), 'false');
 }
+
+// Every group the contract publishes maps to one SDK list, exactly and in order.
+$groups = [
+    'auth' => DominaiteClient::AUTHENTICATION_ERROR_CODES,
+    'authorization' => DominaiteClient::AUTHORIZATION_ERROR_CODES,
+    'storefront' => DominaiteClient::STOREFRONT_ERROR_CODES,
+    'transient' => DominaiteClient::TRANSIENT_ERROR_CODES,
+    'validation' => DominaiteClient::FIELD_VALIDATION_CODES,
+];
+foreach ($groups as $group => $codes) {
+    check("the $group list is exactly the contract $group group, in order",
+        json_encode($codes),
+        json_encode(array_map(static function (array $entry): string {
+            return $entry['code'];
+        }, $wire['errorCodes'][$group] ?? [])));
+}
+foreach ($wire['errorCodes']['auth'] ?? [] as $entry) {
+    check("the contract's {$entry['code']} is HTTP 401", (string) $entry['httpStatus'], '401');
+}
+check('constant MERCHANT_API_UNAVAILABLE carries its own wire spelling',
+    DominaiteClient::MERCHANT_API_UNAVAILABLE, 'MERCHANT_API_UNAVAILABLE');
+
+// The vocabulary guard: every code the contract publishes, in any group, is named by the SDK.
+$sdkCodes = array_merge(
+    DominaiteClient::REFUSAL_ERROR_CODES,
+    DominaiteClient::VALIDATION_ERROR_CODES,
+    DominaiteClient::STOREFRONT_ERROR_CODES,
+    DominaiteClient::AUTHORIZATION_ERROR_CODES,
+    DominaiteClient::AUTHENTICATION_ERROR_CODES,
+    DominaiteClient::TRANSIENT_ERROR_CODES,
+    DominaiteClient::FIELD_VALIDATION_CODES,
+    DominaiteClient::CHARGE_ERROR_CODES,
+    DominaiteClient::REVOKE_ERROR_CODES,
+    DominaiteClient::REFUND_ERROR_CODES,
+    DominaiteClient::RECURRING_ERROR_CODES,
+    DominaiteClient::WEBHOOK_ERROR_CODES
+);
+foreach ($wire['errorCodes'] as $group => $entries) {
+    foreach ($entries as $entry) {
+        check("the SDK names the contract's $group code {$entry['code']}",
+            in_array($entry['code'], $sdkCodes, true) ? 'named' : 'missing', 'named');
+    }
+}
+
+// Webhook event types: the payment catalog and the recurring list, exactly and in order.
+check('the payment webhook events are exactly the contract catalog, in order',
+    json_encode(DominaiteClient::PAYMENT_WEBHOOK_EVENTS), json_encode($wire['webhookEventCatalog']));
+check('the recurring webhook events are exactly the contract list, in order',
+    json_encode(DominaiteClient::RECURRING_WEBHOOK_EVENTS), json_encode($wire['recurringWebhookEvents']));
+// verification.* is not in the contract yet; the SDK lists the two the platform sends.
+check('the verification webhook events are the two the platform sends',
+    json_encode(DominaiteClient::VERIFICATION_WEBHOOK_EVENTS), '["verification.succeeded","verification.failed"]');
+check('no event type is in two lists',
+    (string) count(array_unique(array_merge(DominaiteClient::PAYMENT_WEBHOOK_EVENTS,
+        DominaiteClient::RECURRING_WEBHOOK_EVENTS, DominaiteClient::VERIFICATION_WEBHOOK_EVENTS))),
+    (string) (count(DominaiteClient::PAYMENT_WEBHOOK_EVENTS) + count(DominaiteClient::RECURRING_WEBHOOK_EVENTS)
+        + count(DominaiteClient::VERIFICATION_WEBHOOK_EVENTS)));
 
 check('the contract still lists this SDK', in_array('php', $wire['sdks'], true) ? 'listed' : 'missing', 'listed');
 

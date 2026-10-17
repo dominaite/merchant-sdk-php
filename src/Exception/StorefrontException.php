@@ -20,7 +20,8 @@ namespace Dominaite\Exception;
  * constants on DominaiteClient (STOREFRONT_NOT_WHITELISTED and friends).
  *
  * A key first used for one storefront and replayed for another answers STOREFRONT_MISMATCH
- * as an HTTP 200 refusal instead, which arrives as CheckoutRefusedException.
+ * as an HTTP 200 refusal instead. It arrives as this exception too, with getHttpStatus()
+ * 200 and the refusal payload (errorCode, errorMessage, transactionId) on getResult().
  */
 class StorefrontException extends ApiException
 {

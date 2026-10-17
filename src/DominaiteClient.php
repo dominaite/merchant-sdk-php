@@ -45,7 +45,7 @@ class DominaiteClient
     public const SESSIONS_PATH = '/merchant-api/checkout/sessions';
     /**
      * Canonical path of stored payment methods. POST {id}/charges charges one, DELETE
-     * {id} revokes it - both signed on this path with the id verbatim.
+     * {id} revokes it - both signed on this path with the id in lowercase.
      */
     public const PAYMENT_METHODS_PATH = '/merchant-api/payment-methods';
     /**
@@ -80,8 +80,11 @@ class DominaiteClient
     /** This SDK's version. The User-Agent carries it. */
     public const VERSION = '0.6.0';
     private const TIMEOUT_SECONDS = 15;
+    private const DEFAULT_MAX_RETRIES = 2;
+    private const RETRY_BASE_MS = 500;
+    private const RETRY_CAP_MS = 8000;
     /** The keys the constructor's $options accepts. */
-    private const OPTION_KEYS = ['userAgent', 'logger', 'debug'];
+    private const OPTION_KEYS = ['userAgent', 'logger', 'debug', 'maxRetries', 'timeout'];
     /** Distinct Dominaite-Sdk-Notice values one client remembers; later new ones are dropped. */
     private const MAX_NOTICES = 32;
     /** The API rejects requests from 300 seconds of skew; the SDK warns well before that. */
@@ -110,8 +113,8 @@ class DominaiteClient
     /**
      * A payment method id is opaque (pm_...), so this only pins what keeps it a single
      * path segment: no slash, no query, no whitespace, nothing that needs
-     * percent-encoding. The id goes into the signed canonical path verbatim, so anything
-     * else would sign one path and request another.
+     * percent-encoding. Anything else would sign one path and request another. The plan_,
+     * agr_ and re_ ids share the pattern and go into the signed path verbatim.
      */
     private const PAYMENT_METHOD_ID_PATTERN = '/^[A-Za-z0-9_-]{1,100}$/';
 
@@ -207,14 +210,19 @@ class DominaiteClient
     /**
      * HTTP 400: the API key is bound to one storefront and the request named another. A
      * configuration bug: use the key issued for that storefront. On a replay of a key
-     * first used for a different storefront it arrives as an HTTP 200 refusal instead.
+     * first used for a different storefront the API answers HTTP 200 instead; both arrive
+     * as a StorefrontException, the replay with getHttpStatus() 200.
      */
     public const STOREFRONT_MISMATCH = 'STOREFRONT_MISMATCH';
 
     /**
-     * Every errorCode a refused createCheckoutSession() can carry, as pinned by the
-     * canonical contract fixture. These arrive as HTTP 200 with success=false and reach
-     * the caller as a CheckoutRefusedException - branch on getErrorCode().
+     * Every errorCode a refused createCheckoutSession() can carry as a CheckoutRefusedException.
+     * These arrive as HTTP 200 with success=false - branch on getErrorCode(). The first five
+     * are the replay and availability refusals of every session. The rest refuse a
+     * subscription session (one with agreementId): the agreement is unknown, not pending,
+     * paid already or has a session open; the amount or the consent does not fit it; or
+     * subscriptions are not switched on for your account. STOREFRONT_MISMATCH can arrive as
+     * an HTTP 200 refusal too, but as a StorefrontException, so it is not in this list.
      */
     public const REFUSAL_ERROR_CODES = [
         self::PAYMENT_PROCESSING_UNAVAILABLE,
@@ -222,6 +230,14 @@ class DominaiteClient
         self::ALREADY_PROCESSED,
         self::IDEMPOTENCY_KEY_REUSED,
         self::PRIOR_ATTEMPT_FAILED,
+        'AGREEMENT_NOT_FOUND',
+        'AGREEMENT_NOT_PENDING',
+        'AGREEMENT_AMOUNT_MISMATCH',
+        'AGREEMENT_CONSENT_REQUIRED',
+        'AGREEMENT_SESSION_OPEN',
+        'AGREEMENT_ALREADY_PAID',
+        'AGREEMENT_VARIABLE_AMOUNT_UNSUPPORTED',
+        'SUBSCRIPTIONS_NOT_ENABLED',
     ];
 
     /**
@@ -284,6 +300,48 @@ class DominaiteClient
      */
     public const AUTHORIZATION_ERROR_CODES = [
         self::INSUFFICIENT_SCOPE,
+    ];
+
+    /**
+     * The authentication codes the gateway publishes, in the contract's order. Each is an
+     * HTTP 401 and arrives as an AuthenticationException: the key id, the signature, the
+     * clock or the source IP. Not retryable: fix the configuration.
+     */
+    public const AUTHENTICATION_ERROR_CODES = [
+        'INVALID_API_KEY',
+        'INVALID_SIGNATURE',
+        'TIMESTAMP_OUT_OF_RANGE',
+        'IP_NOT_ALLOWED',
+    ];
+
+    /** HTTP 503: the API cannot serve the request right now. Nothing changed; retry later. */
+    public const MERCHANT_API_UNAVAILABLE = 'MERCHANT_API_UNAVAILABLE';
+
+    /**
+     * The transient codes the gateway publishes, in the contract's order: retry later with
+     * the SAME idempotency key. MERCHANT_API_UNAVAILABLE is an HTTP 503 (a TransportException
+     * that keeps the code, a RevokeException on revokePaymentMethod()).
+     * PAYMENT_PROCESSING_UNAVAILABLE is an HTTP 200 refusal on a session and a 503
+     * ChargeException on a charge.
+     */
+    public const TRANSIENT_ERROR_CODES = [
+        self::MERCHANT_API_UNAVAILABLE,
+        self::PAYMENT_PROCESSING_UNAVAILABLE,
+    ];
+
+    /**
+     * The codes a 400 VALIDATION_ERROR names per field, in the contract's order, at
+     * getResult()['error']['validationErrors'][n]['code']. They are never getErrorCode().
+     */
+    public const FIELD_VALIDATION_CODES = [
+        'REQUIRED',
+        'MIN_VALUE',
+        'MAX_LENGTH',
+        'INVALID_FORMAT',
+        'INVALID_SELECTION',
+        'DATE_IN_FUTURE',
+        'INVALID_EMAIL',
+        'INVALID_CURRENCY',
     ];
 
     /** integration value for the hosted cashier widget, the default when you send none. */
@@ -363,20 +421,115 @@ class DominaiteClient
     ];
 
     /**
-     * Every errorCode chargePaymentMethod() raises as a ChargeException, in the API's
-     * own order: 409 (PAYMENT_METHOD_NOT_ACTIVE, DUPLICATE_REQUEST), 422
-     * (IDEMPOTENCY_KEY_REUSED), 502 (CHARGE_OUTCOME_UNKNOWN, CHARGE_FAILED) and 503
-     * (PAYMENT_METHOD_CHARGES_DISABLED, PAYMENT_PROCESSING_UNAVAILABLE). CHARGE_DECLINED
-     * (402) is deliberately not one of them: a decline is a charge with status failed.
+     * Every errorCode chargePaymentMethod() raises as a ChargeException, by HTTP status:
+     * 404 (the payment method or the agreement is not yours), 409 (the method is not
+     * active, or a charge with this key is in flight), 422 (the key was used for another
+     * body, or the currency or the amount does not fit the card, the agreement or the
+     * per-charge cap, or the agreement cannot be charged now), 502 (CHARGE_OUTCOME_UNKNOWN,
+     * CHARGE_FAILED) and 503 (PAYMENT_METHOD_CHARGES_DISABLED, PAYMENT_PROCESSING_UNAVAILABLE).
+     * Nothing was charged under any of them except, maybe, CHARGE_OUTCOME_UNKNOWN.
+     * CHARGE_DECLINED (402) is deliberately not one of them: a decline is a charge with
+     * status failed. The 429 codes are RateLimitExceptions (CHARGE_VELOCITY_EXCEEDED,
+     * CHARGE_DECLINE_RATE_EXCEEDED).
      */
     public const CHARGE_ERROR_CODES = [
+        'PAYMENT_METHOD_NOT_FOUND',
+        'AGREEMENT_NOT_FOUND',
         'PAYMENT_METHOD_NOT_ACTIVE',
+        'CHARGE_IN_PROGRESS',
         'DUPLICATE_REQUEST',
         'IDEMPOTENCY_KEY_REUSED',
+        'CHARGE_CURRENCY_MISMATCH',
+        'AGREEMENT_METHOD_MISMATCH',
+        'AGREEMENT_CONSENT_MISSING',
+        'AGREEMENT_CURRENCY_MISMATCH',
+        'AGREEMENT_AMOUNT_MISMATCH',
+        'CHARGE_AMOUNT_ABOVE_AGREEMENT',
+        'AGREEMENT_PERIOD_ALREADY_CHARGED',
+        'AGREEMENT_ENDED',
+        'AGREEMENT_NOT_STARTED',
+        'CHARGE_AMOUNT_ABOVE_CAP',
         'CHARGE_OUTCOME_UNKNOWN',
         'CHARGE_FAILED',
         'PAYMENT_METHOD_CHARGES_DISABLED',
         'PAYMENT_PROCESSING_UNAVAILABLE',
+    ];
+
+    /**
+     * Every errorCode the plan and agreement routes answer, by HTTP status: 404
+     * (PLAN_NOT_FOUND, AGREEMENT_NOT_FOUND, PAYMENT_METHOD_NOT_FOUND), 409 (PLAN_NOT_ACTIVE,
+     * AGREEMENT_ENDED, PAYMENT_METHOD_NOT_ACTIVE) and 422 (the card's currency, a variable
+     * amount below the plan's, missing consent, or IDEMPOTENCY_KEY_REUSED). Each arrives as
+     * an ApiException; branch on getErrorCode(). Nothing was created or changed.
+     */
+    public const RECURRING_ERROR_CODES = [
+        'PLAN_NOT_FOUND',
+        'PLAN_NOT_ACTIVE',
+        'AGREEMENT_NOT_FOUND',
+        'AGREEMENT_ENDED',
+        'PAYMENT_METHOD_NOT_FOUND',
+        'PAYMENT_METHOD_NOT_ACTIVE',
+        'PAYMENT_METHOD_CURRENCY_MISMATCH',
+        'PAYMENT_METHOD_CURRENCY_UNKNOWN',
+        'MAX_AMOUNT_BELOW_PLAN_AMOUNT',
+        'AGREEMENT_CONSENT_REQUIRED',
+        'IDEMPOTENCY_KEY_REUSED',
+    ];
+
+    /**
+     * Every errorCode the webhook endpoint routes answer: 404 WEBHOOK_NOT_FOUND, 409
+     * WEBHOOK_LIMIT_REACHED and WEBHOOK_ALREADY_REGISTERED, 400 WEBHOOK_URL_REJECTED, 422
+     * IDEMPOTENCY_KEY_REUSED and 409 DUPLICATE_REQUEST (retry the SAME key after a second).
+     * Each arrives as an ApiException; branch on getErrorCode().
+     */
+    public const WEBHOOK_ERROR_CODES = [
+        'WEBHOOK_NOT_FOUND',
+        'WEBHOOK_LIMIT_REACHED',
+        'WEBHOOK_ALREADY_REGISTERED',
+        'WEBHOOK_URL_REJECTED',
+        'IDEMPOTENCY_KEY_REUSED',
+        'DUPLICATE_REQUEST',
+    ];
+
+    /**
+     * The payment events a webhook endpoint can receive, in the contract's order. Their
+     * data is the payment: transactionId, status, previousStatus, amount, currency,
+     * paymentMethod, walletType, storedPaymentMethod, verifyOnly, declineClass and the rest
+     * of the fields in the README. Every field is in the payload, null when it has no value.
+     */
+    public const PAYMENT_WEBHOOK_EVENTS = [
+        'payment.succeeded',
+        'payment.failed',
+        'payment.requires_capture',
+        'payment.cancelled',
+        'payment.abandoned',
+        'payment.refunded',
+        'payment.disputed',
+    ];
+
+    /**
+     * The subscription events, in the contract's order. agreement.* data is the agreement
+     * (id, planId, status, previousStatus, nextChargeAt, sequence, ...); charge.* data is
+     * one scheduled charge (chargeId, transactionId, agreementId, outcome, paymentMethod
+     * {brand, last4}, declineClass, nextAttemptAt, sequence, ...). Order both by
+     * data.sequence. Every field is in the payload, null when it has no value.
+     */
+    public const RECURRING_WEBHOOK_EVENTS = [
+        'agreement.activated',
+        'agreement.past_due',
+        'agreement.cancelled',
+        'charge.succeeded',
+        'charge.failed',
+        'charge.retrying',
+    ];
+
+    /**
+     * The verify-only events: a session created with verifyOnly saved the card or did not.
+     * Their data has the payment events' shape, with verifyOnly true.
+     */
+    public const VERIFICATION_WEBHOOK_EVENTS = [
+        'verification.succeeded',
+        'verification.failed',
     ];
 
     /**
@@ -484,14 +637,35 @@ class DominaiteClient
      */
     private const GENERIC_FAILURE_STATUSES = [400, 401, 403, 404, 429];
 
+    /**
+     * The same for the charge route, without 404: a coded 404 there (PAYMENT_METHOD_NOT_FOUND,
+     * AGREEMENT_NOT_FOUND) is a ChargeException like the other charge refusals.
+     */
+    private const CHARGE_GENERIC_FAILURE_STATUSES = [400, 401, 403, 429];
+
+    /**
+     * The 5xx codes the automatic retry leaves to the caller. Each one is an answer about
+     * this request, not an outage: the provider failed or broke the contract, the charge
+     * outcome needs a getStatus() check, or charges are off for the payment method.
+     */
+    private const NOT_RETRIED_5XX_CODES = [
+        'CHARGE_OUTCOME_UNKNOWN',
+        'CHARGE_FAILED',
+        'PAYMENT_METHOD_CHARGES_DISABLED',
+        'UPSTREAM_CONTRACT_ERROR',
+    ];
+
     private string $keyId;
     private string $secret;
     private string $baseUrl;
     private ?string $lastIdempotencyKey = null;
+    private ?string $lastRequestId = null;
     private string $userAgent;
     /** @var object|null Anything with warning(string $message, array $context = []); PSR-3 fits. */
     private ?object $logger = null;
     private bool $debug = false;
+    private int $maxRetries = self::DEFAULT_MAX_RETRIES;
+    private int $timeoutMs = self::TIMEOUT_SECONDS * 1000;
     /** @var array<string,true> The Dominaite-Sdk-Notice values this client already warned about. */
     private array $seenNotices = [];
 
@@ -513,6 +687,12 @@ class DominaiteClient
      *                         debug (bool) - one line per request (method, path, status,
      *                         time, request id, idempotency key) to the logger's debug(),
      *                         or to error_log() without one. Off by default.
+     *                         maxRetries (int, 0 or more) - how many times a failed attempt is
+     *                         sent again, with the same idempotency key. Default 2; 0 sends
+     *                         each request once. See send() for what is retried.
+     *                         timeout (int|float seconds, more than 0) - the limit for ONE
+     *                         attempt. Default 15. With retries, one call can take up to
+     *                         (maxRetries + 1) x timeout, plus the waits between attempts.
      *                         An unknown key throws InvalidArgumentException.
      */
     public function __construct(string $keyId, string $secret, ?string $baseUrl = null, array $options = [])
@@ -546,6 +726,17 @@ class DominaiteClient
             throw new \InvalidArgumentException('debug must be a bool');
         }
         $this->debug = $debug;
+
+        $maxRetries = $options['maxRetries'] ?? self::DEFAULT_MAX_RETRIES;
+        if (!is_int($maxRetries) || $maxRetries < 0) {
+            throw new \InvalidArgumentException('maxRetries must be an int of 0 or more');
+        }
+        $this->maxRetries = $maxRetries;
+        $timeout = $options['timeout'] ?? self::TIMEOUT_SECONDS;
+        if ((!is_int($timeout) && !is_float($timeout)) || !($timeout > 0) || is_infinite((float) $timeout)) {
+            throw new \InvalidArgumentException('timeout must be a number of seconds, more than 0');
+        }
+        $this->timeoutMs = max(1, (int) round($timeout * 1000));
     }
 
     /**
@@ -776,6 +967,8 @@ class DominaiteClient
         $this->userAgent = self::userAgent(null);
         $this->logger = null;
         $this->debug = false;
+        $this->maxRetries = self::DEFAULT_MAX_RETRIES;
+        $this->timeoutMs = self::TIMEOUT_SECONDS * 1000;
         $this->seenNotices = [];
     }
 
@@ -890,7 +1083,8 @@ class DominaiteClient
      * @throws AuthenticationException Wrong/revoked credentials or bad signature (fix config; do not retry),
      *                                 or HTTP 403 VERIFY_ONLY_NOT_ENABLED.
      * @throws CheckoutRefusedException The gateway refused the session (inspect getErrorCode()).
-     * @throws StorefrontException     The storefront cannot take payments (STOREFRONT_ERROR_CODES, HTTP 409 or 400).
+     * @throws StorefrontException     The storefront cannot take payments (STOREFRONT_ERROR_CODES, HTTP 409 or 400,
+     *                                 or 200 for a replayed key first used for another storefront).
      * @throws ApiException            Unexpected API response.
      * @throws RateLimitException     HTTP 429 - you are over the rate limit; back off (getRetryAfterSeconds()).
      * @throws TransportException      Network-level failure (retry WITH the same idempotencyKey - getLastIdempotencyKey()).
@@ -943,12 +1137,21 @@ class DominaiteClient
             // (and the whole payload) so the caller can reconcile with getStatus()
             // instead of minting a second payment for the same order.
             $transactionId = $response['transactionId'] ?? null;
+            $errorCode = (string) ($response['errorCode'] ?? 'UNKNOWN');
+            $errorMessage = (string) ($response['errorMessage'] ?? 'The checkout session was refused.');
+
+            // A storefront problem is one class whatever the status: a replay for another
+            // storefront answers 200, a fresh request 400.
+            if (in_array($errorCode, self::STOREFRONT_ERROR_CODES, true)) {
+                throw new StorefrontException(200, $errorMessage, $errorCode, $response, $this->lastRequestId);
+            }
 
             throw new CheckoutRefusedException(
-                (string) ($response['errorCode'] ?? 'UNKNOWN'),
-                (string) ($response['errorMessage'] ?? 'The checkout session was refused.'),
+                $errorCode,
+                $errorMessage,
                 is_string($transactionId) && $transactionId !== '' ? $transactionId : null,
-                $response
+                $response,
+                $this->lastRequestId
             );
         }
 
@@ -992,15 +1195,31 @@ class DominaiteClient
     }
 
     /**
+     * The request id of the last answer this client received: the Dominaite-Request-Id
+     * response header, or metadata.requestId in the body when the header is absent. Give
+     * it to support with the time of the call.
+     *
+     * Every result reads it here, including the lists and the calls that return nothing.
+     * Every exception carries its own copy on getRequestId(). Null before the first answer,
+     * after a request that got no answer, and when the answer carried no id. A single slot,
+     * like getLastIdempotencyKey(): the next request overwrites it.
+     */
+    public function getLastRequestId(): ?string
+    {
+        return $this->lastRequestId;
+    }
+
+    /**
      * Reads the payment status of one of your checkout sessions.
      *
      * Status values: pending, processing, succeeded, failed, refunded, partially_refunded,
      * cancelled, disputed, requires_capture, abandoned. While a session is still payable,
      * expiresAt says until when; amounts are integers in MINOR units.
      *
-     * orderReference, refundedAmount, updatedAt and expiresAt are always in the array, and
-     * null when they have no value. The API leaves a null field out; the SDK reads it back
-     * as null.
+     * orderReference, pspReference, refundedAmount, paymentMethod, walletType, declineClass,
+     * updatedAt and expiresAt are always in the array, and null when they have no value;
+     * verifyOnly is always there too, false unless the session was verify-only. The API
+     * leaves a null field out; the SDK reads it back as null (false for verifyOnly).
      *
      * succeeded is the only value that means the payment is complete. Keep polling on
      * pending, processing and requires_capture - none of them is terminal.
@@ -1081,11 +1300,14 @@ class DominaiteClient
         $status = $this->request('GET', self::SESSIONS_PATH . '/' . $normalized, null, '');
 
         // Passed through as sent, except where the gateway omits a null field on the wire.
-        // The four keys the shape always has read as null when absent: no order reference
-        // recorded, nothing refunded, never updated, or the payer's part is over.
-        foreach (['orderReference', 'refundedAmount', 'updatedAt', 'expiresAt'] as $nullable) {
+        // Every nullable key reads as null when absent: no order reference recorded, no
+        // processor reference yet, nothing refunded, still open (no payment method), not a
+        // wallet, not declined, never updated, or the payer's part is over.
+        foreach (['orderReference', 'pspReference', 'refundedAmount', 'paymentMethod', 'walletType', 'declineClass',
+            'updatedAt', 'expiresAt'] as $nullable) {
             $status[$nullable] = $status[$nullable] ?? null;
         }
+        $status['verifyOnly'] = $status['verifyOnly'] ?? false;
         // The card on file and the agreement get one shape each, not two. When the gateway
         // sent no storedPaymentMethod or agreement at all there is no key here either.
         if (is_array($status['storedPaymentMethod'] ?? null)) {
@@ -1157,16 +1379,17 @@ class DominaiteClient
      * @param array<string,mixed> $params
      * @return array{chargeId:string,status:string,declineClass:?string,declineCode:?string,transactionId:string,agreementId:?string,sequence?:int}
      *
-     * @throws ChargeException         409, 422, 502 or 503 with a code (CHARGE_ERROR_CODES): branch on
-     *                                 getErrorCode(). CHARGE_OUTCOME_UNKNOWN carries the charge row
-     *                                 (getCharge(), getTransactionId()): poll getStatus() with it, never
-     *                                 retry under a new key.
+     * @throws ChargeException         404, 409 or 422 with a code, or 502 or 503 with a code in
+     *                                 CHARGE_ERROR_CODES: branch on getErrorCode(). An id that is not
+     *                                 yours is 404 PAYMENT_METHOD_NOT_FOUND. CHARGE_OUTCOME_UNKNOWN
+     *                                 carries the charge row (getCharge(), getTransactionId()): poll
+     *                                 getStatus() with it, never retry under a new key.
      * @throws AuthenticationException Wrong/revoked credentials or bad signature (fix config; do not retry).
-     * @throws ApiException            An id that is not yours (HTTP 404, getErrorCode() PAYMENT_METHOD_NOT_FOUND),
-     *                                 validation (HTTP 400) or an unexpected response.
+     * @throws ApiException            Validation (HTTP 400) or an unexpected response.
      * @throws RateLimitException     HTTP 429 - back off (getRetryAfterSeconds()), retry with the same key.
-     * @throws TransportException      Network-level failure or a 5xx without a code (retry WITH the same
-     *                                 idempotencyKey - getLastIdempotencyKey()).
+     * @throws TransportException      Network-level failure, or a 5xx with no code or a code not in
+     *                                 CHARGE_ERROR_CODES (getErrorCode() keeps it). Retry WITH the same
+     *                                 idempotencyKey - getLastIdempotencyKey().
      */
     public function chargePaymentMethod(string $paymentMethodId, array $params): array
     {
@@ -1213,19 +1436,24 @@ class DominaiteClient
             return $charge;
         }
 
-        if ($errorCode !== null && $reply['status'] >= 400 && !in_array($reply['status'], self::GENERIC_FAILURE_STATUSES, true)) {
+        // A 5xx is the charge's own outcome only for the codes the route owns. Any other
+        // coded 5xx (the platform's INTERNAL_ERROR, say) stays the transport error it is.
+        if ($errorCode !== null && $reply['status'] >= 400
+            && !in_array($reply['status'], self::CHARGE_GENERIC_FAILURE_STATUSES, true)
+            && ($reply['status'] < 500 || in_array($errorCode, self::CHARGE_ERROR_CODES, true))) {
             throw new ChargeException(
                 $reply['status'],
                 $errorCode,
                 (string) ($reply['error']['message'] ?? 'The charge was refused.'),
                 $charge,
-                $reply['envelope']
+                $reply['envelope'],
+                $reply['requestId'] ?? null
             );
         }
         if ($reply['status'] >= 400) {
             throw self::rejection($reply);
         }
-        throw new ApiException($reply['status'], 'The API answered the charge without a charge body', 'UNEXPECTED_RESPONSE');
+        throw self::unexpected($reply, 'The API answered the charge without a charge body');
     }
 
     /**
@@ -1241,7 +1469,8 @@ class DominaiteClient
      * @throws AuthenticationException Wrong/revoked credentials or bad signature (fix config; do not retry).
      * @throws ApiException            An id that is not yours (HTTP 404) or unexpected response.
      * @throws RateLimitException     HTTP 429 - back off (getRetryAfterSeconds()).
-     * @throws TransportException      Network-level failure or a 5xx without a code (safe to retry).
+     * @throws TransportException      Network-level failure, or a 5xx with no code or another code
+     *                                 (getErrorCode() keeps it). Safe to retry.
      */
     public function revokePaymentMethod(string $paymentMethodId): void
     {
@@ -1255,12 +1484,14 @@ class DominaiteClient
         }
 
         $errorCode = $reply['error']['code'] ?? null;
-        if (is_string($errorCode) && $errorCode !== '' && !in_array($reply['status'], self::GENERIC_FAILURE_STATUSES, true)) {
+        if (is_string($errorCode) && $errorCode !== '' && !in_array($reply['status'], self::GENERIC_FAILURE_STATUSES, true)
+            && ($reply['status'] < 500 || in_array($errorCode, self::REVOKE_ERROR_CODES, true))) {
             throw new RevokeException(
                 $reply['status'],
                 $errorCode,
                 (string) ($reply['error']['message'] ?? 'The revoke was refused.'),
-                $reply['envelope']
+                $reply['envelope'],
+                $reply['requestId'] ?? null
             );
         }
         throw self::rejection($reply);
@@ -1446,14 +1677,15 @@ class DominaiteClient
                 $reply['status'],
                 (string) ($reply['error']['message'] ?? 'The refund was refused.'),
                 $errorCode,
-                $reply['envelope']
+                $reply['envelope'],
+                $reply['requestId'] ?? null
             );
         }
         if ($reply['status'] >= 400) {
             return self::rejection($reply);
         }
 
-        return new ApiException($reply['status'], $unexpected, 'UNEXPECTED_RESPONSE');
+        return self::unexpected($reply, $unexpected);
     }
 
     /**
@@ -1719,8 +1951,10 @@ class DominaiteClient
      * register it again.
      *
      * A create with no answer (a timeout or a 503) may still have registered the endpoint.
-     * Retry with the SAME key: the retry replaces that endpoint and answers a fresh 201 with
-     * a new id and secret. A retry with a new key cannot do this.
+     * The client never retries this call on its own, whatever maxRetries says. Retry it
+     * yourself with the SAME key. If that answer has no secret (null), delete that endpoint
+     * and create it again with a new key. A retry with a new key while the first endpoint
+     * exists registers a second one.
      *
      * A refusal is an ApiException; branch on getErrorCode(). WEBHOOK_URL_REJECTED (400:
      * not https, does not resolve, or a private host), WEBHOOK_LIMIT_REACHED (409: you have
@@ -1847,7 +2081,7 @@ class DominaiteClient
         $reply = $this->send('GET', self::TRANSACTIONS_PATH . ($query === '' ? '' : '?' . $query), null, '');
         $page = self::settle($reply);
         if (!is_array($page['items'] ?? null)) {
-            throw new ApiException($reply['status'], 'The API answered without a transaction page', 'UNEXPECTED_RESPONSE');
+            throw self::unexpected($reply, 'The API answered without a transaction page');
         }
         $page['items'] = array_map(static function (array $item): array {
             foreach (['orderReference', 'completedAt', 'storedPaymentMethodId', 'refundedAmount', 'fee', 'netAmount',
@@ -1889,7 +2123,7 @@ class DominaiteClient
     {
         $data = self::settle($reply);
         if (!is_string($data['id'] ?? null)) {
-            throw new ApiException($reply['status'], "The API answered without the {$what}", 'UNEXPECTED_RESPONSE');
+            throw self::unexpected($reply, "The API answered without the {$what}");
         }
 
         return $data;
@@ -1907,7 +2141,7 @@ class DominaiteClient
         self::settle($reply);
         $data = $reply['envelope']['data'] ?? null;
         if (!is_array($data) || $data !== array_values($data) || count(array_filter($data, 'is_array')) !== count($data)) {
-            throw new ApiException($reply['status'], "The API answered without the {$what} list", 'UNEXPECTED_RESPONSE');
+            throw self::unexpected($reply, "The API answered without the {$what} list");
         }
 
         return $data;
@@ -2111,10 +2345,14 @@ class DominaiteClient
         return $idempotencyKey;
     }
 
-    /** Refuses anything that would not survive as one path segment of the signed canonical path. */
+    /**
+     * Refuses anything that would not survive as one path segment of the signed canonical
+     * path, and lowercases the rest. The API signs a charge on the lowercase pm_ id
+     * whatever case the request used, so an uppercase id would fail the signature.
+     */
     private static function normalizePaymentMethodId(string $paymentMethodId): string
     {
-        $normalized = trim($paymentMethodId);
+        $normalized = strtolower(trim($paymentMethodId));
         if (preg_match(self::PAYMENT_METHOD_ID_PATTERN, $normalized) !== 1) {
             throw new \InvalidArgumentException('paymentMethodId must be the storedPaymentMethod id from getStatus()');
         }
@@ -2309,8 +2547,20 @@ class DominaiteClient
      * to read, because the payment-method routes answer 402, 409, 422, 502 and 503
      * with a body that the caller needs.
      *
+     * A failed attempt is sent again, up to the maxRetries option (default 2), when the
+     * API can replay it: a GET, or a POST with an idempotency key. The body, the path and
+     * the idempotency key are the same on every attempt; only the timestamp, and so the
+     * signature, is new. An attempt is retried after:
+     *  - no answer at all (connect error, reset, timeout);
+     *  - a 5xx, except a code in NOT_RETRIED_5XX_CODES;
+     *  - a PAYMENT_PROCESSING_UNAVAILABLE refusal, whatever the status.
+     * Never retried: a 429 (back off as Retry-After says), a 4xx, an answer over the size
+     * cap, PATCH and DELETE, and webhook endpoint create, whose answer carries the signing
+     * secret once. Before retry n (from 0) the client waits a random time from 0 to
+     * min(8 s, 500 ms x 2^n). The last attempt's answer or exception is what the route sees.
+     *
      * @param array<string,mixed>|null $body Null for GET and DELETE.
-     * @return array{status:int,envelope:array<string,mixed>,payload:array<string,mixed>,error:array<string,mixed>}
+     * @return array{status:int,envelope:array<string,mixed>,payload:array<string,mixed>,error:array<string,mixed>,requestId:?string}
      *
      * Protected for the same reason as request(); not part of the public API.
      */
@@ -2334,36 +2584,122 @@ class DominaiteClient
         $queryAt = strpos($path, '?');
         $signedPath = $queryAt === false ? $path : substr($path, 0, $queryAt);
 
-        $timestamp = (string) time();
-        $signature = $this->sign($timestamp, $method, $signedPath, $idempotencyKey, $json);
+        $replayable = $method === 'GET'
+            || ($method === 'POST' && $idempotencyKey !== '' && $signedPath !== self::WEBHOOKS_PATH);
+        $retries = $replayable ? $this->maxRetries : 0;
 
-        $headers = [
-            'Content-Type: application/json',
-            'X-Api-Key-Id: ' . $this->keyId,
-            'X-Timestamp: ' . $timestamp,
-            'X-Signature: ' . $signature,
-        ];
-        if ($idempotencyKey !== '') {
-            $headers[] = 'Idempotency-Key: ' . $idempotencyKey;
+        for ($attempt = 1; ; $attempt++) {
+            $canRetry = $attempt <= $retries;
+            $retry = false;
+
+            $timestamp = (string) time();
+            $headers = [
+                'Content-Type: application/json',
+                'X-Api-Key-Id: ' . $this->keyId,
+                'X-Timestamp: ' . $timestamp,
+                'X-Signature: ' . $this->sign($timestamp, $method, $signedPath, $idempotencyKey, $json),
+            ];
+            if ($idempotencyKey !== '') {
+                $headers[] = 'Idempotency-Key: ' . $idempotencyKey;
+            }
+
+            $started = hrtime(true);
+            $answer = $this->exchange($method, $this->baseUrl . $path, $headers, $body === null ? null : $json);
+            $this->lastRequestId = null;
+            try {
+                if ($answer['oversized']) {
+                    throw new TransportException(
+                        'The API response exceeded ' . self::MAX_RESPONSE_BYTES . ' bytes and was not read; '
+                        . 'retry with the same idempotency key.'
+                    );
+                }
+                if ($answer['error'] !== null) {
+                    $retry = $canRetry;
+                    throw new TransportException("Could not reach the Dominaite API: {$answer['error']}");
+                }
+                try {
+                    $reply = $this->readResponse($answer['status'], $answer['body'], $answer['headers']);
+                } catch (TransportException $unreadable) {
+                    // Only a 5xx without a JSON body lands here: an edge's error page.
+                    $retry = $canRetry;
+                    throw $unreadable;
+                }
+                $retry = $canRetry && self::retriesReply($reply);
+                if (!$retry) {
+                    return $reply;
+                }
+            } catch (TransportException $failure) {
+                if (!$retry) {
+                    throw $failure;
+                }
+            } finally {
+                // After readResponse(), so the line carries the request id from the header or
+                // the body, and is written for an answer that throws too.
+                if ($this->debug) {
+                    $line = 'dominaite-php: ' . $method . ' ' . $signedPath . ' '
+                        . ($answer['oversized'] || $answer['error'] !== null ? 'error' : (string) $answer['status']) . ' '
+                        . intdiv(hrtime(true) - $started, 1000000) . 'ms';
+                    if ($this->lastRequestId !== null) {
+                        $line .= ' request_id=' . $this->lastRequestId;
+                    }
+                    if ($idempotencyKey !== '') {
+                        $line .= ' idempotency_key=' . $idempotencyKey;
+                    }
+                    if ($attempt > 1) {
+                        $line .= ' attempt=' . $attempt;
+                    }
+                    $this->debugLine($line);
+                }
+            }
+
+            $this->sleepMs($this->randomMs(min(self::RETRY_CAP_MS, self::RETRY_BASE_MS * 2 ** ($attempt - 1))));
+        }
+    }
+
+    /**
+     * Whether a reply that readResponse() returned is worth another attempt.
+     *
+     * @param array{status:int,envelope:array<string,mixed>,payload:array<string,mixed>,error:array<string,mixed>} $reply
+     */
+    private static function retriesReply(array $reply): bool
+    {
+        $code = $reply['error']['code'] ?? $reply['payload']['errorCode'] ?? null;
+        if ($code === self::PAYMENT_PROCESSING_UNAVAILABLE) {
+            return true;
         }
 
+        return $reply['status'] >= 500 && !in_array($code, self::NOT_RETRIED_5XX_CODES, true);
+    }
+
+    /**
+     * Sends one attempt over curl and hands back what came back, without reading it.
+     *
+     * @param list<string> $headers
+     * @param ?string      $payload The JSON body, or null to send none.
+     * @return array{status:int,body:string,headers:array<string,string>,error:?string,oversized:bool}
+     *         error is curl's message when no answer came back, else null. headers has
+     *         lowercased names.
+     *
+     * Protected so tests can stand in for the network; not part of the public API.
+     */
+    protected function exchange(string $method, string $url, array $headers, ?string $payload): array
+    {
         $raw = '';
         $oversized = false;
         $responseHeaders = [];
 
-        $started = hrtime(true);
-        $ch = curl_init($this->baseUrl . $path);
+        $ch = curl_init($url);
         $options = [
             CURLOPT_CUSTOMREQUEST => $method,
             CURLOPT_RETURNTRANSFER => true,
-            CURLOPT_TIMEOUT => self::TIMEOUT_SECONDS,
+            CURLOPT_TIMEOUT_MS => $this->timeoutMs,
             // Some edges block requests without a real User-Agent - always send one.
             CURLOPT_USERAGENT => $this->userAgent,
             CURLOPT_HTTPHEADER => $headers,
             // Buffer the body ourselves so the size cap can abort mid-transfer. Returning
             // a short count from this callback is curl's documented way to stop a read;
             // the transfer then fails with a write error, which $oversized tells apart
-            // from a real network failure below.
+            // from a real network failure.
             CURLOPT_WRITEFUNCTION => static function ($handle, string $chunk) use (&$raw, &$oversized): int {
                 if ($oversized || strlen($raw) + strlen($chunk) > self::MAX_RESPONSE_BYTES) {
                     $oversized = true;
@@ -2383,8 +2719,12 @@ class DominaiteClient
                 return strlen($header);
             },
         ];
-        if ($body !== null) {
-            $options[CURLOPT_POSTFIELDS] = $json;
+        if ($this->timeoutMs < 1000) {
+            // Below one second curl needs this, or the name lookup ignores the limit.
+            $options[CURLOPT_NOSIGNAL] = true;
+        }
+        if ($payload !== null) {
+            $options[CURLOPT_POSTFIELDS] = $payload;
         }
         curl_setopt_array($ch, $options);
 
@@ -2393,31 +2733,32 @@ class DominaiteClient
         $status = (int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
         curl_close($ch);
 
-        if ($this->debug) {
-            $line = 'dominaite-php: ' . $method . ' ' . $signedPath . ' '
-                . ($oversized || $completed === false ? 'error' : (string) $status) . ' '
-                . intdiv(hrtime(true) - $started, 1000000) . 'ms';
-            $requestId = self::headerText($responseHeaders['dominaite-request-id'] ?? '', 128);
-            if ($requestId !== '') {
-                $line .= ' request_id=' . $requestId;
-            }
-            if ($idempotencyKey !== '') {
-                $line .= ' idempotency_key=' . $idempotencyKey;
-            }
-            $this->debugLine($line);
-        }
+        return [
+            'status' => $status,
+            'body' => $raw,
+            'headers' => $responseHeaders,
+            'error' => $completed === false && !$oversized ? $error : null,
+            'oversized' => $oversized,
+        ];
+    }
 
-        if ($oversized) {
-            throw new TransportException(
-                'The API response exceeded ' . self::MAX_RESPONSE_BYTES . ' bytes and was not read; '
-                . 'retry with the same idempotency key.'
-            );
+    /**
+     * Waits before a retry. Protected so tests can record the wait instead of sleeping.
+     */
+    protected function sleepMs(int $milliseconds): void
+    {
+        if ($milliseconds > 0) {
+            usleep($milliseconds * 1000);
         }
-        if ($completed === false) {
-            throw new TransportException("Could not reach the Dominaite API: {$error}");
-        }
+    }
 
-        return $this->readResponse($status, $raw, $responseHeaders);
+    /**
+     * The random part of the backoff: a whole number from 0 to $max milliseconds.
+     * Protected so tests can pin the draw; not part of the public API.
+     */
+    protected function randomMs(int $max): int
+    {
+        return random_int(0, $max);
     }
 
     /**
@@ -2452,31 +2793,35 @@ class DominaiteClient
         // First, so a notice on a 429, a 401 or an unreadable body still reaches the caller.
         $this->readNotice($responseHeaders['dominaite-sdk-notice'] ?? null);
 
+        // 204 carries nothing to parse; the status is the whole answer, and only the header
+        // can carry the request id.
+        $decoded = $status === 204 ? null : json_decode($raw, true);
+        $requestId = self::requestId($responseHeaders, is_array($decoded) ? $decoded : []);
+        $this->lastRequestId = $requestId;
+
         if ($status === 429) {
             // The code is read when the body is the gateway's envelope, and skipped
             // otherwise: an edge's HTML 429 is still a rate limit.
-            $limited = json_decode($raw, true);
-            $limited = is_array($limited) ? $limited : [];
+            $limited = is_array($decoded) ? $decoded : [];
             $limitCode = is_array($limited['error'] ?? null) ? ($limited['error']['code'] ?? null) : null;
             throw new RateLimitException(
                 'Rate limit exceeded (HTTP 429); back off and retry with the same idempotency key.',
                 self::parseRetryAfter($responseHeaders['retry-after'] ?? null),
                 is_string($limitCode) && $limitCode !== '' ? $limitCode : null,
-                $limited
+                $limited,
+                $requestId
             );
         }
 
-        // 204 carries nothing to parse; the status is the whole answer.
         if ($status === 204) {
-            return ['status' => 204, 'envelope' => [], 'payload' => [], 'error' => []];
+            return ['status' => 204, 'envelope' => [], 'payload' => [], 'error' => [], 'requestId' => $requestId];
         }
 
-        $decoded = json_decode($raw, true);
         if (!is_array($decoded)) {
             if ($status >= 500) {
-                throw self::unavailable($status);
+                throw self::unavailable($status, null, [], $requestId);
             }
-            throw new ApiException($status, 'The API returned a non-JSON response');
+            throw new ApiException($status, 'The API returned a non-JSON response', null, [], $requestId);
         }
 
         // The gateway wraps responses as { success, data, ... }; unwrap when present.
@@ -2489,11 +2834,36 @@ class DominaiteClient
             throw new AuthenticationException(
                 $errorCode,
                 self::refusalMessage($status, $errorCode, $envelopeError['message'] ?? null),
-                $status
+                $status,
+                $requestId
             );
         }
 
-        return ['status' => $status, 'envelope' => $decoded, 'payload' => $payload, 'error' => $envelopeError];
+        return ['status' => $status, 'envelope' => $decoded, 'payload' => $payload, 'error' => $envelopeError,
+            'requestId' => $requestId];
+    }
+
+    /**
+     * The request id of one answer: the Dominaite-Request-Id header when the API sent one,
+     * otherwise metadata.requestId in the body. Both are the same id; production sends only
+     * the body field so far.
+     *
+     * @param array<string,string> $responseHeaders Lowercased header names to values.
+     * @param array<string,mixed>  $decoded         The decoded body, or [] when there is none.
+     */
+    private static function requestId(array $responseHeaders, array $decoded): ?string
+    {
+        $header = trim(self::headerText($responseHeaders['dominaite-request-id'] ?? '', 128));
+        if ($header !== '') {
+            return $header;
+        }
+        $body = is_array($decoded['metadata'] ?? null) ? ($decoded['metadata']['requestId'] ?? null) : null;
+        if (!is_string($body)) {
+            return null;
+        }
+        $body = trim(self::headerText($body, 128));
+
+        return $body === '' ? null : $body;
     }
 
     /**
@@ -2548,23 +2918,48 @@ class DominaiteClient
      */
     private static function rejection(array $reply): \RuntimeException
     {
-        if ($reply['status'] >= 500) {
-            return self::unavailable($reply['status']);
-        }
         $errorCode = $reply['payload']['errorCode'] ?? $reply['error']['code'] ?? null;
         $errorCode = is_string($errorCode) && $errorCode !== '' ? $errorCode : null;
+        $requestId = $reply['requestId'] ?? null;
+        if ($reply['status'] >= 500) {
+            return self::unavailable($reply['status'], $errorCode, $reply['envelope'], $requestId);
+        }
         $message = (string) ($reply['payload']['errorMessage'] ?? $reply['error']['message'] ?? 'Request rejected');
 
         if ($errorCode !== null && in_array($errorCode, self::STOREFRONT_ERROR_CODES, true)) {
-            return new StorefrontException($reply['status'], $message, $errorCode, $reply['envelope']);
+            return new StorefrontException($reply['status'], $message, $errorCode, $reply['envelope'], $requestId);
         }
 
-        return new ApiException($reply['status'], $message, $errorCode, $reply['envelope']);
+        return new ApiException($reply['status'], $message, $errorCode, $reply['envelope'], $requestId);
     }
 
-    private static function unavailable(int $status): TransportException
+    /**
+     * A 2xx without the body the route promises.
+     *
+     * @param array{status:int,envelope:array<string,mixed>,payload:array<string,mixed>,error:array<string,mixed>,requestId?:?string} $reply
+     */
+    private static function unexpected(array $reply, string $message): ApiException
     {
-        return new TransportException("The Dominaite API is unavailable (HTTP {$status}); retry with the same idempotency key.");
+        return new ApiException($reply['status'], $message, 'UNEXPECTED_RESPONSE', [], $reply['requestId'] ?? null);
+    }
+
+    /** @param array<string,mixed> $envelope */
+    private static function unavailable(
+        int $status,
+        ?string $errorCode = null,
+        array $envelope = [],
+        ?string $requestId = null
+    ): TransportException {
+        return new TransportException(
+            "The Dominaite API is unavailable (HTTP {$status}" . ($errorCode === null ? '' : ", {$errorCode}")
+            . '); retry with the same idempotency key.',
+            0,
+            null,
+            $status,
+            $errorCode,
+            $envelope,
+            $requestId
+        );
     }
 
     /**

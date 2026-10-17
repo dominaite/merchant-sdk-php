@@ -415,7 +415,8 @@ $read = (new RecordingClient(envelope($charged)))->getStatus('1a2b3c4d-5e6f-4a7b
 check('a recurring charge read carries isRecurring and its sequence',
     var_export($read['isRecurring'], true) . ' ' . var_export($read['sequence'], true), 'true 3');
 check('an active agreement keeps its next charge', (string) $read['agreement']['nextChargeAt'], '2026-12-01T08:00:00Z');
-check('a read without declineClass does not invent it', array_key_exists('declineClass', $read) ? 'invented' : 'absent', 'absent');
+check('a read without declineClass reads it as null',
+    var_export(array_key_exists('declineClass', $read) ? $read['declineClass'] : 'missing', true), 'NULL');
 unset($charged['agreement']);
 $read = (new RecordingClient(envelope($charged)))->getStatus('1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d');
 check('a one-off payment read has no agreement key', array_key_exists('agreement', $read) ? 'invented' : 'absent', 'absent');
@@ -429,6 +430,39 @@ foreach (['', 'agr_1/x', 'agr_1?x=1', 'agr 1', str_repeat('a', 101)] as $bad) {
             }), \InvalidArgumentException::class);
     }
     check('the bad agreement id ' . var_export($bad, true) . ' never reached the transport', (string) count($client->calls), '0');
+}
+
+// Every code the plan, agreement and webhook routes answer reaches the caller as an
+// ApiException that keeps its status and code.
+$routeStatus = static function (string $code): int {
+    if (substr($code, -10) === '_NOT_FOUND') {
+        return 404;
+    }
+    if ($code === 'WEBHOOK_URL_REJECTED') {
+        return 400;
+    }
+    if (in_array($code, ['PLAN_NOT_ACTIVE', 'AGREEMENT_ENDED', 'PAYMENT_METHOD_NOT_ACTIVE', 'WEBHOOK_LIMIT_REACHED',
+        'WEBHOOK_ALREADY_REGISTERED', 'DUPLICATE_REQUEST'], true)) {
+        return 409;
+    }
+
+    return 422;
+};
+foreach (DominaiteClient::RECURRING_ERROR_CODES as $code) {
+    $status = $routeStatus($code);
+    check("plan and agreement code $code is an ApiException",
+        refusal(caught(static function () use ($status, $code): void {
+            (new RecordingClient(failure($status, $code), $status))->createAgreement(
+                ['planId' => 'plan_0123456789abcdef0123456789abcdef', 'customerReference' => 'c-1', 'idempotencyKey' => 'agr-c-1']);
+        })), ApiException::class . " $status $code");
+}
+foreach (DominaiteClient::WEBHOOK_ERROR_CODES as $code) {
+    $status = $routeStatus($code);
+    check("webhook code $code is an ApiException",
+        refusal(caught(static function () use ($status, $code): void {
+            (new RecordingClient(failure($status, $code), $status))->createWebhookEndpoint(
+                ['url' => 'https://shop.example/hook', 'events' => ['payment.succeeded'], 'idempotencyKey' => 'hook-1']);
+        })), ApiException::class . " $status $code");
 }
 
 exit($failures === 0 ? 0 : 1);

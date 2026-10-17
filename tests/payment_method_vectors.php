@@ -203,7 +203,7 @@ foreach ($verifyRefusals as $label => $params) {
 }
 
 // The status read of a verify-only session: verifyOnly true, the raw status, the card.
-// A one-off payment's read has no verifyOnly key at all, so ?? false reads it.
+// A one-off payment's read has no verifyOnly key on the wire; the SDK reads it as false.
 $verifyStatus = ['transactionId' => '1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d', 'orderId' => 'ord_1',
     'orderReference' => 'verify-customer-7', 'status' => 'requires_capture', 'amount' => 30, 'currency' => 'EUR',
     'createdAt' => '2026-10-01T08:00:00Z', 'isRecurring' => false, 'verifyOnly' => true, 'sequence' => 0,
@@ -214,9 +214,10 @@ check('a verify-only status read keeps the raw status', (string) $read['status']
 check('a verify-only status read carries the saved card', (string) ($read['storedPaymentMethod']['id'] ?? ''), PAYMENT_METHOD_ID);
 unset($verifyStatus['verifyOnly']);
 $read = (new RecordingClient(['success' => true, 'data' => $verifyStatus]))->getStatus('1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d');
-check('a status read without verifyOnly does not invent it', array_key_exists('verifyOnly', $read) ? 'invented' : 'absent', 'absent');
-check('and reads as false with ?? false', var_export($read['verifyOnly'] ?? false, true), 'false');
-check('a status read without declineClass does not invent it', array_key_exists('declineClass', $read) ? 'invented' : 'absent', 'absent');
+check('a status read without verifyOnly reads it as false',
+    var_export(array_key_exists('verifyOnly', $read) ? $read['verifyOnly'] : 'missing', true), 'false');
+check('a status read without declineClass reads it as null',
+    var_export(array_key_exists('declineClass', $read) ? $read['declineClass'] : 'missing', true), 'NULL');
 
 // Off until we switch it on for the account: a 403 with its own message.
 $client = new RecordingClient(['success' => false, 'error' => [
@@ -329,16 +330,75 @@ foreach ([409 => 'PAYMENT_METHOD_NOT_ACTIVE', 422 => 'IDEMPOTENCY_KEY_REUSED', 5
     check("$status $code has no transaction to poll", $thrown !== null && $thrown->getTransactionId() === null ? 'null' : 'set', 'null');
 }
 
-// The generic statuses keep their generic exceptions, code and all.
-$missing = null;
-try {
-    (new RecordingClient(['success' => false, 'error' => ['message' => 'No stored payment method with this id.', 'code' => 'PAYMENT_METHOD_NOT_FOUND', 'statusCode' => 404]], 404))
-        ->chargePaymentMethod(PAYMENT_METHOD_ID, $chargeParams);
-} catch (ApiException $e) {
-    $missing = $e;
+// Every code the charge route answers reaches the caller as a ChargeException with that code.
+$chargeStatus = static function (string $code): int {
+    if (in_array($code, ['PAYMENT_METHOD_NOT_FOUND', 'AGREEMENT_NOT_FOUND'], true)) {
+        return 404;
+    }
+    if (in_array($code, ['PAYMENT_METHOD_NOT_ACTIVE', 'CHARGE_IN_PROGRESS', 'DUPLICATE_REQUEST'], true)) {
+        return 409;
+    }
+    if (in_array($code, ['CHARGE_OUTCOME_UNKNOWN', 'CHARGE_FAILED'], true)) {
+        return 502;
+    }
+    if (in_array($code, ['PAYMENT_METHOD_CHARGES_DISABLED', 'PAYMENT_PROCESSING_UNAVAILABLE'], true)) {
+        return 503;
+    }
+
+    return 422;
+};
+foreach (DominaiteClient::CHARGE_ERROR_CODES as $code) {
+    $status = $chargeStatus($code);
+    $thrown = null;
+    try {
+        (new RecordingClient(['success' => false, 'error' => ['message' => 'Refused.', 'code' => $code, 'statusCode' => $status]], $status))
+            ->chargePaymentMethod(PAYMENT_METHOD_ID, $chargeParams);
+    } catch (\Throwable $e) {
+        $thrown = $e;
+    }
+    check("charge code $code ($status) is a ChargeException with its code",
+        $thrown instanceof ChargeException ? $thrown->getErrorCode() : ($thrown === null ? 'no exception' : get_class($thrown)), $code);
 }
-check('a 404 on a charge is an ApiException', $missing === null ? 'no exception' : get_class($missing), ApiException::class);
-check('the charge 404 keeps its code', $missing === null ? '' : (string) $missing->getErrorCode(), 'PAYMENT_METHOD_NOT_FOUND');
+
+// A coded 404 on a charge is a charge refusal like the 409 and 422 ones.
+foreach (['PAYMENT_METHOD_NOT_FOUND', 'AGREEMENT_NOT_FOUND'] as $code) {
+    $missing = null;
+    try {
+        (new RecordingClient(['success' => false, 'error' => ['message' => 'Not found.', 'code' => $code, 'statusCode' => 404]], 404))
+            ->chargePaymentMethod(PAYMENT_METHOD_ID, $chargeParams);
+    } catch (\Throwable $e) {
+        $missing = $e;
+    }
+    check("a 404 $code on a charge is a ChargeException", $missing === null ? 'no exception' : get_class($missing), ChargeException::class);
+    check("the charge 404 $code keeps status and code",
+        $missing instanceof ChargeException ? $missing->getHttpStatus() . ' ' . $missing->getErrorCode() : '', "404 $code");
+}
+
+// A coded 5xx that the route does not own is the platform failing, not a charge or revoke
+// outcome: a retryable transport error that keeps the status, the code and the envelope.
+$internal = ['success' => false, 'error' => ['code' => 'INTERNAL_ERROR', 'message' => 'An unexpected error occurred', 'statusCode' => 500]];
+foreach ([
+    'charge' => static function () use ($internal, $chargeParams): void {
+        (new RecordingClient($internal, 500))->chargePaymentMethod(PAYMENT_METHOD_ID, $chargeParams);
+    },
+    'revoke' => static function () use ($internal): void {
+        (new RecordingClient($internal, 500))->revokePaymentMethod(PAYMENT_METHOD_ID);
+    },
+] as $route => $call) {
+    $thrown = null;
+    try {
+        $call();
+    } catch (\Throwable $e) {
+        $thrown = $e;
+    }
+    check("a coded 500 on a $route is a TransportException", $thrown === null ? 'no exception' : get_class($thrown), TransportException::class);
+    check("the $route 500 keeps its status and code",
+        $thrown instanceof TransportException ? $thrown->getHttpStatus() . ' ' . $thrown->getErrorCode() : '', '500 INTERNAL_ERROR');
+    check("the $route 500 keeps the envelope",
+        $thrown instanceof TransportException ? (string) ($thrown->getResult()['error']['message'] ?? '') : '', 'An unexpected error occurred');
+}
+
+// The generic statuses keep their generic exceptions, code and all.
 check('a 400 on a charge is an ApiException',
     thrownBy(static function () use ($chargeParams): void {
         (new RecordingClient(['success' => false, 'error' => ['message' => 'Validation failed', 'code' => 'VALIDATION_ERROR', 'statusCode' => 400]], 400))
@@ -432,6 +492,15 @@ check('no bad id reached the transport', (string) count($client->calls), '0');
 $client = new RecordingClient($charge, 201);
 $client->chargePaymentMethod(' ' . PAYMENT_METHOD_ID . ' ', $chargeParams);
 check('a padded id is trimmed', $client->calls[0]['path'], DominaiteClient::PAYMENT_METHODS_PATH . '/' . PAYMENT_METHOD_ID . '/charges');
+
+// The API signs a charge on the lowercase pm_ id whatever case the request used, so the SDK
+// sends and signs the lowercase form on both routes.
+$client = new RecordingClient($charge, 201);
+$client->chargePaymentMethod(strtoupper(PAYMENT_METHOD_ID), $chargeParams);
+check('an uppercase id is charged in lowercase', $client->calls[0]['path'], DominaiteClient::PAYMENT_METHODS_PATH . '/' . PAYMENT_METHOD_ID . '/charges');
+$client = new RecordingClient([], 204);
+$client->revokePaymentMethod('PM_' . substr(PAYMENT_METHOD_ID, 3));
+check('an uppercase id is revoked in lowercase', $client->calls[0]['path'], DominaiteClient::PAYMENT_METHODS_PATH . '/' . PAYMENT_METHOD_ID);
 
 // --- revokePaymentMethod ---------------------------------------------------------------
 $client = new RecordingClient($charge, 201);

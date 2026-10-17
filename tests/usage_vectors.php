@@ -353,12 +353,26 @@ $logged = (string) file_get_contents($errorLog);
 @unlink($errorLog);
 check('debug without a logger writes the line to error_log()', preg_match('#dominaite-php: GET /merchant-api/ping 200 \d+ms request_id=req-9#', $logged) === 1, $logged);
 
-$closed = new LiveClient(KEY_ID, SECRET, 'http://127.0.0.1:' . freePort(), ['logger' => $debug, 'debug' => true]);
+$closedUrl = 'http://127.0.0.1:' . freePort();
+$closed = new LiveClient(KEY_ID, SECRET, $closedUrl, ['logger' => $debug, 'debug' => true, 'maxRetries' => 0]);
 try {
     $closed->ping();
 } catch (\Dominaite\Exception\TransportException $e) {
 }
 check('a transport failure logs status "error"', preg_match('#^dominaite-php: GET /merchant-api/ping error \d+ms$#', (string) end($debug->debugs)) === 1, (string) end($debug->debugs));
+
+$retried = new RecordingLogger();
+$retrying = new LiveClient(KEY_ID, SECRET, $closedUrl, ['logger' => $retried, 'debug' => true, 'maxRetries' => 2]);
+try {
+    $retrying->ping();
+} catch (\Dominaite\Exception\TransportException $e) {
+}
+check('each retry logs its own line with the attempt number',
+    count($retried->debugs) === 3
+        && preg_match('#^dominaite-php: GET /merchant-api/ping error \d+ms$#', $retried->debugs[0]) === 1
+        && preg_match('#^dominaite-php: GET /merchant-api/ping error \d+ms attempt=2$#', $retried->debugs[1]) === 1
+        && preg_match('#^dominaite-php: GET /merchant-api/ping error \d+ms attempt=3$#', $retried->debugs[2]) === 1,
+    json_encode($retried->debugs));
 
 // --- Nothing secret in any line ---------------------------------------------------------------
 
@@ -403,9 +417,11 @@ check(
 // --- Version -----------------------------------------------------------------------------
 
 $changelog = (string) file_get_contents(__DIR__ . '/../CHANGELOG.md');
-preg_match('/^## (\S+)/m', $changelog, $heading);
+// A section for the next version sits on top as "## x.y.z (unreleased)" until its tag; the
+// first released heading is the one VERSION must match.
+preg_match('/^## (\S+)$/m', $changelog, $heading);
 check(
-    'DominaiteClient::VERSION is the first CHANGELOG.md heading',
+    'DominaiteClient::VERSION is the first released CHANGELOG.md heading',
     ($heading[1] ?? '') === DominaiteClient::VERSION,
     'CHANGELOG ' . ($heading[1] ?? 'none') . ', VERSION ' . DominaiteClient::VERSION
 );

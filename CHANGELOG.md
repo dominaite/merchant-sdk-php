@@ -3,6 +3,58 @@
 Versions follow semver. The package installs from git tags, so a version exists once its
 `v` tag does.
 
+## 0.7.0 (unreleased)
+
+Breaking:
+
+- The client now retries a failed request on its own, up to `maxRetries` times (default 2).
+  It retries only a GET or a POST with an idempotency key, and never
+  `createWebhookEndpoint()`. It retries after no answer, a 5xx, or a
+  `PAYMENT_PROCESSING_UNAVAILABLE` refusal. It never retries a 429, a 4xx, an oversized
+  answer, PATCH or DELETE. Every attempt sends the same key, path and body. Pass
+  `'maxRetries' => 0` to keep the old one-attempt behavior. If your code has its own retry
+  loop, it now runs on top of these retries.
+- The timeout is per attempt. With retries, one call can take up to
+  `(maxRetries + 1) x timeout`, plus the waits between attempts. With the defaults that is
+  up to about 47 seconds instead of 15.
+- A 404 on `chargePaymentMethod()` (`PAYMENT_METHOD_NOT_FOUND`, `AGREEMENT_NOT_FOUND`) is now a
+  `ChargeException`, not an `ApiException`. `ChargeException` does not extend
+  `ApiException`, so a `catch (ApiException $e)` no longer sees it. Check the order of your
+  `catch` blocks and your `instanceof` checks.
+- A 5xx with a code the route does not own is a `TransportException` on every route, also
+  on `chargePaymentMethod()` and `revokePaymentMethod()`. The exception keeps the code:
+  `getHttpStatus()`, `getErrorCode()` and `getResult()` are new on `TransportException`.
+- A `STOREFRONT_MISMATCH` refusal on a checkout replay is a `StorefrontException` with
+  `getHttpStatus()` 200, not a `CheckoutRefusedException`.
+- `getStatus()` returns `null` for every nullable field the API leaves out, also
+  `orderReference`, `pspReference`, `refundedAmount`, `paymentMethod`, `walletType`,
+  `declineClass`, `updatedAt` and `expiresAt`. `verifyOnly` reads `false` when absent. Code
+  that tested `isset()` or `array_key_exists()` on these keys now sees them set.
+- `REFUSAL_ERROR_CODES` gains the subscription session refusals, and `CHARGE_ERROR_CODES`
+  lists every code the charge route answers. Code that relies on the old lists being short
+  sees more codes.
+
+Added:
+
+- The request id. `getLastRequestId()` on the client, and `getRequestId()` on every SDK
+  exception. The SDK reads the `Dominaite-Request-Id` header, then `metadata.requestId` in
+  the body. The debug line prints that id, and `attempt=N` on a retry.
+- The `maxRetries` option (int, 0 or more, default 2) and the `timeout` option (seconds per
+  attempt, default 15).
+- Error code lists: `AUTHENTICATION_ERROR_CODES`, `TRANSIENT_ERROR_CODES`,
+  `FIELD_VALIDATION_CODES`, `RECURRING_ERROR_CODES`, `WEBHOOK_ERROR_CODES` and
+  `MERCHANT_API_UNAVAILABLE`. Webhook event lists: `PAYMENT_WEBHOOK_EVENTS`,
+  `RECURRING_WEBHOOK_EVENTS` and `VERIFICATION_WEBHOOK_EVENTS`. A test pins them to the wire
+  contract fixture.
+
+Fixed:
+
+- A `pm_` id with uppercase hex is lowercased before signing. The API signs a charge on the
+  lowercase id, so an uppercase id failed with `INVALID_SIGNATURE`.
+- The README and the `createWebhookEndpoint()` docblock no longer say a same-key retry always
+  answers a new secret. After a timeout, retry with the same key. If that answer has no
+  secret, delete that endpoint and create it again with a new key.
+
 ## 0.6.0
 
 Breaking:

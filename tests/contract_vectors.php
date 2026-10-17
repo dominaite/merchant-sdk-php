@@ -214,8 +214,16 @@ foreach ($fixture['sessionRefusalErrorCodes'] as $code) {
     check("refusal code recognised: $code",
         in_array($code, DominaiteClient::REFUSAL_ERROR_CODES, true) ? 'known' : 'unknown', 'known');
 }
-check('refusal codes match the fixture exactly',
-    sortedList(DominaiteClient::REFUSAL_ERROR_CODES), sortedList($fixture['sessionRefusalErrorCodes']));
+// The fixture lists the replay and availability refusals only. The SDK adds the subscription
+// session refusals the gateway answers in the same shape, and nothing else.
+check('the fixture refusal codes are the first SDK refusal codes',
+    sortedList(array_slice(DominaiteClient::REFUSAL_ERROR_CODES, 0, count($fixture['sessionRefusalErrorCodes']))),
+    sortedList($fixture['sessionRefusalErrorCodes']));
+check('every other SDK refusal code is a subscription session refusal',
+    listOf(array_values(array_filter(array_slice(DominaiteClient::REFUSAL_ERROR_CODES, count($fixture['sessionRefusalErrorCodes'])),
+        static function (string $code): bool {
+            return strpos($code, 'AGREEMENT_') !== 0 && $code !== 'SUBSCRIPTIONS_NOT_ENABLED';
+        }))), '');
 
 // Validation codes are the HTTP 400 family, kept separate from the success=false refusals
 // because a caller must not retry them the same way.
@@ -241,6 +249,30 @@ foreach (DominaiteClient::REFUSAL_ERROR_CODES as $code) {
         check("refusal surfaces errorCode: $code", $refusal->getErrorCode(), $code);
     }
 }
+
+// A replayed key first used for another storefront answers HTTP 200 with STOREFRONT_MISMATCH.
+// It is a storefront problem like the 400 one, so it gets the same class, at status 200.
+$replayed = null;
+try {
+    (new CannedClient([
+        'success' => false,
+        'checkout' => null,
+        'transactionId' => '0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0',
+        'errorCode' => DominaiteClient::STOREFRONT_MISMATCH,
+        'errorMessage' => 'This key was first used for another storefront.',
+    ]))->createCheckoutSession(['amount' => 8440, 'currency' => 'EUR', 'orderReference' => 'order-1042',
+        'idempotencyKey' => 'order-1042']);
+} catch (\Throwable $e) {
+    $replayed = $e;
+}
+check('a 200 STOREFRONT_MISMATCH replay is a StorefrontException',
+    $replayed === null ? 'no exception' : get_class($replayed), StorefrontException::class);
+check('the 200 STOREFRONT_MISMATCH replay keeps status and code',
+    $replayed instanceof StorefrontException ? $replayed->getHttpStatus() . ' ' . $replayed->getErrorCode() : '',
+    '200 ' . DominaiteClient::STOREFRONT_MISMATCH);
+check('the 200 STOREFRONT_MISMATCH replay keeps the transaction it collided with',
+    $replayed instanceof StorefrontException ? (string) ($replayed->getResult()['transactionId'] ?? '') : '',
+    '0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0');
 
 // 3. The endpoints. Each canned response is the fixture's own example object.
 $endpoints = $fixture['endpoints'];
@@ -482,8 +514,10 @@ check('charge status vocabulary matches the fixture',
     listOf(DominaiteClient::CHARGE_STATUS_VOCABULARY), listOf($fixture['chargeStatusVocabulary']));
 check('decline class vocabulary matches the fixture',
     listOf(DominaiteClient::DECLINE_CLASS_VOCABULARY), listOf($fixture['declineClassVocabulary']));
-check('charge error codes match the fixture',
-    listOf(DominaiteClient::CHARGE_ERROR_CODES), listOf($fixture['chargeErrorCodes']));
+// The fixture lists 7 of the charge codes; the SDK list holds every code the route answers.
+check('the fixture charge error codes are in the SDK list, in the same order',
+    listOf(array_values(array_intersect(DominaiteClient::CHARGE_ERROR_CODES, $fixture['chargeErrorCodes']))),
+    listOf($fixture['chargeErrorCodes']));
 check('revoke error codes match the fixture',
     listOf(DominaiteClient::REVOKE_ERROR_CODES), listOf($fixture['revokeErrorCodes']));
 check('CHARGE_DECLINED is a result, never a charge error code',
@@ -551,7 +585,7 @@ $oldBody = $status['example'];
 unset($oldBody['pspReference']);
 $oldRead = (new CannedClient($oldBody))->getStatus($status['example']['transactionId']);
 check('getStatus from a gateway without pspReference still parses', var_export($oldRead['pspReference'] ?? null, true), 'NULL');
-check('and the field is not invented', var_export(array_key_exists('pspReference', $oldRead), true), 'false');
+check('and the omitted field reads as null', var_export(array_key_exists('pspReference', $oldRead) ? $oldRead['pspReference'] : 'missing', true), 'NULL');
 
 // The documented status type names exactly the fixture's fields, so a field the gateway
 // adds cannot reach callers undocumented.
@@ -580,8 +614,10 @@ check('getStatus keeps a null walletType present on a card payment',
 $preWallet = $status['example'];
 unset($preWallet['paymentMethod'], $preWallet['walletType']);
 $preRead = (new CannedClient($preWallet))->getStatus($preWallet['transactionId']);
-check('getStatus from a gateway without the wallet fields does not invent them',
-    var_export(array_key_exists('paymentMethod', $preRead) || array_key_exists('walletType', $preRead), true), 'false');
+foreach (['paymentMethod', 'walletType'] as $omitted) {
+    check("getStatus reads an omitted $omitted as null",
+        var_export(array_key_exists($omitted, $preRead) ? $preRead[$omitted] : 'missing', true), 'NULL');
+}
 
 // A card the platform retired because the payment that saved it was refunded: it reads
 // as retired with its reason, as spelled and with the wire's null members omitted.
@@ -742,21 +778,22 @@ foreach ($charge['errorExamples'] as $index => $example) {
         }
     }
 }
-check('the fixture exercises every charge error code',
-    sortedList(array_values(array_unique($seenCodes))), sortedList(DominaiteClient::CHARGE_ERROR_CODES));
+check('the fixture exercises every charge error code it lists',
+    sortedList(array_values(array_unique($seenCodes))), sortedList($fixture['chargeErrorCodes']));
 check('CHARGE_OUTCOME_UNKNOWN is the example that carries a transaction to poll',
     (string) $charge['errorExamples'][0]['code'] . ' ' . (isset($charge['errorExamples'][0]['body']['data']['transactionId']) ? 'with transactionId' : 'without'),
     'CHARGE_OUTCOME_UNKNOWN with transactionId');
 
-// 404: an id that is not yours stays the generic ApiException, code and all.
+// 404: an id that is not yours is a ChargeException, code and all. The fixture still calls
+// it a generic error; the SDKs follow one rule instead: a coded charge answer is a charge error.
 $notFound = $charge['notFoundExample'];
 $missing = null;
 try {
     (new CannedClient($notFound['body'], (int) $notFound['httpStatus']))->chargePaymentMethod($paymentMethodId, $chargeParams);
-} catch (ApiException $e) {
+} catch (ChargeException $e) {
     $missing = $e;
 }
-check('a charge on an id that is not yours is an ApiException', $missing === null ? 'no exception' : get_class($missing), ApiException::class);
+check('a charge on an id that is not yours is a ChargeException', $missing === null ? 'no exception' : get_class($missing), ChargeException::class);
 check('the charge 404 keeps its status', (string) ($missing === null ? 0 : $missing->getHttpStatus()), (string) $notFound['httpStatus']);
 check('the charge 404 keeps its code', (string) ($missing === null ? '' : $missing->getErrorCode()), (string) $notFound['code']);
 check('the charge 404 keeps its message', $missing === null ? '' : $missing->getMessage(), (string) $notFound['body']['error']['message']);
