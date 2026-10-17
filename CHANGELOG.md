@@ -16,7 +16,11 @@ Breaking:
   loop, it now runs on top of these retries.
 - The timeout is per attempt. With retries, one call can take up to
   `(maxRetries + 1) x timeout`, plus the waits between attempts. With the defaults that is
-  up to about 47 seconds instead of 15.
+  up to about 137 seconds instead of 15.
+- The default timeout is 45 seconds per attempt, up from 15, the same as the other Dominaite
+  SDKs. A charge can take longer than 15 seconds at the card provider, and a first attempt
+  cut off early makes the API refuse its same-key retry until that attempt finishes. Pass
+  `'timeout' => 15` to keep the old limit.
 - A 404 on `chargePaymentMethod()` (`PAYMENT_METHOD_NOT_FOUND`, `AGREEMENT_NOT_FOUND`) is now a
   `ChargeException`, not an `ApiException`. `ChargeException` does not extend
   `ApiException`, so a `catch (ApiException $e)` no longer sees it. Check the order of your
@@ -38,9 +42,11 @@ Added:
 
 - The request id. `getLastRequestId()` on the client, and `getRequestId()` on every SDK
   exception. The SDK reads the `Dominaite-Request-Id` header, then `metadata.requestId` in
-  the body. The debug line prints that id, and `attempt=N` on a retry.
+  the body. The debug line prints that id, and `attempt=N` on a retry. When the last retry
+  gets no answer, the thrown `TransportException` and `getLastRequestId()` carry the id of
+  the last attempt that answered.
 - The `maxRetries` option (int, 0 or more, default 2) and the `timeout` option (seconds per
-  attempt, default 15).
+  attempt, default 45). A client restored with `unserialize()` keeps both.
 - Error code lists: `AUTHENTICATION_ERROR_CODES`, `TRANSIENT_ERROR_CODES`,
   `FIELD_VALIDATION_CODES`, `RECURRING_ERROR_CODES`, `WEBHOOK_ERROR_CODES` and
   `MERCHANT_API_UNAVAILABLE`. Webhook event lists: `PAYMENT_WEBHOOK_EVENTS`,
@@ -49,6 +55,10 @@ Added:
 
 Fixed:
 
+- The README said nothing was charged on a 409 `DUPLICATE_REQUEST` from
+  `chargePaymentMethod()`. It means an earlier request with this key is still running, or
+  it finished and its answer can no longer be replayed, so a charge may exist. Retry with
+  the same key; if the code comes back, read the transaction. Never retry under a new key.
 - A `pm_` id with uppercase hex is lowercased before signing. The API signs a charge on the
   lowercase id, so an uppercase id failed with `INVALID_SIGNATURE`.
 - The README and the `createWebhookEndpoint()` docblock no longer say a same-key retry always

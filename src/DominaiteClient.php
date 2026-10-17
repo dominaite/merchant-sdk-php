@@ -79,7 +79,7 @@ class DominaiteClient
     public const INTEGRATION_CONTRACT_PATH = '/merchant-api/integration/contract';
     /** This SDK's version. The User-Agent carries it. */
     public const VERSION = '0.6.0';
-    private const TIMEOUT_SECONDS = 15;
+    private const TIMEOUT_SECONDS = 45;
     private const DEFAULT_MAX_RETRIES = 2;
     private const RETRY_BASE_MS = 500;
     private const RETRY_CAP_MS = 8000;
@@ -427,7 +427,11 @@ class DominaiteClient
      * body, or the currency or the amount does not fit the card, the agreement or the
      * per-charge cap, or the agreement cannot be charged now), 502 (CHARGE_OUTCOME_UNKNOWN,
      * CHARGE_FAILED) and 503 (PAYMENT_METHOD_CHARGES_DISABLED, PAYMENT_PROCESSING_UNAVAILABLE).
-     * Nothing was charged under any of them except, maybe, CHARGE_OUTCOME_UNKNOWN.
+     * Nothing was charged under any of them except, maybe, CHARGE_OUTCOME_UNKNOWN and
+     * DUPLICATE_REQUEST. DUPLICATE_REQUEST means an earlier request with this key is still
+     * running, or it finished and its answer can no longer be replayed: in both cases a
+     * charge may exist. Retry with the SAME key, or read the transaction; never retry under
+     * a new key.
      * CHARGE_DECLINED (402) is deliberately not one of them: a decline is a charge with
      * status failed. The 429 codes are RateLimitExceptions (CHARGE_VELOCITY_EXCEEDED,
      * CHARGE_DECLINE_RATE_EXCEEDED).
@@ -691,7 +695,7 @@ class DominaiteClient
      *                         sent again, with the same idempotency key. Default 2; 0 sends
      *                         each request once. See send() for what is retried.
      *                         timeout (int|float seconds, more than 0) - the limit for ONE
-     *                         attempt. Default 15. With retries, one call can take up to
+     *                         attempt. Default 45. With retries, one call can take up to
      *                         (maxRetries + 1) x timeout, plus the waits between attempts.
      *                         An unknown key throws InvalidArgumentException.
      */
@@ -952,10 +956,15 @@ class DominaiteClient
             'secret' => self::REDACTED,
             'baseUrl' => $this->baseUrl,
             'lastIdempotencyKey' => $this->lastIdempotencyKey,
+            'maxRetries' => $this->maxRetries,
+            'timeoutMs' => $this->timeoutMs,
         ];
     }
 
     /**
+     * Restores a client from __serialize(). The retry and timeout options come back as the
+     * caller set them; a value that is missing or out of range falls back to the default.
+     *
      * @param array<string,mixed> $data
      */
     public function __unserialize(array $data): void
@@ -967,8 +976,10 @@ class DominaiteClient
         $this->userAgent = self::userAgent(null);
         $this->logger = null;
         $this->debug = false;
-        $this->maxRetries = self::DEFAULT_MAX_RETRIES;
-        $this->timeoutMs = self::TIMEOUT_SECONDS * 1000;
+        $maxRetries = $data['maxRetries'] ?? null;
+        $this->maxRetries = is_int($maxRetries) && $maxRetries >= 0 ? $maxRetries : self::DEFAULT_MAX_RETRIES;
+        $timeoutMs = $data['timeoutMs'] ?? null;
+        $this->timeoutMs = is_int($timeoutMs) && $timeoutMs >= 1 ? $timeoutMs : self::TIMEOUT_SECONDS * 1000;
         $this->seenNotices = [];
     }
 
@@ -1200,9 +1211,10 @@ class DominaiteClient
      * it to support with the time of the call.
      *
      * Every result reads it here, including the lists and the calls that return nothing.
-     * Every exception carries its own copy on getRequestId(). Null before the first answer,
-     * after a request that got no answer, and when the answer carried no id. A single slot,
-     * like getLastIdempotencyKey(): the next request overwrites it.
+     * Every exception carries its own copy on getRequestId(). When the last attempt of a
+     * call got no answer, it is the id of the last attempt that did. Null before the first
+     * answer, after a call none of whose attempts got an answer, and when the answer carried
+     * no id. A single slot, like getLastIdempotencyKey(): the next request overwrites it.
      */
     public function getLastRequestId(): ?string
     {
@@ -2587,6 +2599,9 @@ class DominaiteClient
         $replayable = $method === 'GET'
             || ($method === 'POST' && $idempotencyKey !== '' && $signedPath !== self::WEBHOOKS_PATH);
         $retries = $replayable ? $this->maxRetries : 0;
+        // The request id of the last attempt that answered. An attempt that gets no answer
+        // throws with this one, so an earlier 5xx stays traceable after a lost retry.
+        $answeredRequestId = null;
 
         for ($attempt = 1; ; $attempt++) {
             $canRetry = $attempt <= $retries;
@@ -2606,16 +2621,21 @@ class DominaiteClient
             $started = hrtime(true);
             $answer = $this->exchange($method, $this->baseUrl . $path, $headers, $body === null ? null : $json);
             $this->lastRequestId = null;
+            $answered = !$answer['oversized'] && $answer['error'] === null;
             try {
                 if ($answer['oversized']) {
                     throw new TransportException(
                         'The API response exceeded ' . self::MAX_RESPONSE_BYTES . ' bytes and was not read; '
-                        . 'retry with the same idempotency key.'
+                        . 'retry with the same idempotency key.',
+                        0, null, null, null, [], $answeredRequestId
                     );
                 }
                 if ($answer['error'] !== null) {
                     $retry = $canRetry;
-                    throw new TransportException("Could not reach the Dominaite API: {$answer['error']}");
+                    throw new TransportException(
+                        "Could not reach the Dominaite API: {$answer['error']}",
+                        0, null, null, null, [], $answeredRequestId
+                    );
                 }
                 try {
                     $reply = $this->readResponse($answer['status'], $answer['body'], $answer['headers']);
@@ -2649,6 +2669,12 @@ class DominaiteClient
                         $line .= ' attempt=' . $attempt;
                     }
                     $this->debugLine($line);
+                }
+                // After the debug line, which names only this attempt's own id.
+                if ($answered) {
+                    $answeredRequestId = $this->lastRequestId;
+                } else {
+                    $this->lastRequestId = $answeredRequestId;
                 }
             }
 
