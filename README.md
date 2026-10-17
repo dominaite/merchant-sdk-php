@@ -695,8 +695,11 @@ the next answer is most likely the same. You can retry it with the same idempote
 The API gives every request an id. Give it to support with the time of the call.
 
 - `$client->getLastRequestId()` is the id of the last answer, after a result or an error.
-  It is `null` when no answer came back, or the answer had none. The next call overwrites it.
-- Every SDK exception has `getRequestId()`, the id of the answer that raised it.
+  It is `null` when no attempt of the call got an answer, or the answer had none. The next
+  call overwrites it.
+- Every SDK exception has `getRequestId()`, the id of the answer that raised it. When the
+  last retry got no answer, it is the id of the last attempt that did, for example an
+  earlier 503.
 
 The SDK reads the `Dominaite-Request-Id` response header, and `metadata.requestId` in the
 body when the header is absent. Results stay plain arrays: the id is not a key in them.

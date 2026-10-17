@@ -1211,9 +1211,10 @@ class DominaiteClient
      * it to support with the time of the call.
      *
      * Every result reads it here, including the lists and the calls that return nothing.
-     * Every exception carries its own copy on getRequestId(). Null before the first answer,
-     * after a request that got no answer, and when the answer carried no id. A single slot,
-     * like getLastIdempotencyKey(): the next request overwrites it.
+     * Every exception carries its own copy on getRequestId(). When the last attempt of a
+     * call got no answer, it is the id of the last attempt that did. Null before the first
+     * answer, after a call none of whose attempts got an answer, and when the answer carried
+     * no id. A single slot, like getLastIdempotencyKey(): the next request overwrites it.
      */
     public function getLastRequestId(): ?string
     {
@@ -2598,6 +2599,9 @@ class DominaiteClient
         $replayable = $method === 'GET'
             || ($method === 'POST' && $idempotencyKey !== '' && $signedPath !== self::WEBHOOKS_PATH);
         $retries = $replayable ? $this->maxRetries : 0;
+        // The request id of the last attempt that answered. An attempt that gets no answer
+        // throws with this one, so an earlier 5xx stays traceable after a lost retry.
+        $answeredRequestId = null;
 
         for ($attempt = 1; ; $attempt++) {
             $canRetry = $attempt <= $retries;
@@ -2617,16 +2621,21 @@ class DominaiteClient
             $started = hrtime(true);
             $answer = $this->exchange($method, $this->baseUrl . $path, $headers, $body === null ? null : $json);
             $this->lastRequestId = null;
+            $answered = !$answer['oversized'] && $answer['error'] === null;
             try {
                 if ($answer['oversized']) {
                     throw new TransportException(
                         'The API response exceeded ' . self::MAX_RESPONSE_BYTES . ' bytes and was not read; '
-                        . 'retry with the same idempotency key.'
+                        . 'retry with the same idempotency key.',
+                        0, null, null, null, [], $answeredRequestId
                     );
                 }
                 if ($answer['error'] !== null) {
                     $retry = $canRetry;
-                    throw new TransportException("Could not reach the Dominaite API: {$answer['error']}");
+                    throw new TransportException(
+                        "Could not reach the Dominaite API: {$answer['error']}",
+                        0, null, null, null, [], $answeredRequestId
+                    );
                 }
                 try {
                     $reply = $this->readResponse($answer['status'], $answer['body'], $answer['headers']);
@@ -2660,6 +2669,12 @@ class DominaiteClient
                         $line .= ' attempt=' . $attempt;
                     }
                     $this->debugLine($line);
+                }
+                // After the debug line, which names only this attempt's own id.
+                if ($answered) {
+                    $answeredRequestId = $this->lastRequestId;
+                } else {
+                    $this->lastRequestId = $answeredRequestId;
                 }
             }
 

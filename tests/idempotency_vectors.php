@@ -687,4 +687,59 @@ outcomeOf(static function () use ($restored): void { $restored->listTransactions
 check('an unserialized client keeps a larger maxRetries and a fractional timeout',
     count($restored->sent) . ' ' . timeoutMsOf($restored), '5 250');
 
+// A 5xx that answered, then a retry that got no answer: the thrown error still names the
+// request id of the attempt that answered, so support can find the call.
+$lines = new class {
+    /** @var list<string> */
+    public array $debug = [];
+
+    public function warning(string $message, array $context = []): void
+    {
+    }
+
+    public function debug(string $message, array $context = []): void
+    {
+        $this->debug[] = $message;
+    }
+};
+$wire = new WireClient(['maxRetries' => 1, 'debug' => true, 'logger' => $lines]);
+$wire->answers = [answer(503, errorBody('INTERNAL_ERROR', 'req_first')), noAnswer()];
+$lost = null;
+try {
+    $wire->listTransactions([]);
+} catch (TransportException $e) {
+    $lost = $e;
+}
+check('a lost last attempt keeps the request id of the attempt that answered',
+    $lost === null ? 'no exception' : (string) $lost->getRequestId(), 'req_first');
+check('getLastRequestId() agrees with the thrown error', (string) $wire->getLastRequestId(), 'req_first');
+check('the debug line of the lost attempt carries no request id of its own',
+    (string) preg_replace('/ \\d+ms/', '', implode(' | ', $lines->debug)),
+    'dominaite-php: GET /merchant-api/transactions 503 request_id=req_first'
+        . ' | dominaite-php: GET /merchant-api/transactions error attempt=2');
+
+$wire = new WireClient(['maxRetries' => 1]);
+$wire->answers = [noAnswer(), noAnswer()];
+$lost = null;
+try {
+    $wire->listTransactions([]);
+} catch (TransportException $e) {
+    $lost = $e;
+}
+check('no answer on any attempt leaves no request id',
+    json_encode([$lost === null ? 'no exception' : $lost->getRequestId(), $wire->getLastRequestId()]), '[null,null]');
+
+$wire = new WireClient(['maxRetries' => 1]);
+$wire->answers = [answer(503, errorBody('INTERNAL_ERROR', 'req_old')), noAnswer()];
+outcomeOf(static function () use ($wire): void { $wire->listTransactions([]); });
+$wire->answers = [noAnswer(), noAnswer()];
+$lost = null;
+try {
+    $wire->listTransactions([]);
+} catch (TransportException $e) {
+    $lost = $e;
+}
+check('a later call never inherits the request id of an earlier call',
+    json_encode([$lost === null ? 'no exception' : $lost->getRequestId(), $wire->getLastRequestId()]), '[null,null]');
+
 exit($failures === 0 ? 0 : 1);

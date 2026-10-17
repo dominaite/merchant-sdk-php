@@ -59,6 +59,9 @@ Fixed:
   the same key; if the code comes back, read the transaction. Never retry under a new key.
 - `unserialize()` reset `maxRetries` and `timeout` to the defaults. A restored client now
   keeps the values you passed to the constructor.
+- When a retry got no answer, the request id of the earlier attempt that did was lost.
+  `getRequestId()` on the thrown `TransportException`, and `getLastRequestId()`, now return
+  the id of the last attempt that answered.
 - A `pm_` id with uppercase hex is lowercased before signing. The API signs a charge on the
   lowercase id, so an uppercase id failed with `INVALID_SIGNATURE`.
 - The README and the `createWebhookEndpoint()` docblock no longer say a same-key retry always
