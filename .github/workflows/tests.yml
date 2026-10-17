@@ -35,3 +35,28 @@ jobs:
               php "tests/$suite.php"
             done
           '
+
+  lint:
+    # php -l catches syntax the other version does not parse, in files no suite loads yet.
+    # composer validate --strict keeps composer.json publishable.
+    strategy:
+      fail-fast: false
+      matrix:
+        php: ['7.4', '8.3']
+
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: php -l on PHP ${{ matrix.php }}
+        run: |
+          docker run --rm -v "$PWD":/sdk -w /sdk php:${{ matrix.php }}-cli sh -c '
+            set -e
+            php -v
+            find src tests -name "*.php" -print0 | xargs -0 -n1 php -l
+          '
+
+      - name: composer validate --strict
+        if: matrix.php == '8.3'
+        run: docker run --rm -v "$PWD":/app -w /app composer:2 composer validate --strict
