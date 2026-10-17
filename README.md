@@ -149,6 +149,8 @@ throws `InvalidArgumentException`.
 | `userAgent` | Your own identifier, for example `'shop/1.2'`. The SDK sends `dominaite-php/<version> (php <version>)`, then one space and this value. It helps support find your calls. A control character throws `InvalidArgumentException`. |
 | `logger` | Receives the SDK's warnings, see [Logging and warnings](#logging-and-warnings). |
 | `debug` | `true` writes one line per request. Off by default. |
+| `maxRetries` | How many times the client sends a failed request again, with the same idempotency key. Default `2`. `0` sends every request once. See [Automatic retries](#automatic-retries). |
+| `timeout` | The limit in seconds for one attempt, an int or a float above 0. Default `15`. With retries, one call can take up to `(maxRetries + 1) x timeout`, plus the waits between attempts. |
 
 ```php
 $client = new DominaiteClient(
@@ -183,9 +185,10 @@ dominaite-php: POST /merchant-api/checkout/sessions 201 184ms request_id=4f1c...
 ```
 
 The line holds the method, the path without the query string, the status (`error` when the
-request did not complete), the time, the `Dominaite-Request-Id` response header and the
-idempotency key you sent. Give support the request id. No line holds your secret, the
-signature, the `cashierToken` or a request or response body.
+request did not complete), the time, the request id and the idempotency key you sent. A
+retried attempt adds `attempt=2`, `attempt=3` and so on, one line per attempt. Give support
+the request id, see [Request id](#request-id). No line holds your secret, the signature,
+the `cashierToken` or a request or response body.
 
 ## Read the integration contract
 
@@ -256,7 +259,8 @@ try {
     header('Retry-After: ' . ($e->getRetryAfterSeconds() ?? 5));
     exit('Payment temporarily unavailable');
 } catch (TransportException $e) {
-    // Network blip or a 5xx - retry with the same params, so the same key, never a fresh one.
+    // Network blip or a 5xx, still failing after the client's own retries. Retry later
+    // with the same params, so the same key, never a fresh one.
     http_response_code(503);
     exit('Payment temporarily unavailable');
 }
@@ -329,8 +333,9 @@ $reporting->deleteWebhookEndpoint($endpoint['id']);
 
 - The secret is in the first answer only. On a replay of the same key `secret` is `null`, and
   the list never has it. If you lose it, delete the endpoint and create it again.
-- After a timeout or a 503, retry with the same key. The retry can answer a new id and a new
-  secret, and one key never holds two endpoints.
+- The client never retries `createWebhookEndpoint()` on its own, whatever `maxRetries` says.
+  After a timeout or a 503, retry it yourself with the same key. If that answer has no
+  secret (`null`), delete that endpoint and create it again with a new key.
 - The SDK does not check event types. The API refuses an unknown type with
   `VALIDATION_ERROR`.
 - A key used again more than a day later, while its endpoint still exists, answers 409
@@ -597,26 +602,12 @@ flow. The result follows the usual key rules (1 to 100 visible ASCII characters,
 so no spaces), and
 the helper throws if it would not.
 
-On a timeout, retry with the same params and so the same key:
+The client retries a timeout for you with the same key, see
+[Automatic retries](#automatic-retries). When it still fails, the call throws
+`TransportException`. Retry later with the same params, and so the same key.
 
-```php
-$params['idempotencyKey'] = DominaiteClient::orderIdempotencyKey('checkout', 'order-1042', 2500, 'EUR');
-$session = null;
-
-for ($attempt = 1; $attempt <= 3 && $session === null; $attempt++) {
-    try {
-        $session = $client->createCheckoutSession($params);
-    } catch (TransportException $e) {
-        if ($attempt === 3) {
-            throw $e;
-        }
-        sleep($attempt);
-    }
-}
-```
-
-`getLastIdempotencyKey()` still reads back the key of the last attempt that went out, for a
-generic catch block that no longer has the params.
+`getLastIdempotencyKey()` reads back the key of the last call that went out, for a generic
+catch block that no longer has the params.
 
 A replay only hands back the original session while that session is open and unexpired. If
 the first attempt already completed, failed, or was sent with a different amount, the retry
@@ -626,15 +617,46 @@ as a `CheckoutRefusedException` carrying the transaction id to reconcile against
 "Recovering from a replay refusal" below. Treat it as "go look up what the first attempt did",
 not as an error to show the payer.
 
+### Automatic retries
+
+The client sends a failed request again on its own, up to `maxRetries` times (default 2).
+Every attempt sends the same idempotency key, the same path and the same body. Only the
+timestamp and the signature are new.
+
+The client retries a request only when the API can replay it:
+
+- every GET;
+- every POST with an idempotency key: sessions, charges, refunds, plans and agreements;
+- never `createWebhookEndpoint()`, see [Manage endpoints](#manage-endpoints-from-your-server);
+- never PATCH (`updatePlan()`) or DELETE (`revokePaymentMethod()`, `deletePlan()`,
+  `cancelAgreement()`, `deleteWebhookEndpoint()`).
+
+The client retries after these failures only:
+
+- no answer: a connection error, a reset or a timeout;
+- an HTTP 5xx, except `CHARGE_OUTCOME_UNKNOWN`, `CHARGE_FAILED`,
+  `PAYMENT_METHOD_CHARGES_DISABLED` and `UPSTREAM_CONTRACT_ERROR`. Each of these is an answer
+  about your request, not an outage;
+- a `PAYMENT_PROCESSING_UNAVAILABLE` refusal, as a 503 or as a 200 on a session.
+
+A 429, a 4xx and an answer over the size cap are never retried. Before retry `n` (counted
+from 0), the client waits a random time from 0 to `min(8 s, 500 ms x 2^n)`: up to 0.5 s, then
+up to 1 s. The last attempt's answer or exception is what your code gets.
+
+The `timeout` option (default 15 seconds) is the limit for ONE attempt. With the defaults,
+one call can take up to 3 x 15 s plus about 1.5 s of waits. Set `maxRetries` to `0` to send
+every request once, for example in a web request that must answer fast.
+
 ## Rate limits
 
 60 requests per minute per API key, 120 per minute per source IP. The per-IP bucket is the
 one that surprises people: several keys behind one egress address share it, so a key well
 under 60/min can still be limited.
 
-Over the limit the API answers HTTP 429 and the SDK raises `RateLimitException`. It is not
-retried for you - a loop against a rate limiter just spends the next window too, and on
-`createCheckoutSession()` retrying is a decision about a payment that belongs in your code.
+Over the limit the API answers HTTP 429 and the SDK raises `RateLimitException`. The client
+never retries a 429, whatever `maxRetries` says - a loop against a rate limiter just spends
+the next window too, and on `createCheckoutSession()` retrying is a decision about a payment
+that belongs in your code.
 `getRetryAfterSeconds()` gives the server's own number of seconds to wait, or `null` when it
 did not send a usable one; treat `null` as "use your own backoff", not "retry now". When you
 do retry, reuse the idempotency key.
@@ -663,7 +685,19 @@ transaction every few seconds, not every transaction every second.
 Responses are read up to 10 MB and no further. A real merchant-API response is a few
 kilobytes, so anything near that is a captive portal or an edge serving something that is
 not us, and reading it to the end would grow a worker's memory for no reason. An oversized
-response surfaces as `TransportException` - retryable, same as any other transport failure.
+response surfaces as `TransportException`. The client does not retry it on its own, because
+the next answer is most likely the same. You can retry it with the same idempotency key.
+
+## Request id
+
+The API gives every request an id. Give it to support with the time of the call.
+
+- `$client->getLastRequestId()` is the id of the last answer, after a result or an error.
+  It is `null` when no answer came back, or the answer had none. The next call overwrites it.
+- Every SDK exception has `getRequestId()`, the id of the answer that raised it.
+
+The SDK reads the `Dominaite-Request-Id` response header, and `metadata.requestId` in the
+body when the header is absent. Results stay plain arrays: the id is not a key in them.
 
 ## Sessions expire
 
@@ -847,12 +881,14 @@ A charge is signed exactly like a session and carries a required `Idempotency-Ke
 retry after a timeout with the **same** key never charges the card twice: the gateway replays
 its first answer, HTTP status included. `getLastIdempotencyKey()` reads the key back the same
 way it does for a session. The HTTP status is the contract on this route: 201 (or 200 on a replay) returns
-the charge, 402 returns the charge too (`status` `failed`), and 409, 422,
+the charge, 402 returns the charge too (`status` `failed`), and 404, 409, 422,
 502 and 503 throw `ChargeException` with `getErrorCode()`, `getHttpStatus()`, the gateway's
 message and, when the gateway attached the charge row, `getCharge()` and `getTransactionId()`.
-Only authentication (401/403), an id that is not yours (404, `ApiException` with
-`getErrorCode()` `PAYMENT_METHOD_NOT_FOUND`), validation (400, `ApiException`), rate limiting
-(429) and network failures keep their generic exceptions. `declineClass` and `declineCode` are
+An id that is not yours is a 404 `ChargeException` with `getErrorCode()`
+`PAYMENT_METHOD_NOT_FOUND` (or `AGREEMENT_NOT_FOUND` for an `agreementId`). A 5xx with a code
+the charge route does not own is a `TransportException` that keeps the code. Only
+authentication (401/403), validation (400, `ApiException`), rate limiting (429) and network
+failures keep their generic exceptions. `declineClass` and `declineCode` are
 `null` unless the charge was declined; the gateway omits them on the wire and the SDK reads
 absent as null. `declineClass` can be null, for example when nobody declined the payment.
 Handle a null class on a 402 like `soft_other`.

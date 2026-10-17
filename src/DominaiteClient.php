@@ -1951,8 +1951,10 @@ class DominaiteClient
      * register it again.
      *
      * A create with no answer (a timeout or a 503) may still have registered the endpoint.
-     * Retry with the SAME key: the retry replaces that endpoint and answers a fresh 201 with
-     * a new id and secret. A retry with a new key cannot do this.
+     * The client never retries this call on its own, whatever maxRetries says. Retry it
+     * yourself with the SAME key. If that answer has no secret (null), delete that endpoint
+     * and create it again with a new key. A retry with a new key while the first endpoint
+     * exists registers a second one.
      *
      * A refusal is an ApiException; branch on getErrorCode(). WEBHOOK_URL_REJECTED (400:
      * not https, does not resolve, or a private host), WEBHOOK_LIMIT_REACHED (409: you have

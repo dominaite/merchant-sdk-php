@@ -417,9 +417,11 @@ check(
 // --- Version -----------------------------------------------------------------------------
 
 $changelog = (string) file_get_contents(__DIR__ . '/../CHANGELOG.md');
-preg_match('/^## (\S+)/m', $changelog, $heading);
+// A section for the next version sits on top as "## x.y.z (unreleased)" until its tag; the
+// first released heading is the one VERSION must match.
+preg_match('/^## (\S+)$/m', $changelog, $heading);
 check(
-    'DominaiteClient::VERSION is the first CHANGELOG.md heading',
+    'DominaiteClient::VERSION is the first released CHANGELOG.md heading',
     ($heading[1] ?? '') === DominaiteClient::VERSION,
     'CHANGELOG ' . ($heading[1] ?? 'none') . ', VERSION ' . DominaiteClient::VERSION
 );
