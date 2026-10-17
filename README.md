@@ -54,6 +54,9 @@ captured signed request stays replayable for the whole 5 minute clock window. `h
 accepted only for `localhost`, `127.0.0.1` and `::1`, so a local mock still works. Anything
 else throws `InvalidArgumentException` at construction rather than on your first live payment.
 
+The private `DEFAULT_BASE_URL` constant is removed in 0.6.0. Use
+`DominaiteClient::PRODUCTION_BASE_URL`.
+
 ### Do not dump the client
 
 The client holds your secret in memory. Do not `var_dump()`, `print_r()`, `var_export()`,
@@ -135,6 +138,54 @@ print_r($client->ping());
 
 Watch `clockSkewSeconds`: the gateway rejects requests once it passes 300, so a number that
 keeps growing is your cue to fix NTP before payments start failing.
+
+## Client options
+
+The fourth constructor argument is an array of options. All are optional. An unknown key
+throws `InvalidArgumentException`.
+
+| Option | What |
+|--------|------|
+| `userAgent` | Your own identifier, for example `'shop/1.2'`. The SDK sends `dominaite-php/<version> (php <version>)`, then one space and this value. It helps support find your calls. A control character throws `InvalidArgumentException`. |
+| `logger` | Receives the SDK's warnings, see [Logging and warnings](#logging-and-warnings). |
+| `debug` | `true` writes one line per request. Off by default. |
+
+```php
+$client = new DominaiteClient(
+    getenv('DOMINAITE_KEY_ID'),
+    getenv('DOMINAITE_SECRET'),
+    getenv('DOMINAITE_BASE_URL'),
+    ['userAgent' => 'shop/1.2', 'logger' => $logger]
+);
+```
+
+## Logging and warnings
+
+The SDK warns you about two things:
+
+- The API sent a `Dominaite-Sdk-Notice` header: this SDK version is deprecated. The warning
+  names the current version, the sunset date and a link when the API sends them. The SDK
+  warns once per distinct notice per client. The SDK reads the header on every response,
+  errors included.
+- `ping()` found a clock skew of more than 60 seconds. Requests fail at 300 seconds.
+
+The `logger` option takes any object with `warning(string $message, array $context = [])`,
+so a PSR-3 `LoggerInterface` fits. The SDK does not require `psr/log`. Without a logger,
+warnings go to `trigger_error($message, E_USER_DEPRECATED)`. Frameworks log a deprecation and
+do not throw on it. If your logger or your error handler throws, the SDK drops the error:
+a warning never fails a request.
+
+With `'debug' => true`, the SDK writes one line per request to the logger's `debug()`, or to
+`error_log()` without a logger:
+
+```
+dominaite-php: POST /merchant-api/checkout/sessions 201 184ms request_id=4f1c... idempotency_key=checkout-order-1042-2500-EUR
+```
+
+The line holds the method, the path without the query string, the status (`error` when the
+request did not complete), the time, the `Dominaite-Request-Id` response header and the
+idempotency key you sent. Give support the request id. No line holds your secret, the
+signature, the `cashierToken` or a request or response body.
 
 ## Read the integration contract
 
