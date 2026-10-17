@@ -26,6 +26,8 @@ class TransportException extends \RuntimeException
     /** @var array<string,mixed> */
     private array $result;
 
+    private ?string $requestId;
+
     /**
      * The first three parameters are \RuntimeException's own, so existing calls keep working.
      *
@@ -37,9 +39,11 @@ class TransportException extends \RuntimeException
         ?\Throwable $previous = null,
         ?int $httpStatus = null,
         ?string $errorCode = null,
-        array $result = []
+        array $result = [],
+        ?string $requestId = null
     ) {
         parent::__construct($message, $code, $previous);
+        $this->requestId = $requestId;
         $this->httpStatus = $httpStatus;
         $this->errorCode = $errorCode;
         $this->result = $result;
@@ -65,5 +69,15 @@ class TransportException extends \RuntimeException
     public function getResult(): array
     {
         return $this->result;
+    }
+
+    /**
+     * The id the API gave this request: the Dominaite-Request-Id header, or metadata.requestId
+     * in the body when the header is absent. Null when no answer carried one. Give it to
+     * support with the time of the call.
+     */
+    public function getRequestId(): ?string
+    {
+        return $this->requestId;
     }
 }

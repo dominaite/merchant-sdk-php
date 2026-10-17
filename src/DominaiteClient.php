@@ -644,6 +644,7 @@ class DominaiteClient
     private string $secret;
     private string $baseUrl;
     private ?string $lastIdempotencyKey = null;
+    private ?string $lastRequestId = null;
     private string $userAgent;
     /** @var object|null Anything with warning(string $message, array $context = []); PSR-3 fits. */
     private ?object $logger = null;
@@ -1106,14 +1107,15 @@ class DominaiteClient
             // A storefront problem is one class whatever the status: a replay for another
             // storefront answers 200, a fresh request 400.
             if (in_array($errorCode, self::STOREFRONT_ERROR_CODES, true)) {
-                throw new StorefrontException(200, $errorMessage, $errorCode, $response);
+                throw new StorefrontException(200, $errorMessage, $errorCode, $response, $this->lastRequestId);
             }
 
             throw new CheckoutRefusedException(
                 $errorCode,
                 $errorMessage,
                 is_string($transactionId) && $transactionId !== '' ? $transactionId : null,
-                $response
+                $response,
+                $this->lastRequestId
             );
         }
 
@@ -1154,6 +1156,21 @@ class DominaiteClient
     public function getLastIdempotencyKey(): ?string
     {
         return $this->lastIdempotencyKey;
+    }
+
+    /**
+     * The request id of the last answer this client received: the Dominaite-Request-Id
+     * response header, or metadata.requestId in the body when the header is absent. Give
+     * it to support with the time of the call.
+     *
+     * Every result reads it here, including the lists and the calls that return nothing.
+     * Every exception carries its own copy on getRequestId(). Null before the first answer,
+     * after a request that got no answer, and when the answer carried no id. A single slot,
+     * like getLastIdempotencyKey(): the next request overwrites it.
+     */
+    public function getLastRequestId(): ?string
+    {
+        return $this->lastRequestId;
     }
 
     /**
@@ -1393,13 +1410,14 @@ class DominaiteClient
                 $errorCode,
                 (string) ($reply['error']['message'] ?? 'The charge was refused.'),
                 $charge,
-                $reply['envelope']
+                $reply['envelope'],
+                $reply['requestId'] ?? null
             );
         }
         if ($reply['status'] >= 400) {
             throw self::rejection($reply);
         }
-        throw new ApiException($reply['status'], 'The API answered the charge without a charge body', 'UNEXPECTED_RESPONSE');
+        throw self::unexpected($reply, 'The API answered the charge without a charge body');
     }
 
     /**
@@ -1436,7 +1454,8 @@ class DominaiteClient
                 $reply['status'],
                 $errorCode,
                 (string) ($reply['error']['message'] ?? 'The revoke was refused.'),
-                $reply['envelope']
+                $reply['envelope'],
+                $reply['requestId'] ?? null
             );
         }
         throw self::rejection($reply);
@@ -1622,14 +1641,15 @@ class DominaiteClient
                 $reply['status'],
                 (string) ($reply['error']['message'] ?? 'The refund was refused.'),
                 $errorCode,
-                $reply['envelope']
+                $reply['envelope'],
+                $reply['requestId'] ?? null
             );
         }
         if ($reply['status'] >= 400) {
             return self::rejection($reply);
         }
 
-        return new ApiException($reply['status'], $unexpected, 'UNEXPECTED_RESPONSE');
+        return self::unexpected($reply, $unexpected);
     }
 
     /**
@@ -2023,7 +2043,7 @@ class DominaiteClient
         $reply = $this->send('GET', self::TRANSACTIONS_PATH . ($query === '' ? '' : '?' . $query), null, '');
         $page = self::settle($reply);
         if (!is_array($page['items'] ?? null)) {
-            throw new ApiException($reply['status'], 'The API answered without a transaction page', 'UNEXPECTED_RESPONSE');
+            throw self::unexpected($reply, 'The API answered without a transaction page');
         }
         $page['items'] = array_map(static function (array $item): array {
             foreach (['orderReference', 'completedAt', 'storedPaymentMethodId', 'refundedAmount', 'fee', 'netAmount',
@@ -2065,7 +2085,7 @@ class DominaiteClient
     {
         $data = self::settle($reply);
         if (!is_string($data['id'] ?? null)) {
-            throw new ApiException($reply['status'], "The API answered without the {$what}", 'UNEXPECTED_RESPONSE');
+            throw self::unexpected($reply, "The API answered without the {$what}");
         }
 
         return $data;
@@ -2083,7 +2103,7 @@ class DominaiteClient
         self::settle($reply);
         $data = $reply['envelope']['data'] ?? null;
         if (!is_array($data) || $data !== array_values($data) || count(array_filter($data, 'is_array')) !== count($data)) {
-            throw new ApiException($reply['status'], "The API answered without the {$what} list", 'UNEXPECTED_RESPONSE');
+            throw self::unexpected($reply, "The API answered without the {$what} list");
         }
 
         return $data;
@@ -2573,31 +2593,35 @@ class DominaiteClient
         $status = (int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
         curl_close($ch);
 
-        if ($this->debug) {
-            $line = 'dominaite-php: ' . $method . ' ' . $signedPath . ' '
-                . ($oversized || $completed === false ? 'error' : (string) $status) . ' '
-                . intdiv(hrtime(true) - $started, 1000000) . 'ms';
-            $requestId = self::headerText($responseHeaders['dominaite-request-id'] ?? '', 128);
-            if ($requestId !== '') {
-                $line .= ' request_id=' . $requestId;
+        $this->lastRequestId = null;
+        try {
+            if ($oversized) {
+                throw new TransportException(
+                    'The API response exceeded ' . self::MAX_RESPONSE_BYTES . ' bytes and was not read; '
+                    . 'retry with the same idempotency key.'
+                );
             }
-            if ($idempotencyKey !== '') {
-                $line .= ' idempotency_key=' . $idempotencyKey;
+            if ($completed === false) {
+                throw new TransportException("Could not reach the Dominaite API: {$error}");
             }
-            $this->debugLine($line);
-        }
 
-        if ($oversized) {
-            throw new TransportException(
-                'The API response exceeded ' . self::MAX_RESPONSE_BYTES . ' bytes and was not read; '
-                . 'retry with the same idempotency key.'
-            );
+            return $this->readResponse($status, $raw, $responseHeaders);
+        } finally {
+            // After readResponse(), so the line carries the request id from the header or
+            // the body, and is written for an answer that throws too.
+            if ($this->debug) {
+                $line = 'dominaite-php: ' . $method . ' ' . $signedPath . ' '
+                    . ($oversized || $completed === false ? 'error' : (string) $status) . ' '
+                    . intdiv(hrtime(true) - $started, 1000000) . 'ms';
+                if ($this->lastRequestId !== null) {
+                    $line .= ' request_id=' . $this->lastRequestId;
+                }
+                if ($idempotencyKey !== '') {
+                    $line .= ' idempotency_key=' . $idempotencyKey;
+                }
+                $this->debugLine($line);
+            }
         }
-        if ($completed === false) {
-            throw new TransportException("Could not reach the Dominaite API: {$error}");
-        }
-
-        return $this->readResponse($status, $raw, $responseHeaders);
     }
 
     /**
@@ -2632,31 +2656,35 @@ class DominaiteClient
         // First, so a notice on a 429, a 401 or an unreadable body still reaches the caller.
         $this->readNotice($responseHeaders['dominaite-sdk-notice'] ?? null);
 
+        // 204 carries nothing to parse; the status is the whole answer, and only the header
+        // can carry the request id.
+        $decoded = $status === 204 ? null : json_decode($raw, true);
+        $requestId = self::requestId($responseHeaders, is_array($decoded) ? $decoded : []);
+        $this->lastRequestId = $requestId;
+
         if ($status === 429) {
             // The code is read when the body is the gateway's envelope, and skipped
             // otherwise: an edge's HTML 429 is still a rate limit.
-            $limited = json_decode($raw, true);
-            $limited = is_array($limited) ? $limited : [];
+            $limited = is_array($decoded) ? $decoded : [];
             $limitCode = is_array($limited['error'] ?? null) ? ($limited['error']['code'] ?? null) : null;
             throw new RateLimitException(
                 'Rate limit exceeded (HTTP 429); back off and retry with the same idempotency key.',
                 self::parseRetryAfter($responseHeaders['retry-after'] ?? null),
                 is_string($limitCode) && $limitCode !== '' ? $limitCode : null,
-                $limited
+                $limited,
+                $requestId
             );
         }
 
-        // 204 carries nothing to parse; the status is the whole answer.
         if ($status === 204) {
-            return ['status' => 204, 'envelope' => [], 'payload' => [], 'error' => []];
+            return ['status' => 204, 'envelope' => [], 'payload' => [], 'error' => [], 'requestId' => $requestId];
         }
 
-        $decoded = json_decode($raw, true);
         if (!is_array($decoded)) {
             if ($status >= 500) {
-                throw self::unavailable($status);
+                throw self::unavailable($status, null, [], $requestId);
             }
-            throw new ApiException($status, 'The API returned a non-JSON response');
+            throw new ApiException($status, 'The API returned a non-JSON response', null, [], $requestId);
         }
 
         // The gateway wraps responses as { success, data, ... }; unwrap when present.
@@ -2669,11 +2697,36 @@ class DominaiteClient
             throw new AuthenticationException(
                 $errorCode,
                 self::refusalMessage($status, $errorCode, $envelopeError['message'] ?? null),
-                $status
+                $status,
+                $requestId
             );
         }
 
-        return ['status' => $status, 'envelope' => $decoded, 'payload' => $payload, 'error' => $envelopeError];
+        return ['status' => $status, 'envelope' => $decoded, 'payload' => $payload, 'error' => $envelopeError,
+            'requestId' => $requestId];
+    }
+
+    /**
+     * The request id of one answer: the Dominaite-Request-Id header when the API sent one,
+     * otherwise metadata.requestId in the body. Both are the same id; production sends only
+     * the body field so far.
+     *
+     * @param array<string,string> $responseHeaders Lowercased header names to values.
+     * @param array<string,mixed>  $decoded         The decoded body, or [] when there is none.
+     */
+    private static function requestId(array $responseHeaders, array $decoded): ?string
+    {
+        $header = trim(self::headerText($responseHeaders['dominaite-request-id'] ?? '', 128));
+        if ($header !== '') {
+            return $header;
+        }
+        $body = is_array($decoded['metadata'] ?? null) ? ($decoded['metadata']['requestId'] ?? null) : null;
+        if (!is_string($body)) {
+            return null;
+        }
+        $body = trim(self::headerText($body, 128));
+
+        return $body === '' ? null : $body;
     }
 
     /**
@@ -2730,21 +2783,36 @@ class DominaiteClient
     {
         $errorCode = $reply['payload']['errorCode'] ?? $reply['error']['code'] ?? null;
         $errorCode = is_string($errorCode) && $errorCode !== '' ? $errorCode : null;
+        $requestId = $reply['requestId'] ?? null;
         if ($reply['status'] >= 500) {
-            return self::unavailable($reply['status'], $errorCode, $reply['envelope']);
+            return self::unavailable($reply['status'], $errorCode, $reply['envelope'], $requestId);
         }
         $message = (string) ($reply['payload']['errorMessage'] ?? $reply['error']['message'] ?? 'Request rejected');
 
         if ($errorCode !== null && in_array($errorCode, self::STOREFRONT_ERROR_CODES, true)) {
-            return new StorefrontException($reply['status'], $message, $errorCode, $reply['envelope']);
+            return new StorefrontException($reply['status'], $message, $errorCode, $reply['envelope'], $requestId);
         }
 
-        return new ApiException($reply['status'], $message, $errorCode, $reply['envelope']);
+        return new ApiException($reply['status'], $message, $errorCode, $reply['envelope'], $requestId);
+    }
+
+    /**
+     * A 2xx without the body the route promises.
+     *
+     * @param array{status:int,envelope:array<string,mixed>,payload:array<string,mixed>,error:array<string,mixed>,requestId?:?string} $reply
+     */
+    private static function unexpected(array $reply, string $message): ApiException
+    {
+        return new ApiException($reply['status'], $message, 'UNEXPECTED_RESPONSE', [], $reply['requestId'] ?? null);
     }
 
     /** @param array<string,mixed> $envelope */
-    private static function unavailable(int $status, ?string $errorCode = null, array $envelope = []): TransportException
-    {
+    private static function unavailable(
+        int $status,
+        ?string $errorCode = null,
+        array $envelope = [],
+        ?string $requestId = null
+    ): TransportException {
         return new TransportException(
             "The Dominaite API is unavailable (HTTP {$status}" . ($errorCode === null ? '' : ", {$errorCode}")
             . '); retry with the same idempotency key.',
@@ -2752,7 +2820,8 @@ class DominaiteClient
             null,
             $status,
             $errorCode,
-            $envelope
+            $envelope,
+            $requestId
         );
     }
 

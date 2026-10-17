@@ -32,9 +32,9 @@ class RefundException extends ApiException
     private const RETRYABLE_CODES = ['REFUND_NOT_FOUND', 'DUPLICATE_REQUEST'];
 
     /** @param array<string,mixed> $result The full envelope. */
-    public function __construct(int $httpStatus, string $message, string $errorCode, array $result = [])
+    public function __construct(int $httpStatus, string $message, string $errorCode, array $result = [], ?string $requestId = null)
     {
-        parent::__construct($httpStatus, $message, $errorCode, $result);
+        parent::__construct($httpStatus, $message, $errorCode, $result, $requestId);
     }
 
     /**

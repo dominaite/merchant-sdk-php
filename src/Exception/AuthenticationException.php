@@ -22,9 +22,12 @@ class AuthenticationException extends \RuntimeException
     private string $errorCode;
     private int $httpStatus;
 
-    public function __construct(string $errorCode, string $message, int $httpStatus = 401)
+    private ?string $requestId;
+
+    public function __construct(string $errorCode, string $message, int $httpStatus = 401, ?string $requestId = null)
     {
         parent::__construct($message);
+        $this->requestId = $requestId;
         $this->errorCode = $errorCode;
         $this->httpStatus = $httpStatus;
     }
@@ -38,5 +41,15 @@ class AuthenticationException extends \RuntimeException
     public function getHttpStatus(): int
     {
         return $this->httpStatus;
+    }
+
+    /**
+     * The id the API gave this request: the Dominaite-Request-Id header, or metadata.requestId
+     * in the body when the header is absent. Null when no answer carried one. Give it to
+     * support with the time of the call.
+     */
+    public function getRequestId(): ?string
+    {
+        return $this->requestId;
     }
 }

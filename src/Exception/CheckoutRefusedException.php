@@ -44,12 +44,15 @@ class CheckoutRefusedException extends \RuntimeException
     /** @var array<string,mixed> */
     private array $result;
 
+    private ?string $requestId;
+
     /**
      * @param array<string,mixed> $result The full unwrapped refusal payload.
      */
-    public function __construct(string $errorCode, string $message, ?string $transactionId = null, array $result = [])
+    public function __construct(string $errorCode, string $message, ?string $transactionId = null, array $result = [], ?string $requestId = null)
     {
         parent::__construct($message);
+        $this->requestId = $requestId;
         $this->errorCode = $errorCode;
         $this->transactionId = $transactionId;
         $this->result = $result;
@@ -77,5 +80,15 @@ class CheckoutRefusedException extends \RuntimeException
     public function getResult(): array
     {
         return $this->result;
+    }
+
+    /**
+     * The id the API gave this request: the Dominaite-Request-Id header, or metadata.requestId
+     * in the body when the header is absent. Null when no answer carried one. Give it to
+     * support with the time of the call.
+     */
+    public function getRequestId(): ?string
+    {
+        return $this->requestId;
     }
 }
