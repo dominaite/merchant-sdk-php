@@ -16,7 +16,11 @@ Breaking:
   loop, it now runs on top of these retries.
 - The timeout is per attempt. With retries, one call can take up to
   `(maxRetries + 1) x timeout`, plus the waits between attempts. With the defaults that is
-  up to about 47 seconds instead of 15.
+  up to about 137 seconds instead of 15.
+- The default timeout is 45 seconds per attempt, up from 15, the same as the other Dominaite
+  SDKs. A charge can take longer than 15 seconds at the card provider, and a first attempt
+  cut off early makes the API refuse its same-key retry until that attempt finishes. Pass
+  `'timeout' => 15` to keep the old limit.
 - A 404 on `chargePaymentMethod()` (`PAYMENT_METHOD_NOT_FOUND`, `AGREEMENT_NOT_FOUND`) is now a
   `ChargeException`, not an `ApiException`. `ChargeException` does not extend
   `ApiException`, so a `catch (ApiException $e)` no longer sees it. Check the order of your
@@ -40,7 +44,7 @@ Added:
   exception. The SDK reads the `Dominaite-Request-Id` header, then `metadata.requestId` in
   the body. The debug line prints that id, and `attempt=N` on a retry.
 - The `maxRetries` option (int, 0 or more, default 2) and the `timeout` option (seconds per
-  attempt, default 15).
+  attempt, default 45).
 - Error code lists: `AUTHENTICATION_ERROR_CODES`, `TRANSIENT_ERROR_CODES`,
   `FIELD_VALIDATION_CODES`, `RECURRING_ERROR_CODES`, `WEBHOOK_ERROR_CODES` and
   `MERCHANT_API_UNAVAILABLE`. Webhook event lists: `PAYMENT_WEBHOOK_EVENTS`,

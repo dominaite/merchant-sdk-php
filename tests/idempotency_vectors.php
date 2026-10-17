@@ -661,4 +661,16 @@ foreach ([['maxRetries' => 0], ['maxRetries' => 5], ['timeout' => 30], ['timeout
         outcomeOf(static function () use ($good): void { new WireClient($good); }), 'returned');
 }
 
+/** The per-attempt limit curl gets, in milliseconds. No public getter exists; the default is documented. */
+function timeoutMsOf(DominaiteClient $client): int
+{
+    $property = new \ReflectionProperty(DominaiteClient::class, 'timeoutMs');
+    $property->setAccessible(true);
+
+    return (int) $property->getValue($client);
+}
+
+check('the default timeout is 45 seconds per attempt', (string) timeoutMsOf(new WireClient()), '45000');
+check('the timeout option sets the per-attempt limit', (string) timeoutMsOf(new WireClient(['timeout' => 2.5])), '2500');
+
 exit($failures === 0 ? 0 : 1);

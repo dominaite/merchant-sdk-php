@@ -150,7 +150,7 @@ throws `InvalidArgumentException`.
 | `logger` | Receives the SDK's warnings, see [Logging and warnings](#logging-and-warnings). |
 | `debug` | `true` writes one line per request. Off by default. |
 | `maxRetries` | How many times the client sends a failed request again, with the same idempotency key. Default `2`. `0` sends every request once. See [Automatic retries](#automatic-retries). |
-| `timeout` | The limit in seconds for one attempt, an int or a float above 0. Default `15`. With retries, one call can take up to `(maxRetries + 1) x timeout`, plus the waits between attempts. |
+| `timeout` | The limit in seconds for one attempt, an int or a float above 0. Default `45`. With retries, one call can take up to `(maxRetries + 1) x timeout`, plus the waits between attempts. |
 
 ```php
 $client = new DominaiteClient(
@@ -643,9 +643,11 @@ A 429, a 4xx and an answer over the size cap are never retried. Before retry `n`
 from 0), the client waits a random time from 0 to `min(8 s, 500 ms x 2^n)`: up to 0.5 s, then
 up to 1 s. The last attempt's answer or exception is what your code gets.
 
-The `timeout` option (default 15 seconds) is the limit for ONE attempt. With the defaults,
-one call can take up to 3 x 15 s plus about 1.5 s of waits. Set `maxRetries` to `0` to send
-every request once, for example in a web request that must answer fast.
+The `timeout` option (default 45 seconds) is the limit for ONE attempt. A charge can take
+longer than 15 seconds at the card provider. A shorter limit cuts the first attempt off while
+it still runs, and the API then refuses the same-key retry until that attempt finishes. With
+the defaults, one call can take up to 3 x 45 s plus about 1.5 s of waits. Set `maxRetries` to
+`0` to send every request once, for example in a web request that must answer fast.
 
 ## Rate limits
 

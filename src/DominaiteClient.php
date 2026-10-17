@@ -79,7 +79,7 @@ class DominaiteClient
     public const INTEGRATION_CONTRACT_PATH = '/merchant-api/integration/contract';
     /** This SDK's version. The User-Agent carries it. */
     public const VERSION = '0.6.0';
-    private const TIMEOUT_SECONDS = 15;
+    private const TIMEOUT_SECONDS = 45;
     private const DEFAULT_MAX_RETRIES = 2;
     private const RETRY_BASE_MS = 500;
     private const RETRY_CAP_MS = 8000;
@@ -691,7 +691,7 @@ class DominaiteClient
      *                         sent again, with the same idempotency key. Default 2; 0 sends
      *                         each request once. See send() for what is retried.
      *                         timeout (int|float seconds, more than 0) - the limit for ONE
-     *                         attempt. Default 15. With retries, one call can take up to
+     *                         attempt. Default 45. With retries, one call can take up to
      *                         (maxRetries + 1) x timeout, plus the waits between attempts.
      *                         An unknown key throws InvalidArgumentException.
      */
