@@ -164,7 +164,8 @@ final class CannedClient extends DominaiteClient
     {
         parent::__construct(
             'dmk_0123456789abcdef',
-            'dms_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'
+            'dms_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef',
+            DominaiteClient::SANDBOX_BASE_URL
         );
         $this->canned = $canned;
         $this->status = $status;

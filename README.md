@@ -30,11 +30,32 @@ You get two values from Dominaite (shown once - store them like passwords):
 Every request is signed with the secret (HMAC-SHA256) and timestamped. Keep your server
 clock on NTP - signatures older than 5 minutes are rejected.
 
-The third constructor argument overrides the base URL for non-production environments. It
-has to be `https://`: the key id and the signature travel in headers, and a captured
-signed request stays replayable for the whole 5 minute clock window. `http://` is accepted
-only for `localhost`, `127.0.0.1` and `::1`, so a local mock still works. Anything else
-throws `InvalidArgumentException` at construction rather than on your first live payment.
+### Base URL
+
+The third constructor argument is the base URL. It is required: there is no default.
+
+| Environment | Base URL | Constant |
+|-------------|----------|----------|
+| Sandbox | `https://api.staging.dominaite.com/payments` | `DominaiteClient::SANDBOX_BASE_URL` |
+| Production | `https://api.dominaite.com/payments` | `DominaiteClient::PRODUCTION_BASE_URL` |
+
+The examples below read it from `DOMINAITE_BASE_URL`:
+
+```bash
+export DOMINAITE_BASE_URL=https://api.staging.dominaite.com/payments
+```
+
+A missing, empty or whitespace-only base URL throws `InvalidArgumentException` at
+construction. An unset environment variable therefore fails loudly instead of sending your
+sandbox key to production.
+
+The base URL has to be `https://`: the key id and the signature travel in headers, and a
+captured signed request stays replayable for the whole 5 minute clock window. `http://` is
+accepted only for `localhost`, `127.0.0.1` and `::1`, so a local mock still works. Anything
+else throws `InvalidArgumentException` at construction rather than on your first live payment.
+
+The private `DEFAULT_BASE_URL` constant is removed in 0.6.0. Use
+`DominaiteClient::PRODUCTION_BASE_URL`.
 
 ### Do not dump the client
 
@@ -109,7 +130,7 @@ require __DIR__ . '/vendor/autoload.php';
 
 use Dominaite\DominaiteClient;
 
-$client = new DominaiteClient(getenv('DOMINAITE_KEY_ID'), getenv('DOMINAITE_SECRET'));
+$client = new DominaiteClient(getenv('DOMINAITE_KEY_ID'), getenv('DOMINAITE_SECRET'), getenv('DOMINAITE_BASE_URL'));
 
 print_r($client->ping());
 // ['pong' => true, 'merchantId' => '...', 'serverTime' => '...', 'clockSkewSeconds' => 0]
@@ -117,6 +138,54 @@ print_r($client->ping());
 
 Watch `clockSkewSeconds`: the gateway rejects requests once it passes 300, so a number that
 keeps growing is your cue to fix NTP before payments start failing.
+
+## Client options
+
+The fourth constructor argument is an array of options. All are optional. An unknown key
+throws `InvalidArgumentException`.
+
+| Option | What |
+|--------|------|
+| `userAgent` | Your own identifier, for example `'shop/1.2'`. The SDK sends `dominaite-php/<version> (php <version>)`, then one space and this value. It helps support find your calls. A control character throws `InvalidArgumentException`. |
+| `logger` | Receives the SDK's warnings, see [Logging and warnings](#logging-and-warnings). |
+| `debug` | `true` writes one line per request. Off by default. |
+
+```php
+$client = new DominaiteClient(
+    getenv('DOMINAITE_KEY_ID'),
+    getenv('DOMINAITE_SECRET'),
+    getenv('DOMINAITE_BASE_URL'),
+    ['userAgent' => 'shop/1.2', 'logger' => $logger]
+);
+```
+
+## Logging and warnings
+
+The SDK warns you about two things:
+
+- The API sent a `Dominaite-Sdk-Notice` header: this SDK version is deprecated. The warning
+  names the current version, the sunset date and a link when the API sends them. The SDK
+  warns once per distinct notice per client. The SDK reads the header on every response,
+  errors included.
+- `ping()` found a clock skew of more than 60 seconds. Requests fail at 300 seconds.
+
+The `logger` option takes any object with `warning(string $message, array $context = [])`,
+so a PSR-3 `LoggerInterface` fits. The SDK does not require `psr/log`. Without a logger,
+warnings go to `trigger_error($message, E_USER_DEPRECATED)`. Frameworks log a deprecation and
+do not throw on it. If your logger or your error handler throws, the SDK drops the error:
+a warning never fails a request.
+
+With `'debug' => true`, the SDK writes one line per request to the logger's `debug()`, or to
+`error_log()` without a logger:
+
+```
+dominaite-php: POST /merchant-api/checkout/sessions 201 184ms request_id=4f1c... idempotency_key=checkout-order-1042-2500-EUR
+```
+
+The line holds the method, the path without the query string, the status (`error` when the
+request did not complete), the time, the `Dominaite-Request-Id` response header and the
+idempotency key you sent. Give support the request id. No line holds your secret, the
+signature, the `cashierToken` or a request or response body.
 
 ## Read the integration contract
 
@@ -144,7 +213,7 @@ use Dominaite\Exception\RateLimitException;
 use Dominaite\Exception\StorefrontException;
 use Dominaite\Exception\TransportException;
 
-$client = new DominaiteClient(getenv('DOMINAITE_KEY_ID'), getenv('DOMINAITE_SECRET'));
+$client = new DominaiteClient(getenv('DOMINAITE_KEY_ID'), getenv('DOMINAITE_SECRET'), getenv('DOMINAITE_BASE_URL'));
 
 $amount = 2500;                              // minor units: 2500 = 25.00 EUR
 
@@ -237,7 +306,11 @@ You can also manage endpoints through the API. These calls need a reporting key 
 `webhooks:manage` scope (see "Scopes" above).
 
 ```php
-$reporting = new DominaiteClient(getenv('DOMINAITE_REPORTING_KEY_ID'), getenv('DOMINAITE_REPORTING_SECRET'));
+$reporting = new DominaiteClient(
+    getenv('DOMINAITE_REPORTING_KEY_ID'),
+    getenv('DOMINAITE_REPORTING_SECRET'),
+    getenv('DOMINAITE_BASE_URL')
+);
 
 $endpoint = $reporting->createWebhookEndpoint([
     'url'            => 'https://shop.example/webhook.php',
@@ -982,7 +1055,11 @@ $list = $client->listRefunds($transactionId);
 needs a reporting key with the `transactions:read` scope (see "Scopes" above).
 
 ```php
-$reporting = new DominaiteClient(getenv('DOMINAITE_REPORTING_KEY_ID'), getenv('DOMINAITE_REPORTING_SECRET'));
+$reporting = new DominaiteClient(
+    getenv('DOMINAITE_REPORTING_KEY_ID'),
+    getenv('DOMINAITE_REPORTING_SECRET'),
+    getenv('DOMINAITE_BASE_URL')
+);
 
 $params = ['from' => '2026-10-01T00:00:00Z', 'to' => '2026-10-08T00:00:00Z', 'limit' => 100];
 do {

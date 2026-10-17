@@ -99,7 +99,7 @@ function thrownBy(callable $fn): string
 // The bug this pins: a 502/503/504 from a load balancer carries an HTML error page or
 // nothing at all. Parsing first turns "the platform is down" into a non-retryable
 // ApiException, and callers stop instead of retrying with the same idempotency key.
-$responseClient = new ResponseClient(KEY_ID, SECRET);
+$responseClient = new ResponseClient(KEY_ID, SECRET, DominaiteClient::SANDBOX_BASE_URL);
 
 $html = "<html><head><title>503 Service Unavailable</title></head><body>\n"
     . "<h1>Service Unavailable</h1><p>No server is available to handle this request.</p>\n"
@@ -282,10 +282,68 @@ foreach ($accepted as $label => $url) {
         'no exception');
 }
 
-// The default base URL must itself survive the check - a constructor nobody can call
-// with no arguments is the loudest possible way to get this wrong.
-check('default baseUrl is accepted',
-    thrownBy(static function (): void { new DominaiteClient(KEY_ID, SECRET); }), 'no exception');
+// --- The base URL is required --------------------------------------------------------
+// There is no default. A default of production turned an unset environment variable into
+// sandbox credentials sent to production, which fail authentication and can get the
+// caller's IP blocked.
+const BASE_URL_REQUIRED = 'baseUrl is required. Use https://api.staging.dominaite.com/payments'
+    . ' for the sandbox or https://api.dominaite.com/payments for production.';
+
+/** @return string The class and message of the thrown exception, or 'no exception'. */
+function failureOf(callable $fn): string
+{
+    try {
+        $fn();
+    } catch (\Throwable $e) {
+        return get_class($e) . ': ' . $e->getMessage();
+    }
+
+    return 'no exception';
+}
+
+check('baseUrl missing',
+    failureOf(static function (): void { new DominaiteClient(KEY_ID, SECRET); }),
+    'InvalidArgumentException: ' . BASE_URL_REQUIRED);
+$blank = [
+    'null'            => null,
+    'empty'           => '',
+    'spaces'          => '   ',
+    'tabs and breaks' => "\t\n",
+    'only slashes'    => '///',
+];
+foreach ($blank as $label => $url) {
+    check("baseUrl blank: $label",
+        failureOf(static function () use ($url): void { new DominaiteClient(KEY_ID, SECRET, $url); }),
+        'InvalidArgumentException: ' . BASE_URL_REQUIRED);
+}
+// getenv() returns false for an unset variable; PHP passes it on as an empty string.
+check('baseUrl from an unset environment variable',
+    failureOf(static function (): void {
+        new DominaiteClient(KEY_ID, SECRET, getenv('DOMINAITE_SDK_TEST_UNSET_VARIABLE'));
+    }),
+    'InvalidArgumentException: ' . BASE_URL_REQUIRED);
+
+check('SANDBOX_BASE_URL', DominaiteClient::SANDBOX_BASE_URL, 'https://api.staging.dominaite.com/payments');
+check('PRODUCTION_BASE_URL', DominaiteClient::PRODUCTION_BASE_URL, 'https://api.dominaite.com/payments');
+foreach (['sandbox' => DominaiteClient::SANDBOX_BASE_URL, 'production' => DominaiteClient::PRODUCTION_BASE_URL] as $label => $url) {
+    check("baseUrl $label is the one the client uses",
+        (string) (new DominaiteClient(KEY_ID, SECRET, $url))->__debugInfo()['baseUrl'], $url);
+}
+check('baseUrl is trimmed of whitespace and trailing slashes',
+    (string) (new DominaiteClient(KEY_ID, SECRET, "  https://api.staging.dominaite.com/payments//\n"))
+        ->__debugInfo()['baseUrl'],
+    'https://api.staging.dominaite.com/payments');
+
+// A restored client keeps its base URL, and a snapshot without one does not fall back to
+// production either.
+$snapshot = serialize(new DominaiteClient(KEY_ID, SECRET, DominaiteClient::SANDBOX_BASE_URL));
+check('unserialize keeps the base URL',
+    (string) unserialize($snapshot)->__debugInfo()['baseUrl'], DominaiteClient::SANDBOX_BASE_URL);
+$withoutBaseUrl = 'O:' . strlen(DominaiteClient::class) . ':"' . DominaiteClient::class . '":1:{s:5:"keyId";s:'
+    . strlen(KEY_ID) . ':"' . KEY_ID . '";}';
+check('unserialize without a base URL',
+    failureOf(static function () use ($withoutBaseUrl): void { unserialize($withoutBaseUrl); }),
+    'InvalidArgumentException: ' . BASE_URL_REQUIRED);
 
 // --- Storefront refusals are a typed exception with the code on it ---------------------
 // The gateway refuses a mint for a storefront that is not whitelisted (409), inactive
@@ -351,7 +409,7 @@ $cyrillic = str_repeat('д', 100);
 check('the Cyrillic fixture is 100 characters', (string) mb_strlen($cyrillic, 'UTF-8'), '100');
 check('the Cyrillic fixture is 200 bytes', (string) strlen($cyrillic), '200');
 
-$unicodeClient = new RecordingClient(KEY_ID, SECRET);
+$unicodeClient = new RecordingClient(KEY_ID, SECRET, DominaiteClient::SANDBOX_BASE_URL);
 check('100-character Cyrillic orderReference is accepted',
     thrownBy(static function () use ($unicodeClient, $cyrillic): void {
         $unicodeClient->createCheckoutSession([
@@ -365,7 +423,7 @@ check('the Cyrillic orderReference reaches the transport untouched',
 
 check('101-character orderReference is rejected',
     thrownBy(static function () use ($cyrillic): void {
-        (new RecordingClient(KEY_ID, SECRET))->createCheckoutSession([
+        (new RecordingClient(KEY_ID, SECRET, DominaiteClient::SANDBOX_BASE_URL))->createCheckoutSession([
             'amount' => 8440, 'currency' => 'EUR', 'orderReference' => $cyrillic . 'д',
             'idempotencyKey' => 'order-1042',
         ]);
@@ -373,7 +431,7 @@ check('101-character orderReference is rejected',
     'InvalidArgumentException');
 check('empty orderReference is rejected',
     thrownBy(static function (): void {
-        (new RecordingClient(KEY_ID, SECRET))->createCheckoutSession([
+        (new RecordingClient(KEY_ID, SECRET, DominaiteClient::SANDBOX_BASE_URL))->createCheckoutSession([
             'amount' => 8440, 'currency' => 'EUR', 'orderReference' => '',
             'idempotencyKey' => 'order-1042',
         ]);
@@ -384,7 +442,7 @@ check('empty orderReference is rejected',
 // same character-counting path is used for it - a 100-char key must still pass.
 check('100-character idempotency key is accepted',
     thrownBy(static function (): void {
-        (new RecordingClient(KEY_ID, SECRET))->createCheckoutSession([
+        (new RecordingClient(KEY_ID, SECRET, DominaiteClient::SANDBOX_BASE_URL))->createCheckoutSession([
             'amount' => 8440, 'currency' => 'EUR', 'orderReference' => 'order-1042',
             'idempotencyKey' => str_repeat('k', 100),
         ]);

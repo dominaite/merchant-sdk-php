@@ -50,7 +50,7 @@ final class CannedClient extends DominaiteClient
     /** @param array<string,mixed> $canned */
     public function __construct(array $canned, int $status = 200)
     {
-        parent::__construct(KEY_ID, SECRET);
+        parent::__construct(KEY_ID, SECRET, DominaiteClient::SANDBOX_BASE_URL);
         $this->canned = $canned;
         $this->status = $status;
     }

@@ -3,6 +3,34 @@
 Versions follow semver. The package installs from git tags, so a version exists once its
 `v` tag does.
 
+## 0.6.0
+
+Breaking:
+
+- The base URL is required. The client no longer falls back to production when you leave it
+  out, so an unset environment variable cannot send sandbox credentials to production.
+  Construction fails with `InvalidArgumentException` when the base URL is missing, empty or
+  whitespace. Pass `DominaiteClient::SANDBOX_BASE_URL`
+  (`https://api.staging.dominaite.com/payments`) or `DominaiteClient::PRODUCTION_BASE_URL`
+  (`https://api.dominaite.com/payments`), or your own value.
+- The private `DEFAULT_BASE_URL` is removed. Use `DominaiteClient::PRODUCTION_BASE_URL`.
+
+Added:
+
+- The User-Agent is now `dominaite-php/<version> (php <version>)`, then your suffix. The new
+  fourth constructor argument takes options; `userAgent` sets the suffix. A control
+  character in it, or an unknown option key, throws `InvalidArgumentException`.
+- `DominaiteClient::VERSION`, the SDK version the User-Agent carries.
+- The `logger` option: any object with `warning()`, for example a PSR-3 `LoggerInterface`
+  (`psr/log` is suggested, not required). Without one, warnings go to
+  `trigger_error(E_USER_DEPRECATED)`. A logger that throws never fails a request.
+- The SDK reads the `Dominaite-Sdk-Notice` response header on every response and warns once
+  per distinct value per client when this version is deprecated. It also warns when `ping()`
+  finds a clock skew above 60 seconds.
+- The `debug` option, off by default: one line per request with the method, the path, the
+  status, the time, the `Dominaite-Request-Id` header and the idempotency key. No line holds
+  the secret, the signature, the `cashierToken` or a body.
+
 ## 0.5.2
 
 Added:
