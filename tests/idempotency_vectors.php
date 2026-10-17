@@ -673,4 +673,18 @@ function timeoutMsOf(DominaiteClient $client): int
 check('the default timeout is 45 seconds per attempt', (string) timeoutMsOf(new WireClient()), '45000');
 check('the timeout option sets the per-attempt limit', (string) timeoutMsOf(new WireClient(['timeout' => 2.5])), '2500');
 
+// A restored client keeps the caller's retry and timeout options. A framework that snapshots
+// its service container must not turn retries back on, or change the limit, behind your back.
+$restored = unserialize(serialize(new WireClient(['maxRetries' => 0, 'timeout' => 5])));
+$restored->answers = [noAnswer(), answer(200, okBody(['items' => []]))];
+check('an unserialized client keeps maxRetries 0',
+    outcomeOf(static function () use ($restored): void { $restored->listTransactions([]); }) . ' ' . count($restored->sent),
+    TransportException::class . ' 1');
+check('an unserialized client keeps its timeout', (string) timeoutMsOf($restored), '5000');
+$restored = unserialize(serialize(new WireClient(['maxRetries' => 4, 'timeout' => 0.25])));
+$restored->answers = array_fill(0, 6, noAnswer());
+outcomeOf(static function () use ($restored): void { $restored->listTransactions([]); });
+check('an unserialized client keeps a larger maxRetries and a fractional timeout',
+    count($restored->sent) . ' ' . timeoutMsOf($restored), '5 250');
+
 exit($failures === 0 ? 0 : 1);

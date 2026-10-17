@@ -956,10 +956,15 @@ class DominaiteClient
             'secret' => self::REDACTED,
             'baseUrl' => $this->baseUrl,
             'lastIdempotencyKey' => $this->lastIdempotencyKey,
+            'maxRetries' => $this->maxRetries,
+            'timeoutMs' => $this->timeoutMs,
         ];
     }
 
     /**
+     * Restores a client from __serialize(). The retry and timeout options come back as the
+     * caller set them; a value that is missing or out of range falls back to the default.
+     *
      * @param array<string,mixed> $data
      */
     public function __unserialize(array $data): void
@@ -971,8 +976,10 @@ class DominaiteClient
         $this->userAgent = self::userAgent(null);
         $this->logger = null;
         $this->debug = false;
-        $this->maxRetries = self::DEFAULT_MAX_RETRIES;
-        $this->timeoutMs = self::TIMEOUT_SECONDS * 1000;
+        $maxRetries = $data['maxRetries'] ?? null;
+        $this->maxRetries = is_int($maxRetries) && $maxRetries >= 0 ? $maxRetries : self::DEFAULT_MAX_RETRIES;
+        $timeoutMs = $data['timeoutMs'] ?? null;
+        $this->timeoutMs = is_int($timeoutMs) && $timeoutMs >= 1 ? $timeoutMs : self::TIMEOUT_SECONDS * 1000;
         $this->seenNotices = [];
     }
 

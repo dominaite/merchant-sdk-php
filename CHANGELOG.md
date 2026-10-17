@@ -57,6 +57,8 @@ Fixed:
   `chargePaymentMethod()`. It means an earlier request with this key is still running, or
   it finished and its answer can no longer be replayed, so a charge may exist. Retry with
   the same key; if the code comes back, read the transaction. Never retry under a new key.
+- `unserialize()` reset `maxRetries` and `timeout` to the defaults. A restored client now
+  keeps the values you passed to the constructor.
 - A `pm_` id with uppercase hex is lowercased before signing. The API signs a charge on the
   lowercase id, so an uppercase id failed with `INVALID_SIGNATURE`.
 - The README and the `createWebhookEndpoint()` docblock no longer say a same-key retry always
