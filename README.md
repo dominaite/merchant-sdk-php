@@ -1180,3 +1180,23 @@ the order-derived key for the life of the order to keep that path open. The band
 endless - once the platform has independently closed the attempt (about an hour past
 expiry), the replay answers `PRIOR_ATTEMPT_FAILED` and the key is spent; reconcile and use
 a fresh key.
+
+## Versioning and support
+
+The SDK is 0.x on purpose. A minor release (for example 0.6 to 0.7) can contain a breaking
+change. A patch release (0.6.0 to 0.6.1) does not. `CHANGELOG.md` lists every breaking change
+and what to do about it.
+
+Composer's caret constraint stops at the minor version on 0.x: `^0.6` allows 0.6.1 but not
+0.7.0. So `composer update` never takes you to a release that can break your code. Upgrade on
+purpose with `composer require dominaite/merchant-sdk:^0.7`, and read `CHANGELOG.md` first.
+
+The SDK needs PHP 7.4 or later with `ext-curl`, `ext-json` and `ext-mbstring`. CI tests it on
+PHP 7.4 and PHP 8.3.
+
+When the API marks your SDK version as deprecated, it sends a `Dominaite-Sdk-Notice` header.
+The client turns it into one warning for each distinct notice (see
+[Logging and warnings](#logging-and-warnings)). The warning names the version to upgrade to and
+the sunset date when the notice carries them. Pass a `logger`, or make sure your framework
+logs `E_USER_DEPRECATED`, so you see the notice before the sunset date. A response without the
+header changes nothing.
