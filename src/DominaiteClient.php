@@ -77,8 +77,11 @@ class DominaiteClient
     public const TRANSACTIONS_PATH = '/merchant-api/transactions';
     /** The public integration contract. It needs no key; the SDK signs it like ping. */
     public const INTEGRATION_CONTRACT_PATH = '/merchant-api/integration/contract';
-    private const USER_AGENT = 'dominaite-php/0.6.0 (php ' . PHP_VERSION . ')';
+    /** This SDK's version. The User-Agent carries it. */
+    public const VERSION = '0.6.0';
     private const TIMEOUT_SECONDS = 15;
+    /** The keys the constructor's $options accepts. */
+    private const OPTION_KEYS = ['userAgent'];
 
     /**
      * Hard cap on how much response body we will buffer, in bytes.
@@ -481,6 +484,7 @@ class DominaiteClient
     private string $secret;
     private string $baseUrl;
     private ?string $lastIdempotencyKey = null;
+    private string $userAgent;
 
     /**
      * @param string $keyId   Your API key id (dmk_...), from the Dominaite dashboard/operator.
@@ -490,8 +494,12 @@ class DominaiteClient
      *                         unset environment variable cannot reach production. Must be
      *                         https://, except on localhost / 127.0.0.1 / ::1 for local
      *                         development.
+     * @param array<string,mixed> $options Optional:
+     *                         userAgent (string) - your own identifier, appended to the SDK's
+     *                         User-Agent after one space. It helps support find your calls.
+     *                         An unknown key throws InvalidArgumentException.
      */
-    public function __construct(string $keyId, string $secret, ?string $baseUrl = null)
+    public function __construct(string $keyId, string $secret, ?string $baseUrl = null, array $options = [])
     {
         if (strpos($keyId, 'dmk_') !== 0) {
             throw new \InvalidArgumentException('keyId must start with dmk_');
@@ -501,9 +509,40 @@ class DominaiteClient
         }
         self::assertHeaderSafe('keyId', $keyId);
         $baseUrl = self::requireBaseUrl($baseUrl);
+        $unknown = array_diff(array_keys($options), self::OPTION_KEYS);
+        if ($unknown !== []) {
+            throw new \InvalidArgumentException(
+                'Unknown option ' . implode(', ', $unknown) . '; the options are ' . implode(', ', self::OPTION_KEYS)
+            );
+        }
         $this->keyId = $keyId;
         $this->secret = $secret;
         $this->baseUrl = $baseUrl;
+        $this->userAgent = self::userAgent($options['userAgent'] ?? null);
+    }
+
+    /**
+     * dominaite-php/<version> (php <version>), then the caller's suffix after one space.
+     * No operating system: the runtime version is all support needs.
+     *
+     * @param mixed $suffix
+     */
+    private static function userAgent($suffix): string
+    {
+        $userAgent = 'dominaite-php/' . self::VERSION . ' (php ' . PHP_VERSION . ')';
+        if ($suffix === null) {
+            return $userAgent;
+        }
+        if (!is_string($suffix)) {
+            throw new \InvalidArgumentException('userAgent must be a string');
+        }
+        // A CR or LF would end the header line and start a header of the caller's choosing.
+        if (preg_match('/[\x00-\x1F\x7F]/', $suffix) === 1) {
+            throw new \InvalidArgumentException('userAgent must not contain control characters; it is sent as an HTTP header');
+        }
+        $suffix = trim($suffix);
+
+        return $suffix === '' ? $userAgent : $userAgent . ' ' . $suffix;
     }
 
     /**
@@ -578,6 +617,7 @@ class DominaiteClient
             'secret' => self::REDACTED,
             'baseUrl' => $this->baseUrl,
             'lastIdempotencyKey' => $this->lastIdempotencyKey,
+            'userAgent' => $this->userAgent,
         ];
     }
 
@@ -610,6 +650,7 @@ class DominaiteClient
         $this->secret = (string) ($data['secret'] ?? self::REDACTED);
         $this->baseUrl = self::requireBaseUrl(isset($data['baseUrl']) ? (string) $data['baseUrl'] : null);
         $this->lastIdempotencyKey = isset($data['lastIdempotencyKey']) ? (string) $data['lastIdempotencyKey'] : null;
+        $this->userAgent = self::userAgent(null);
     }
 
     /**
@@ -2183,7 +2224,7 @@ class DominaiteClient
             CURLOPT_RETURNTRANSFER => true,
             CURLOPT_TIMEOUT => self::TIMEOUT_SECONDS,
             // Some edges block requests without a real User-Agent - always send one.
-            CURLOPT_USERAGENT => self::USER_AGENT,
+            CURLOPT_USERAGENT => $this->userAgent,
             CURLOPT_HTTPHEADER => $headers,
             // Buffer the body ourselves so the size cap can abort mid-transfer. Returning
             // a short count from this callback is curl's documented way to stop a read;

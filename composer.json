@@ -37,7 +37,8 @@
             "php tests/refund_vectors.php",
             "php tests/recurring_vectors.php",
             "php tests/reporting_vectors.php",
-            "php tests/lenient_vectors.php"
+            "php tests/lenient_vectors.php",
+            "php tests/usage_vectors.php"
         ]
     }
 }
