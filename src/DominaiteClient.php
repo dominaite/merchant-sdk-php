@@ -78,7 +78,7 @@ class DominaiteClient
     /** The public integration contract. It needs no key; the SDK signs it like ping. */
     public const INTEGRATION_CONTRACT_PATH = '/merchant-api/integration/contract';
     /** This SDK's version. The User-Agent carries it. */
-    public const VERSION = '0.6.0';
+    public const VERSION = '0.7.0';
     private const TIMEOUT_SECONDS = 45;
     private const DEFAULT_MAX_RETRIES = 2;
     private const RETRY_BASE_MS = 500;
